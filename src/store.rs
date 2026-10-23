@@ -37,10 +37,6 @@ impl Body {
         self.chunks.iter().map(|c| c.len() as u64).sum()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     pub fn to_vec(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.len() as usize);
         for c in &self.chunks {
@@ -57,13 +53,16 @@ pub struct ObjectInfo {
 
 pub enum Store {
     Mem(MemStore),
+    S3(crate::s3::S3Store),
 }
 
 impl Store {
     /// Whole object, `None` if it does not exist.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn get(&self, key: &str) -> StoreResult<Option<Bytes>> {
         let res = match self {
             Store::Mem(m) => m.get(key),
+            Store::S3(s) => s.get(key).await,
         };
         match res {
             Ok(b) => Ok(Some(b)),
@@ -76,6 +75,7 @@ impl Store {
     pub async fn put(&self, key: &str, body: Body) -> StoreResult<()> {
         match self {
             Store::Mem(m) => m.put(key, body),
+            Store::S3(s) => s.put(key, body).await,
         }
     }
 
@@ -83,6 +83,7 @@ impl Store {
     pub async fn patch(&self, key: &str, offset: u64, body: Body) -> StoreResult<()> {
         match self {
             Store::Mem(m) => m.patch(key, offset, body),
+            Store::S3(s) => s.patch(key, offset, body).await,
         }
     }
 
@@ -90,6 +91,7 @@ impl Store {
     pub async fn get_range(&self, key: &str, offset: u64, len: u64) -> StoreResult<Bytes> {
         match self {
             Store::Mem(m) => m.get_range(key, offset, len),
+            Store::S3(s) => s.get_range(key, offset, len).await,
         }
     }
 
@@ -97,6 +99,7 @@ impl Store {
     pub async fn delete(&self, key: &str) -> StoreResult<()> {
         match self {
             Store::Mem(m) => m.delete(key),
+            Store::S3(s) => s.delete(key).await,
         }
     }
 
@@ -104,6 +107,7 @@ impl Store {
     pub async fn list(&self, prefix: &str) -> StoreResult<Vec<ObjectInfo>> {
         match self {
             Store::Mem(m) => m.list(prefix),
+            Store::S3(s) => s.list(prefix).await,
         }
     }
 }

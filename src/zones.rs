@@ -83,15 +83,6 @@ pub enum Piece {
     Zero(u64),
 }
 
-impl Piece {
-    pub fn len(&self) -> u64 {
-        match self {
-            Piece::Store { len, .. } | Piece::Zero(len) => *len,
-            Piece::Mem(b) => b.len() as u64,
-        }
-    }
-}
-
 struct ZoneState {
     cond: Cond,
     /// Reported write pointer, relative to the zone start.
@@ -243,14 +234,6 @@ impl Engine {
         );
         *engine.counters.lock().unwrap() = counters;
         Ok(engine)
-    }
-
-    pub fn nr_zones(&self) -> usize {
-        self.zones.len()
-    }
-
-    pub fn zone_size(&self) -> u64 {
-        self.zone_size
     }
 
     /// Zone index and offset inside the zone.
@@ -662,8 +645,10 @@ mod tests {
     }
 
     fn mem_store(s: &Store) -> &MemStore {
-        let Store::Mem(m) = s;
-        m
+        match s {
+            Store::Mem(m) => m,
+            Store::S3(_) => unreachable!(),
+        }
     }
 
     fn blk(byte: u8, blocks: u64) -> Bytes {

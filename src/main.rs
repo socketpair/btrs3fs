@@ -1,16 +1,20 @@
 mod config;
 mod device;
+mod s3;
 mod store;
 mod zones;
 
 use anyhow::{Context, bail};
+use bytes::Bytes;
+use futures_util::StreamExt;
 use clap::{Args, Parser, Subcommand};
 use config::{DiskConfig, parse_size};
 use log::{error, info, warn};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use store::{Layout, MemStore, Store};
+use s3::{HttpVersion, RetryPolicy, S3Store};
+use store::{Body, Layout, MemStore, Store};
 use zones::Engine;
 
 /// Zoned ublk block device backed by S3, one object per zone.
@@ -45,6 +49,9 @@ struct DiskArgs {
     /// Object key prefix of the disk inside the bucket.
     #[arg(long)]
     prefix: String,
+    /// HTTP protocol version for S3.
+    #[arg(long, value_enum, default_value = "auto")]
+    http: HttpVersion,
 }
 
 #[derive(Args)]
@@ -95,6 +102,9 @@ struct RunArgs {
     /// Override nr_queues from disk.json.
     #[arg(long)]
     queues: Option<u16>,
+    /// HTTP protocol version for S3.
+    #[arg(long, value_enum, default_value = "auto")]
+    http: HttpVersion,
 }
 
 #[derive(Args)]
@@ -120,7 +130,8 @@ fn main() {
         .init();
 
     let res = match cli.command {
-        Command::Create(_) | Command::Destroy(_) => Err(anyhow::anyhow!("S3 support is not implemented yet")),
+        Command::Create(a) => cmd_create(a),
+        Command::Destroy(a) => cmd_destroy(a),
         Command::Run(a) => cmd_run(a),
         Command::Detach(a) => cmd_detach(a),
     };
@@ -148,7 +159,15 @@ fn cmd_run(a: RunArgs) -> anyhow::Result<i32> {
         cfg.validate()?;
         (cfg, Layout::new("memory")?, Store::Mem(MemStore::default()))
     } else {
-        bail!("S3 support is not implemented yet");
+        let creds = config::Creds::load(a.creds.as_ref().unwrap())?;
+        let layout = Layout::new(a.prefix.as_ref().unwrap())?;
+        let defaults = DiskConfig::new(0, DiskConfig::DEFAULT_ZONE_SIZE);
+        let s3 = S3Store::new(&creds, a.http, RetryPolicy::from_config(&defaults))?;
+        let cfg = rt
+            .block_on(load_config(&s3, &layout))?
+            .with_context(|| format!("disk {} not found, create it first", layout.config_key()))?;
+        let s3 = s3.with_retry(RetryPolicy::from_config(&cfg));
+        (cfg, layout, Store::S3(s3))
     };
     if let Some(q) = a.queues {
         cfg.nr_queues = q;
@@ -237,5 +256,107 @@ fn cmd_detach(a: DetachArgs) -> anyhow::Result<i32> {
         }
     }
     info!("device {} detached", a.dev_id);
+    Ok(0)
+}
+
+async fn load_config(s3: &S3Store, layout: &Layout) -> anyhow::Result<Option<DiskConfig>> {
+    let key = layout.config_key();
+    match s3.get(&key).await {
+        Ok(data) => Ok(Some(
+            DiskConfig::from_json(&data).with_context(|| format!("invalid {key}"))?,
+        )),
+        Err(store::StoreError::NotFound(_)) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn cmd_create(a: CreateArgs) -> anyhow::Result<i32> {
+    let mut cfg = DiskConfig::new(a.size, a.zone_size);
+    if let Some(v) = a.max_open_zones {
+        cfg.max_open_zones = v;
+    }
+    if let Some(v) = a.max_active_zones {
+        cfg.max_active_zones = v;
+    }
+    if let Some(v) = a.dirty_limit {
+        cfg.dirty_limit_bytes = v;
+    }
+    if let Some(v) = a.retry_timeout_seconds {
+        cfg.retry_timeout_seconds = v;
+    }
+    if let Some(v) = a.retry_initial_delay_ms {
+        cfg.retry_initial_delay_ms = v;
+    }
+    if let Some(v) = a.retry_backoff_factor {
+        cfg.retry_backoff_factor = v;
+    }
+    if let Some(v) = a.queues {
+        cfg.nr_queues = v;
+    }
+    if let Some(v) = a.queue_depth {
+        cfg.queue_depth = v;
+    }
+    cfg.validate()?;
+
+    let creds = config::Creds::load(&a.disk.creds)?;
+    let layout = Layout::new(&a.disk.prefix)?;
+    let s3 = S3Store::new(&creds, a.disk.http, RetryPolicy::from_config(&cfg))?;
+    runtime()?.block_on(async {
+        let existing = s3.list(&layout.dir()).await?;
+        if !existing.is_empty() {
+            bail!(
+                "prefix {} already holds {} objects; destroy the old disk first",
+                layout.dir(),
+                existing.len()
+            );
+        }
+        let json = Bytes::from(cfg.to_json());
+        s3.put(&layout.config_key(), Body::new(vec![json])).await?;
+        Ok(())
+    })?;
+    info!(
+        "created {}: {} bytes, {} zones of {} bytes",
+        layout.config_key(),
+        cfg.disk_size,
+        cfg.nr_zones(),
+        cfg.zone_size
+    );
+    Ok(0)
+}
+
+fn cmd_destroy(a: DestroyArgs) -> anyhow::Result<i32> {
+    if !a.yes {
+        bail!("this deletes all data of the disk; pass --yes to confirm");
+    }
+    let creds = config::Creds::load(&a.disk.creds)?;
+    let layout = Layout::new(&a.disk.prefix)?;
+    let defaults = DiskConfig::new(0, DiskConfig::DEFAULT_ZONE_SIZE);
+    let s3 = S3Store::new(&creds, a.disk.http, RetryPolicy::from_config(&defaults))?;
+    let deleted = runtime()?.block_on(async {
+        let config_key = layout.config_key();
+        let keys: Vec<String> = s3
+            .list(&layout.dir())
+            .await?
+            .into_iter()
+            .map(|o| o.key)
+            .filter(|k| *k != config_key)
+            .collect();
+        let n = keys.len();
+        let results: Vec<_> = futures_util::stream::iter(keys)
+            .map(|k| {
+                let s3 = &s3;
+                async move { s3.delete(&k).await }
+            })
+            .buffer_unordered(16)
+            .collect()
+            .await;
+        for r in results {
+            r?;
+        }
+        // The config goes last so an interrupted destroy can be repeated.
+        s3.delete(&config_key).await?;
+        anyhow::Ok(n)
+    })?;
+    info!("destroyed {}: {deleted} zone objects deleted", layout.dir());
     Ok(0)
 }

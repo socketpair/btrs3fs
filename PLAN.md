@@ -30,24 +30,29 @@ src/
 
 ## Этап 1 — каркас и движок зон в памяти
 
-- [ ] 1.1 Проект Cargo, зависимости, CLI-скелет.
-- [ ] 1.2 `config.rs`: `DiskConfig` (значения по умолчанию, проверки §2), `Creds`.
-- [ ] 1.3 `store.rs`: трейт `ObjectStore` + `MemStore`.
-- [ ] 1.4 `zones.rs`: состояния зон, WRITE / ZONE_APPEND / READ / FLUSH / FUA,
+- [x] 1.1 Проект Cargo, зависимости, CLI-скелет.
+- [x] 1.2 `config.rs`: `DiskConfig` (значения по умолчанию, проверки §2), `Creds`.
+- [x] 1.3 `store.rs`: трейт `ObjectStore` + `MemStore`.
+- [x] 1.4 `zones.rs`: состояния зон, WRITE / ZONE_APPEND / READ / FLUSH / FUA,
       OPEN / CLOSE / FINISH / RESET / RESET_ALL, REPORT, лимиты open/active,
       учёт грязных данных; восстановление из `list()`. Юнит-тесты.
-- [ ] 1.5 `device.rs`: ublk-устройство (`USER_COPY | ZONED`, 4K-сектор, volatile cache + FUA),
+- [x] 1.5 `device.rs`: ublk-устройство (`USER_COPY | ZONED`, 4K-сектор, volatile cache + FUA),
       очереди, мост eventfd, `run --memory`.
 - [ ] 1.6 Проверка на реальном устройстве: `blkzone report`, `fio` (zonemode=zbd, verify),
       `mkfs.btrfs -O zoned`, mount, запись/чтение файлов. Опытная проверка zone write plugging.
+      Сделано: устройство host-managed, 320 зон, блок 4096, write back + FUA; `blkzone`
+      report/reset; запись не по указателю → EIO; `fio` zbd 4×1 ГиБ с verify — без ошибок
+      (iodepth 8 обычных записей на зону — ни одной не по указателю ⇒ zone write plugging
+      работает); `mkfs.btrfs -O zoned` и mount пользователем — чисто в журнале ядра.
+      Осталось: запись файлов (нужно правило `chown`, `setup-permissions.sh install`).
 
 ## Этап 2 — S3-клиент
 
-- [ ] 2.1 `s3.rs`: подпись SigV4 (`UNSIGNED-PAYLOAD`), PUT / PATCH / GET Range / DELETE /
+- [x] 2.1 `s3.rs`: подпись SigV4 (`UNSIGNED-PAYLOAD`), PUT / PATCH / GET Range / DELETE /
       ListObjectsV2 (пагинация) / GET целиком; транспорт (keep-alive, `TCP_NODELAY`,
       TCP keepalive, `--http`); повторы (5xx/429/сеть, бюджет из `disk.json`).
-- [ ] 2.2 Интеграционные тесты против бакета (`#[ignore]`, запускаются явно, свой префикс).
-- [ ] 2.3 `create` / `destroy` через S3.
+- [x] 2.2 Интеграционные тесты против бакета (`#[ignore]`, запускаются явно, свой префикс).
+- [x] 2.3 `create` / `destroy` через S3.
 
 ## Этап 3 — устройство на S3
 
