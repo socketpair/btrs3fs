@@ -310,8 +310,18 @@ struct Zone {
   `/dev/ublk-control`, `/dev/ublkcN`, `/dev/ublkbN`.
 - Монтирование — без sudo, через строку в `/etc/fstab` с опцией `user`
   (подразумевает `nosuid,nodev,noexec`).
-- Одноразовая настройка — `setup-permissions.sh` (запускает пользователь через sudo;
-  есть `uninstall`). Правил sudoers нет.
+- Одноразовая настройка — `setup-permissions.sh` (запускает пользователь через sudo).
+  Правил sudoers нет. Действия:
+
+  | Действие | Что делает |
+  |---|---|
+  | `install` | Пакеты для работы готовой системы + права (группа, udev, модуль, fstab) |
+  | `uninstall` | Откат прав (пакеты остаются) |
+  | `build-deps` | Пакеты для сборки: `rust`, `cargo`, `gcc`, `clang-devel` (libclang для bindgen в `libublk-rs-sys`), `kernel-headers`, `glibc-devel`, `git` |
+  | `diag-tools` | Тесты и диагностика: `fio`, `blktrace`, `sysstat`, `strace`, `gdb`, `perf`, `jq`, `awscli2` |
+
+  Пакеты для работы: `kernel-modules-core` (`ublk_drv`), `systemd-udev`, `shadow-utils`,
+  `util-linux`, `btrfs-progs`, `ca-certificates`.
 - Новая группа без перелогина: `sg ublk -c '<команда>'`.
 - **Запасной план**, если ядро не разрешит `UBLK_F_ZONED` в непривилегированном режиме:
   бинарник в `/usr/local/bin` (владелец root, устанавливает пользователь после ревью) +
@@ -375,7 +385,8 @@ struct Zone {
 ### 13.5. Действия пользователя
 
 - [ ] `sudo ./setup-permissions.sh install`
-- [ ] `sudo dnf install fio` — для нагрузочных тестов (этап 4).
+- [ ] `sudo ./setup-permissions.sh build-deps`
+- [ ] `sudo ./setup-permissions.sh diag-tools` — для тестов (этап 4).
 - [ ] После завершения разработки — `sudo ./setup-permissions.sh uninstall`.
 
 ---
