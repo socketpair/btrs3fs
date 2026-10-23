@@ -84,6 +84,15 @@ target_user() {
     echo "$user"
 }
 
+# Earlier versions granted the group access to /dev/ublk-control; a "change"
+# trigger does not revert that, so restore the kernel default explicitly.
+reset_control_node() {
+    if [[ -e /dev/ublk-control ]]; then
+        chown root:root /dev/ublk-control
+        chmod 0600 /dev/ublk-control
+    fi
+}
+
 install_packages() {
     dnf install -y "$@"
 }
@@ -104,6 +113,7 @@ KERNEL=="ublkb[0-9]*", GROUP="$GROUP", MODE="0660"
 EOF
     udevadm control --reload
     modprobe ublk_drv
+    reset_control_node
     # Re-apply rules to nodes that may already exist (module loaded earlier).
     udevadm trigger --action=change --sysname-match='ublk*'
     udevadm settle
@@ -140,6 +150,7 @@ uninstall() {
     rmdir "$MOUNTPOINT" 2>/dev/null || true
 
     rm -f "$SUDOERS" "$UDEV_RULES" "$MODULES_LOAD"
+    reset_control_node
     udevadm control --reload
     udevadm trigger --action=change --sysname-match='ublk*'
 
