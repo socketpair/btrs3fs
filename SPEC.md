@@ -349,7 +349,7 @@ struct Zone {
   |---|---|
   | `install` | Пакеты для работы готовой системы + права: `/etc/sudoers.d/btrs3fs`, группа, udev-правило для `ublkb*`, загрузка модуля, fstab |
   | `uninstall` | Откат прав, удаление группы (пакеты остаются) |
-  | `build-deps` | Пакеты для сборки: `rust`, `cargo`, `gcc`, `clang-devel` (libclang для bindgen в `libublk-rs-sys`), `kernel-headers`, `glibc-devel`, `git` |
+  | `build-deps` | Пакеты для сборки: `rust`, `cargo`, `clippy`, `rustfmt`, `gcc`, `clang-devel` (libclang для bindgen в `libublk-rs-sys`), `kernel-headers`, `glibc-devel`, `git` |
   | `diag-tools` | Тесты и диагностика: `fio`, `blktrace`, `sysstat`, `strace`, `gdb`, `perf`, `jq`, `awscli2` |
 
   Пакеты для работы: `kernel-modules-core` (`ublk_drv`), `systemd-udev`, `shadow-utils`,

@@ -53,6 +53,7 @@ RUNTIME_PACKAGES=(
 # Required to build btrs3fs from source.
 BUILD_PACKAGES=(
     rust cargo            # compiler and build tool
+    clippy rustfmt        # lints and formatting
     gcc                   # linker used by rustc
     clang-devel           # libclang for bindgen (libublk-rs-sys generates ublk bindings)
     kernel-headers        # linux/ublk_cmd.h, linux/blkzoned.h
