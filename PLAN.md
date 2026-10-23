@@ -38,13 +38,13 @@ src/
       учёт грязных данных; восстановление из `list()`. Юнит-тесты.
 - [x] 1.5 `device.rs`: ublk-устройство (`USER_COPY | ZONED`, 4K-сектор, volatile cache + FUA),
       очереди, мост eventfd, `run --memory`.
-- [ ] 1.6 Проверка на реальном устройстве: `blkzone report`, `fio` (zonemode=zbd, verify),
+- [x] 1.6 Проверка на реальном устройстве: `blkzone report`, `fio` (zonemode=zbd, verify),
       `mkfs.btrfs -O zoned`, mount, запись/чтение файлов. Опытная проверка zone write plugging.
       Сделано: устройство host-managed, 320 зон, блок 4096, write back + FUA; `blkzone`
       report/reset; запись не по указателю → EIO; `fio` zbd 4×1 ГиБ с verify — без ошибок
       (iodepth 8 обычных записей на зону — ни одной не по указателю ⇒ zone write plugging
       работает); `mkfs.btrfs -O zoned` и mount пользователем — чисто в журнале ядра.
-      Осталось: запись файлов (нужно правило `chown`, `setup-permissions.sh install`).
+      Запись и чтение файлов — см. 4.1.
 
 ## Этап 2 — S3-клиент
 
@@ -64,8 +64,11 @@ src/
 
 ## Этап 4 — тесты целиком
 
-- [ ] 4.1 Персистентность: mkfs → файлы + контрольные суммы → umount → detach → run →
+- [x] 4.1 Персистентность: mkfs → файлы + контрольные суммы → umount → detach → run →
       mount → сверка.
+      Диск 10 ГиБ в S3: 227 файлов (42 МБ: крупные, 200 мелких, дерево каталогов, symlink) →
+      sync → umount → detach → run (8 закрытых зон восстановлено) → mount → все sha256
+      совпали, ошибок btrfs в журнале ядра нет.
 - [x] 4.2 `fio` с verify на сыром зонированном устройстве поверх S3.
       2×64 МиБ, fsync каждые 32 записи → detach → run (4 полные зоны восстановлены) →
       `--verify_only` читает всё из S3: `err=0`.
