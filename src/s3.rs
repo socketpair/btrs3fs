@@ -29,6 +29,17 @@ pub enum HttpVersion {
     Http2,
 }
 
+/// Network options of the S3 client.
+#[derive(Clone, Debug, clap::Args)]
+pub struct Transport {
+    /// HTTP protocol version for S3.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub http: HttpVersion,
+    /// Proxy for S3 requests, e.g. http://proxy:3128 (HTTPS goes through CONNECT).
+    #[arg(long)]
+    pub proxy: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RetryPolicy {
     /// Total time budget of one operation including all retries.
@@ -71,7 +82,7 @@ pub struct S3Store {
 }
 
 impl S3Store {
-    pub fn new(creds: &Creds, http_version: HttpVersion, retry: RetryPolicy) -> anyhow::Result<Self> {
+    pub fn new(creds: &Creds, transport: &Transport, retry: RetryPolicy) -> anyhow::Result<Self> {
         let mut builder = reqwest::Client::builder()
             .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(30))
@@ -80,7 +91,10 @@ impl S3Store {
             .read_timeout(Duration::from_secs(60))
             .http2_adaptive_window(true)
             .user_agent(concat!("btrs3fs/", env!("CARGO_PKG_VERSION")));
-        builder = match http_version {
+        if let Some(proxy) = &transport.proxy {
+            builder = builder.proxy(reqwest::Proxy::all(proxy).context("invalid proxy URL")?);
+        }
+        builder = match transport.http {
             HttpVersion::Auto => builder,
             HttpVersion::Http1 => builder.http1_only(),
             HttpVersion::Http2 => builder.http2_prior_knowledge(),
@@ -400,7 +414,8 @@ mod bucket_tests {
             initial_delay: Duration::from_millis(100),
             backoff_factor: 2.0,
         };
-        S3Store::new(&creds, HttpVersion::Auto, retry).unwrap()
+        let transport = Transport { http: HttpVersion::Auto, proxy: None };
+        S3Store::new(&creds, &transport, retry).unwrap()
     }
 
     fn unique_prefix(name: &str) -> String {

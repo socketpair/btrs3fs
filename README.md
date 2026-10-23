@@ -68,7 +68,7 @@ sudo $B detach
 $B destroy --creds creds.json --prefix disks/test --yes
 ```
 
-Полезные флаги: `--log-level debug`, `run --queues N`, `run --http auto|http1|http2`,
+Полезные флаги: `--log-level debug`, `run --queues N`, `--http auto|http1|http2`, `--proxy URL`,
 `run --memory --size 1G` (без S3, для тестов). Параметры диска (`create --help`):
 лимиты открытых/активных зон, лимит буфера, политика повторов, очереди.
 

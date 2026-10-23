@@ -13,7 +13,7 @@ use log::{error, info, warn};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use s3::{HttpVersion, RetryPolicy, S3Store};
+use s3::{RetryPolicy, S3Store, Transport};
 use store::{Body, Layout, MemStore, Store};
 use zones::Engine;
 
@@ -49,9 +49,8 @@ struct DiskArgs {
     /// Object key prefix of the disk inside the bucket.
     #[arg(long)]
     prefix: String,
-    /// HTTP protocol version for S3.
-    #[arg(long, value_enum, default_value = "auto")]
-    http: HttpVersion,
+    #[command(flatten)]
+    transport: Transport,
 }
 
 #[derive(Args)]
@@ -102,9 +101,8 @@ struct RunArgs {
     /// Override nr_queues from disk.json.
     #[arg(long)]
     queues: Option<u16>,
-    /// HTTP protocol version for S3.
-    #[arg(long, value_enum, default_value = "auto")]
-    http: HttpVersion,
+    #[command(flatten)]
+    transport: Transport,
 }
 
 #[derive(Args)]
@@ -162,7 +160,7 @@ fn cmd_run(a: RunArgs) -> anyhow::Result<i32> {
         let creds = config::Creds::load(a.creds.as_ref().unwrap())?;
         let layout = Layout::new(a.prefix.as_ref().unwrap())?;
         let defaults = DiskConfig::new(0, DiskConfig::DEFAULT_ZONE_SIZE);
-        let s3 = S3Store::new(&creds, a.http, RetryPolicy::from_config(&defaults))?;
+        let s3 = S3Store::new(&creds, &a.transport, RetryPolicy::from_config(&defaults))?;
         let cfg = rt
             .block_on(load_config(&s3, &layout))?
             .with_context(|| format!("disk {} not found, create it first", layout.config_key()))?;
@@ -300,7 +298,7 @@ fn cmd_create(a: CreateArgs) -> anyhow::Result<i32> {
 
     let creds = config::Creds::load(&a.disk.creds)?;
     let layout = Layout::new(&a.disk.prefix)?;
-    let s3 = S3Store::new(&creds, a.disk.http, RetryPolicy::from_config(&cfg))?;
+    let s3 = S3Store::new(&creds, &a.disk.transport, RetryPolicy::from_config(&cfg))?;
     runtime()?.block_on(async {
         let existing = s3.list(&layout.dir()).await?;
         if !existing.is_empty() {
@@ -331,7 +329,7 @@ fn cmd_destroy(a: DestroyArgs) -> anyhow::Result<i32> {
     let creds = config::Creds::load(&a.disk.creds)?;
     let layout = Layout::new(&a.disk.prefix)?;
     let defaults = DiskConfig::new(0, DiskConfig::DEFAULT_ZONE_SIZE);
-    let s3 = S3Store::new(&creds, a.disk.http, RetryPolicy::from_config(&defaults))?;
+    let s3 = S3Store::new(&creds, &a.disk.transport, RetryPolicy::from_config(&defaults))?;
     let deleted = runtime()?.block_on(async {
         let config_key = layout.config_key();
         let keys: Vec<String> = s3
