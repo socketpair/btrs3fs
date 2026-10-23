@@ -110,6 +110,7 @@ pub fn serve(cfg: &DiskConfig, engine: Arc<Engine>, rt: Handle, opts: &DeviceOpt
             ctrl.dev_info().nr_hw_queues,
             ctrl.dev_info().queue_depth
         );
+        sd_notify("READY=1");
         loop {
             if let Some(sig) = signals.pending().next() {
                 info!("signal {sig} received, stopping device");
@@ -129,6 +130,25 @@ pub fn serve(cfg: &DiskConfig, engine: Arc<Engine>, rt: Handle, opts: &DeviceOpt
     ctrl.run_target(tgt_init, q_handler, device_fn)
         .context("ublk device failed")?;
     Ok(ctrl)
+}
+
+/// Tells systemd (Type=notify) about state changes; no-op outside systemd.
+fn sd_notify(state: &str) {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+    let Some(path) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    let path = path.to_string_lossy();
+    let addr = match path.strip_prefix('@') {
+        Some(name) => SocketAddr::from_abstract_name(name.as_bytes()),
+        None => SocketAddr::from_pathname(path.as_ref()),
+    };
+    let sent = addr.and_then(|a| UnixDatagram::unbound()?.send_to_addr(state.as_bytes(), &a));
+    if let Err(e) = sent {
+        warn!("cannot notify systemd: {e}");
+    }
 }
 
 /// Removes the stopped device.
@@ -374,4 +394,27 @@ fn report_zones(engine: &Engine, cdev: RawFd, pos: u64, offset: u64, max: usize)
         )));
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixDatagram;
+
+    #[test]
+    fn notifies_systemd_socket() {
+        let dir = std::env::temp_dir().join(format!("btrs3fs-notify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notify.sock");
+        let _ = std::fs::remove_file(&path);
+        let sock = UnixDatagram::bind(&path).unwrap();
+        // SAFETY: no other test reads or writes NOTIFY_SOCKET.
+        unsafe { std::env::set_var("NOTIFY_SOCKET", &path) };
+        sd_notify("READY=1");
+        unsafe { std::env::remove_var("NOTIFY_SOCKET") };
+        let mut buf = [0u8; 64];
+        let n = sock.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"READY=1");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

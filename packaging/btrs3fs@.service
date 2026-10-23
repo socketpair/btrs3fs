@@ -1,0 +1,27 @@
+# btrs3fs device instance. Instance name <name> reads /etc/btrs3fs/<name>.conf:
+#   CREDS=/etc/btrs3fs/creds.json   credentials file (mode 0600)
+#   PREFIX=disks/main               object key prefix of the disk
+#   DEV_ID=0                        device becomes /dev/ublkb<DEV_ID>
+#   EXTRA_ARGS=                     optional, e.g. "--queues 8 --http http1"
+#
+# Mount through fstab so the filesystem is unmounted before the device stops:
+#   /dev/ublkb0 /mnt/data btrfs _netdev,x-systemd.requires=btrs3fs@main.service 0 0
+
+[Unit]
+Description=btrs3fs S3-backed zoned block device (%i)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+EnvironmentFile=/etc/btrs3fs/%i.conf
+ExecStartPre=/usr/sbin/modprobe ublk_drv
+ExecStart=/usr/local/bin/btrs3fs run --creds ${CREDS} --prefix ${PREFIX} --dev-id ${DEV_ID} $EXTRA_ARGS
+# SIGTERM stops the device and flushes buffered data to S3; each request may
+# retry for retry_timeout_seconds (disk.json), so allow time for that.
+KillMode=mixed
+TimeoutStopSec=15min
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
