@@ -3,8 +3,8 @@
 #
 #   install     runtime packages + permissions:
 #               - group "btrs3fs" gets rw access to /dev/ublk-control, /dev/ublkcN, /dev/ublkbN
-#                 (note: this covers ALL ublk devices on the host, not only btrs3fs ones);
 #                 (the daemon uses unprivileged ublk mode: UBLK_F_UNPRIVILEGED_DEV);
+#                 note: this covers ALL ublk devices on the host, not only btrs3fs ones;
 #               - ublk_drv is loaded at boot;
 #               - /dev/ublkb0 can be mounted/unmounted by a regular user via fstab "user"
 #                 option ("user" implies nosuid,nodev,noexec).
