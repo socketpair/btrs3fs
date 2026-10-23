@@ -43,7 +43,12 @@ struct Ctx {
 /// Creates the device and serves it until SIGTERM/SIGINT/SIGHUP or until the
 /// device is removed externally. Returns after all queues stopped; the caller
 /// flushes remaining data and then calls `delete()`.
-pub fn serve(cfg: &DiskConfig, engine: Arc<Engine>, rt: Handle, opts: &DeviceOptions) -> anyhow::Result<UblkCtrl> {
+pub fn serve(
+    cfg: &DiskConfig,
+    engine: Arc<Engine>,
+    rt: Handle,
+    opts: &DeviceOptions,
+) -> anyhow::Result<UblkCtrl> {
     let features = UblkCtrl::get_features().context("ublk driver is not available")?;
     let needed = (sys::UBLK_F_USER_COPY | sys::UBLK_F_ZONED) as u64;
     if features & needed != needed {
@@ -191,8 +196,11 @@ fn run_queue(qid: u16, dev: &UblkDev, ctx: &Arc<Ctx>) {
 }
 
 async fn io_task(q: &UblkQueue<'_>, tag: u16, ctx: &Ctx) -> Result<(), UblkError> {
-    let efd = Arc::new(new_eventfd().map_err(|e| UblkError::OtherError(-e.raw_os_error().unwrap_or(libc::EIO)))?);
-    q.submit_io_prep_cmd(tag, BufDesc::ZonedAppendLba(0), 0, None).await?;
+    let efd = Arc::new(
+        new_eventfd().map_err(|e| UblkError::OtherError(-e.raw_os_error().unwrap_or(libc::EIO)))?,
+    );
+    q.submit_io_prep_cmd(tag, BufDesc::ZonedAppendLba(0), 0, None)
+        .await?;
     loop {
         let (res, lba) = match handle_io(q, tag, ctx, &efd).await {
             Ok(r) => r,
@@ -204,18 +212,27 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, ctx: &Ctx) -> Result<(), UblkError
                     iod.start_sector,
                     iod.nr_sectors
                 );
-                if !matches!(e, ZoneError::Invalid(_) | ZoneError::OpenLimit | ZoneError::ActiveLimit) {
+                if !matches!(
+                    e,
+                    ZoneError::Invalid(_) | ZoneError::OpenLimit | ZoneError::ActiveLimit
+                ) {
                     error!("I/O error: {e}");
                 }
                 (-e.errno(), 0)
             }
         };
-        q.submit_io_commit_cmd(tag, BufDesc::ZonedAppendLba(lba), res).await?;
+        q.submit_io_commit_cmd(tag, BufDesc::ZonedAppendLba(lba), res)
+            .await?;
     }
 }
 
 /// Returns (result, zone append LBA in sectors).
-async fn handle_io(q: &UblkQueue<'_>, tag: u16, ctx: &Ctx, efd: &Arc<OwnedFd>) -> ZResult<(i32, u64)> {
+async fn handle_io(
+    q: &UblkQueue<'_>,
+    tag: u16,
+    ctx: &Ctx,
+    efd: &Arc<OwnedFd>,
+) -> ZResult<(i32, u64)> {
     let iod = *q.get_iod(tag);
     let op = iod.op_flags & 0xff;
     let offset = iod.start_sector << SECTOR_SHIFT;
@@ -333,7 +350,14 @@ fn copy_from_request(cdev: RawFd, pos: u64, len: u64) -> ZResult<Bytes> {
     let mut buf = Vec::<u8>::with_capacity(len as usize);
     // SAFETY: the buffer has `len` bytes of capacity; only the bytes the kernel
     // reported as copied are exposed through set_len.
-    let n = unsafe { libc::pread(cdev, buf.as_mut_ptr().cast(), len as usize, pos as libc::off_t) };
+    let n = unsafe {
+        libc::pread(
+            cdev,
+            buf.as_mut_ptr().cast(),
+            len as usize,
+            pos as libc::off_t,
+        )
+    };
     if n != len as isize {
         return Err(ZoneError::Invalid(format!(
             "user copy from request failed: {n} of {len} bytes, {}",
@@ -348,7 +372,10 @@ fn copy_from_request(cdev: RawFd, pos: u64, len: u64) -> ZResult<Bytes> {
 fn copy_to_request(cdev: RawFd, bufs: &[Bytes], pos: u64, len: u64) -> ZResult<()> {
     let iov: Vec<libc::iovec> = bufs
         .iter()
-        .map(|b| libc::iovec { iov_base: b.as_ptr() as *mut _, iov_len: b.len() })
+        .map(|b| libc::iovec {
+            iov_base: b.as_ptr() as *mut _,
+            iov_len: b.len(),
+        })
         .collect();
     // SAFETY: iovecs point into live Bytes borrowed for the duration of the call.
     let n = unsafe { libc::pwritev(cdev, iov.as_ptr(), iov.len() as i32, pos as libc::off_t) };

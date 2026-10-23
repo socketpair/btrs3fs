@@ -6,14 +6,14 @@ mod zones;
 
 use anyhow::{Context, bail};
 use bytes::Bytes;
-use futures_util::StreamExt;
 use clap::{Args, Parser, Subcommand};
 use config::{DiskConfig, parse_size};
+use futures_util::StreamExt;
 use log::{error, info, warn};
+use s3::{RetryPolicy, S3Store, Transport};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use s3::{RetryPolicy, S3Store, Transport};
 use store::{Body, Layout, MemStore, Store};
 use zones::Engine;
 
@@ -240,7 +240,10 @@ fn cmd_detach(a: DetachArgs) -> anyhow::Result<i32> {
     }
     // SAFETY: plain syscall.
     if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-        bail!("cannot signal server process {pid}: {}", std::io::Error::last_os_error());
+        bail!(
+            "cannot signal server process {pid}: {}",
+            std::io::Error::last_os_error()
+        );
     }
     info!("sent SIGTERM to server process {pid}, waiting for it to flush and exit");
     let started = Instant::now();
@@ -249,7 +252,10 @@ fn cmd_detach(a: DetachArgs) -> anyhow::Result<i32> {
     while unsafe { libc::kill(pid, 0) } == 0 {
         std::thread::sleep(Duration::from_millis(100));
         if reported.elapsed() >= Duration::from_secs(5) {
-            info!("still waiting for process {pid} ({}s)", started.elapsed().as_secs());
+            info!(
+                "still waiting for process {pid} ({}s)",
+                started.elapsed().as_secs()
+            );
             reported = Instant::now();
         }
     }
@@ -329,7 +335,11 @@ fn cmd_destroy(a: DestroyArgs) -> anyhow::Result<i32> {
     let creds = config::Creds::load(&a.disk.creds)?;
     let layout = Layout::new(&a.disk.prefix)?;
     let defaults = DiskConfig::new(0, DiskConfig::DEFAULT_ZONE_SIZE);
-    let s3 = S3Store::new(&creds, &a.disk.transport, RetryPolicy::from_config(&defaults))?;
+    let s3 = S3Store::new(
+        &creds,
+        &a.disk.transport,
+        RetryPolicy::from_config(&defaults),
+    )?;
     let deleted = runtime()?.block_on(async {
         let config_key = layout.config_key();
         let keys: Vec<String> = s3

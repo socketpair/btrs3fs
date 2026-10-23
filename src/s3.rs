@@ -101,16 +101,29 @@ impl S3Store {
         };
         Ok(Self {
             http: builder.build().context("cannot create HTTP client")?,
-            base: format!("{}/{}", creds.endpoint.trim_end_matches('/'), encode_path(&creds.bucket)),
+            base: format!(
+                "{}/{}",
+                creds.endpoint.trim_end_matches('/'),
+                encode_path(&creds.bucket)
+            ),
             region: creds.region.clone(),
-            credentials: Credentials::new(&creds.access_key, &creds.secret_key, None, None, "btrs3fs"),
+            credentials: Credentials::new(
+                &creds.access_key,
+                &creds.secret_key,
+                None,
+                None,
+                "btrs3fs",
+            ),
             retry,
         })
     }
 
     /// Same client and connection pool with another retry policy.
     pub fn with_retry(&self, retry: RetryPolicy) -> Self {
-        Self { retry, ..self.clone() }
+        Self {
+            retry,
+            ..self.clone()
+        }
     }
 
     fn object_url(&self, key: &str) -> String {
@@ -166,10 +179,16 @@ impl S3Store {
             .filter(|(n, _)| *n != http::header::CONTENT_LENGTH)
             .map(|(n, v)| (n.as_str(), v.to_str().unwrap_or("")))
             .collect();
-        let signable =
-            SignableRequest::new(req.method().as_str(), uri, headers.into_iter(), SignableBody::UnsignedPayload)
-                .expect("request URI is valid");
-        let (instructions, _) = sign(signable, &params).expect("signing cannot fail").into_parts();
+        let signable = SignableRequest::new(
+            req.method().as_str(),
+            uri,
+            headers.into_iter(),
+            SignableBody::UnsignedPayload,
+        )
+        .expect("request URI is valid");
+        let (instructions, _) = sign(signable, &params)
+            .expect("signing cannot fail")
+            .into_parts();
         instructions.apply_to_request_http1x(req);
     }
 
@@ -206,7 +225,9 @@ impl S3Store {
     pub async fn put(&self, key: &str, body: Body) -> StoreResult<()> {
         let url = self.object_url(key);
         self.with_retries(&format!("PUT {key}"), || async {
-            let resp = self.send(reqwest::Method::PUT, &url, &[], Some(&body)).await?;
+            let resp = self
+                .send(reqwest::Method::PUT, &url, &[], Some(&body))
+                .await?;
             check(resp, key).await.map(drop)
         })
         .await
@@ -217,7 +238,9 @@ impl S3Store {
         let range = format!("bytes {}-{}/*", offset, offset + body.len() - 1);
         self.with_retries(&format!("PATCH {key} {range}"), || async {
             let headers = [("content-range", range.clone())];
-            let resp = self.send(reqwest::Method::PATCH, &url, &headers, Some(&body)).await?;
+            let resp = self
+                .send(reqwest::Method::PATCH, &url, &headers, Some(&body))
+                .await?;
             check(resp, key).await.map(drop)
         })
         .await
@@ -237,10 +260,15 @@ impl S3Store {
         let range = format!("bytes={}-{}", offset, offset + len - 1);
         self.with_retries(&format!("GET {key} {range}"), || async {
             let headers = [("range", range.clone())];
-            let resp = self.send(reqwest::Method::GET, &url, &headers, None).await?;
+            let resp = self
+                .send(reqwest::Method::GET, &url, &headers, None)
+                .await?;
             let data = check(resp, key).await?.bytes().await?;
             if data.len() as u64 != len {
-                return Err(Attempt::Retry(anyhow!("short read: got {} of {len} bytes", data.len())));
+                return Err(Attempt::Retry(anyhow!(
+                    "short read: got {} of {len} bytes",
+                    data.len()
+                )));
             }
             Ok(data)
         })
@@ -271,12 +299,16 @@ impl S3Store {
                 .with_retries(&format!("LIST {prefix}"), || async {
                     let resp = self.send(reqwest::Method::GET, &url, &[], None).await?;
                     let xml = check(resp, prefix).await?.text().await?;
-                    quick_xml::de::from_str(&xml)
-                        .map_err(|e| Attempt::Fatal(anyhow!("cannot parse list response: {e}").into()))
+                    quick_xml::de::from_str(&xml).map_err(|e| {
+                        Attempt::Fatal(anyhow!("cannot parse list response: {e}").into())
+                    })
                 })
                 .await?;
             debug!("LIST {prefix}: {} objects in page", page.contents.len());
-            out.extend(page.contents.into_iter().map(|c| ObjectInfo { key: c.key, size: c.size }));
+            out.extend(page.contents.into_iter().map(|c| ObjectInfo {
+                key: c.key,
+                size: c.size,
+            }));
             match (page.is_truncated, page.next_continuation_token) {
                 (true, Some(t)) => token = Some(t),
                 _ => return Ok(out),
@@ -312,10 +344,13 @@ async fn check(resp: reqwest::Response, key: &str) -> Result<reqwest::Response, 
     let detail = format!("HTTP {status}: {}", s3_error_summary(&body));
     Err(match status {
         StatusCode::NOT_FOUND => Attempt::Fatal(StoreError::NotFound(key.to_string())),
-        StatusCode::RANGE_NOT_SATISFIABLE => {
-            Attempt::Fatal(StoreError::InvalidRange { key: key.to_string(), detail })
+        StatusCode::RANGE_NOT_SATISFIABLE => Attempt::Fatal(StoreError::InvalidRange {
+            key: key.to_string(),
+            detail,
+        }),
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT => {
+            Attempt::Retry(anyhow!(detail))
         }
-        StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT => Attempt::Retry(anyhow!(detail)),
         s if s.is_server_error() => Attempt::Retry(anyhow!(detail)),
         _ => Attempt::Fatal(anyhow!("{key}: {detail}").into()),
     })
@@ -367,7 +402,10 @@ mod tests {
 
     #[test]
     fn encoding() {
-        assert_eq!(encode_path("a b/c+d/0000000002000000"), "a%20b/c%2Bd/0000000002000000");
+        assert_eq!(
+            encode_path("a b/c+d/0000000002000000"),
+            "a%20b/c%2Bd/0000000002000000"
+        );
         assert_eq!(encode_query("p/q r"), "p%2Fq%20r");
     }
 
@@ -381,7 +419,10 @@ mod tests {
 <NextContinuationToken>tok/1</NextContinuationToken></ListBucketResult>"#;
         let r: ListResult = quick_xml::de::from_str(xml).unwrap();
         assert_eq!(r.contents.len(), 2);
-        assert_eq!((r.contents[0].key.as_str(), r.contents[0].size), ("p/0000000000000000", 8192));
+        assert_eq!(
+            (r.contents[0].key.as_str(), r.contents[0].size),
+            ("p/0000000000000000", 8192)
+        );
         assert!(r.is_truncated);
         assert_eq!(r.next_continuation_token.as_deref(), Some("tok/1"));
 
@@ -393,7 +434,10 @@ mod tests {
     #[test]
     fn error_summary() {
         let body = "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>";
-        assert_eq!(s3_error_summary(body), "NoSuchKey: The specified key does not exist.");
+        assert_eq!(
+            s3_error_summary(body),
+            "NoSuchKey: The specified key does not exist."
+        );
     }
 }
 
@@ -414,12 +458,18 @@ mod bucket_tests {
             initial_delay: Duration::from_millis(100),
             backoff_factor: 2.0,
         };
-        let transport = Transport { http: HttpVersion::Auto, proxy: None };
+        let transport = Transport {
+            http: HttpVersion::Auto,
+            proxy: None,
+        };
         S3Store::new(&creds, &transport, retry).unwrap()
     }
 
     fn unique_prefix(name: &str) -> String {
-        let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         format!("test/{name}-{nanos:x}")
     }
 
@@ -442,7 +492,10 @@ mod bucket_tests {
         let prefix = unique_prefix("ops");
         let key = format!("{prefix}/obj");
 
-        assert!(matches!(s3.patch(&key, 0, body(&[1; 8192])).await, Err(StoreError::NotFound(_))));
+        assert!(matches!(
+            s3.patch(&key, 0, body(&[1; 8192])).await,
+            Err(StoreError::NotFound(_))
+        ));
         s3.put(&key, body(&[1; 8192])).await.unwrap();
         s3.patch(&key, 8192, body(&[2; 4096])).await.unwrap();
         s3.patch(&key, 8192, body(&[2; 4096])).await.unwrap(); // idempotent
@@ -453,11 +506,17 @@ mod bucket_tests {
         assert_eq!(s3.get(&key).await.unwrap().len(), 12288);
         let r = s3.get_range(&key, 8190, 4).await.unwrap();
         assert_eq!(&r[..], &[1, 1, 2, 2]);
-        assert!(matches!(s3.get(&format!("{prefix}/none")).await, Err(StoreError::NotFound(_))));
+        assert!(matches!(
+            s3.get(&format!("{prefix}/none")).await,
+            Err(StoreError::NotFound(_))
+        ));
 
         let listed = s3.list(&format!("{prefix}/")).await.unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!((listed[0].key.as_str(), listed[0].size), (key.as_str(), 12288));
+        assert_eq!(
+            (listed[0].key.as_str(), listed[0].size),
+            (key.as_str(), 12288)
+        );
 
         s3.delete(&key).await.unwrap();
         s3.delete(&key).await.unwrap(); // missing object is fine

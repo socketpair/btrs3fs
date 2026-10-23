@@ -239,7 +239,10 @@ impl Engine {
     /// Zone index and offset inside the zone.
     pub fn locate(&self, offset: u64) -> ZResult<(usize, u64)> {
         if offset >= self.disk_size {
-            return invalid(format!("offset {offset} beyond device size {}", self.disk_size));
+            return invalid(format!(
+                "offset {offset} beyond device size {}",
+                self.disk_size
+            ));
         }
         Ok(((offset / self.zone_size) as usize, offset % self.zone_size))
     }
@@ -284,7 +287,11 @@ impl Engine {
             if let Ok(mut st) = z.state.try_lock()
                 && st.cond == Cond::ImpOpen
             {
-                let to = if st.wp == 0 { Cond::Empty } else { Cond::Closed };
+                let to = if st.wp == 0 {
+                    Cond::Empty
+                } else {
+                    Cond::Closed
+                };
                 self.set_cond(&mut st, to);
                 debug!("zone {i} implicitly closed");
                 return true;
@@ -297,12 +304,16 @@ impl Engine {
     /// is the zone start). Returns the absolute offset the data was written at.
     pub fn write(&self, offset: u64, data: Bytes, append: bool) -> ZResult<u64> {
         let len = data.len() as u64;
-        if len == 0 || len % BLOCK_SIZE != 0 {
-            return invalid(format!("write length {len} is not a multiple of {BLOCK_SIZE}"));
+        if len == 0 || !len.is_multiple_of(BLOCK_SIZE) {
+            return invalid(format!(
+                "write length {len} is not a multiple of {BLOCK_SIZE}"
+            ));
         }
         let (zi, rel) = self.locate(offset)?;
         if append && rel != 0 {
-            return invalid(format!("zone append at {offset} does not target a zone start"));
+            return invalid(format!(
+                "zone append at {offset} does not target a zone start"
+            ));
         }
         let zone = &self.zones[zi];
         let mut st = zone.state.lock().unwrap();
@@ -311,10 +322,14 @@ impl Engine {
         }
         let pos = st.wp;
         if !append && rel != pos {
-            return invalid(format!("write at {rel} in zone {zi}, write pointer is at {pos}"));
+            return invalid(format!(
+                "write at {rel} in zone {zi}, write pointer is at {pos}"
+            ));
         }
         if pos + len > self.zone_size {
-            return invalid(format!("write of {len} at {pos} crosses the end of zone {zi}"));
+            return invalid(format!(
+                "write of {len} at {pos} crosses the end of zone {zi}"
+            ));
         }
         match st.cond {
             Cond::Empty | Cond::Closed => {
@@ -464,7 +479,11 @@ impl Engine {
         match st.cond {
             Cond::Closed => Ok(()),
             Cond::ImpOpen | Cond::ExpOpen => {
-                let to = if st.wp == 0 { Cond::Empty } else { Cond::Closed };
+                let to = if st.wp == 0 {
+                    Cond::Empty
+                } else {
+                    Cond::Closed
+                };
                 self.set_cond(&mut st, to);
                 Ok(())
             }
@@ -637,7 +656,9 @@ mod tests {
         cfg.max_active_zones = max_active;
         cfg.dirty_limit_bytes = 64 * B;
         cfg.validate().unwrap();
-        Engine::open(&cfg, Layout::new("t").unwrap(), store).await.unwrap()
+        Engine::open(&cfg, Layout::new("t").unwrap(), store)
+            .await
+            .unwrap()
     }
 
     fn mem() -> Arc<Store> {
@@ -723,7 +744,15 @@ mod tests {
 
         e.write(0, blk(9, 1), false).unwrap(); // fresh object after reset: PUT
         e.flush_all().await.unwrap();
-        assert_eq!(store.get("t/0000000000000000").await.unwrap().unwrap().len() as u64, B);
+        assert_eq!(
+            store
+                .get("t/0000000000000000")
+                .await
+                .unwrap()
+                .unwrap()
+                .len() as u64,
+            B
+        );
     }
 
     #[tokio::test]
@@ -756,7 +785,10 @@ mod tests {
         let conds: Vec<Cond> = e.report(0, 3).iter().map(|z| z.cond).collect();
         assert_eq!(conds.iter().filter(|&&c| c == Cond::Closed).count(), 1);
         // Three active zones: a fourth cannot be opened.
-        assert!(matches!(e.write(3 * ZS, blk(1, 1), false), Err(ZoneError::ActiveLimit)));
+        assert!(matches!(
+            e.write(3 * ZS, blk(1, 1), false),
+            Err(ZoneError::ActiveLimit)
+        ));
         // Explicitly open zones cannot be implicitly closed.
         e.close_zone(0).ok();
         e.close_zone(ZS).ok();
@@ -767,7 +799,10 @@ mod tests {
         // Finishing frees an open and an active slot.
         e.finish_zone(0).unwrap();
         e.write(3 * ZS, blk(1, 1), false).unwrap();
-        assert!(matches!(e.write(4 * ZS, blk(1, 1), false), Err(ZoneError::ActiveLimit)));
+        assert!(matches!(
+            e.write(4 * ZS, blk(1, 1), false),
+            Err(ZoneError::ActiveLimit)
+        ));
     }
 
     #[tokio::test]

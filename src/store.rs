@@ -136,20 +136,27 @@ impl MemStore {
     fn get(&self, key: &str) -> StoreResult<Bytes> {
         self.check_fail()?;
         let objects = self.objects.lock().unwrap();
-        let data = objects.get(key).ok_or_else(|| StoreError::NotFound(key.to_string()))?;
+        let data = objects
+            .get(key)
+            .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
         Ok(Bytes::copy_from_slice(data))
     }
 
     fn put(&self, key: &str, body: Body) -> StoreResult<()> {
         self.check_fail()?;
-        self.objects.lock().unwrap().insert(key.to_string(), body.to_vec());
+        self.objects
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), body.to_vec());
         Ok(())
     }
 
     fn patch(&self, key: &str, offset: u64, body: Body) -> StoreResult<()> {
         self.check_fail()?;
         let mut objects = self.objects.lock().unwrap();
-        let data = objects.get_mut(key).ok_or_else(|| StoreError::NotFound(key.to_string()))?;
+        let data = objects
+            .get_mut(key)
+            .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
         if offset > data.len() as u64 {
             return Err(StoreError::InvalidRange {
                 key: key.to_string(),
@@ -169,13 +176,16 @@ impl MemStore {
     fn get_range(&self, key: &str, offset: u64, len: u64) -> StoreResult<Bytes> {
         self.check_fail()?;
         let objects = self.objects.lock().unwrap();
-        let data = objects.get(key).ok_or_else(|| StoreError::NotFound(key.to_string()))?;
-        let end = offset.checked_add(len).filter(|&e| e <= data.len() as u64).ok_or_else(|| {
-            StoreError::InvalidRange {
+        let data = objects
+            .get(key)
+            .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
+        let end = offset
+            .checked_add(len)
+            .filter(|&e| e <= data.len() as u64)
+            .ok_or_else(|| StoreError::InvalidRange {
                 key: key.to_string(),
                 detail: format!("range {offset}+{len} beyond object size {}", data.len()),
-            }
-        })?;
+            })?;
         Ok(Bytes::copy_from_slice(&data[offset as usize..end as usize]))
     }
 
@@ -191,7 +201,10 @@ impl MemStore {
         Ok(objects
             .range(prefix.to_string()..)
             .take_while(|(k, _)| k.starts_with(prefix))
-            .map(|(k, v)| ObjectInfo { key: k.clone(), size: v.len() as u64 })
+            .map(|(k, v)| ObjectInfo {
+                key: k.clone(),
+                size: v.len() as u64,
+            })
             .collect())
     }
 }
@@ -207,7 +220,9 @@ impl Layout {
         let prefix = prefix.trim_end_matches('/');
         anyhow::ensure!(!prefix.is_empty(), "prefix must not be empty");
         anyhow::ensure!(!prefix.starts_with('/'), "prefix must not start with '/'");
-        Ok(Self { prefix: prefix.to_string() })
+        Ok(Self {
+            prefix: prefix.to_string(),
+        })
     }
 
     /// `<prefix>/` — every object of the disk starts with it.
@@ -245,12 +260,18 @@ mod tests {
     #[test]
     fn mem_patch_semantics() {
         let m = MemStore::default();
-        assert!(matches!(m.patch("k", 0, body(b"x")), Err(StoreError::NotFound(_))));
+        assert!(matches!(
+            m.patch("k", 0, body(b"x")),
+            Err(StoreError::NotFound(_))
+        ));
         m.put("k", body(b"aaaa")).unwrap();
         m.patch("k", 4, body(b"bb")).unwrap();
         m.patch("k", 4, body(b"bb")).unwrap(); // idempotent repeat
         m.patch("k", 5, body(b"cc")).unwrap(); // overlap + extend
-        assert!(matches!(m.patch("k", 99, body(b"d")), Err(StoreError::InvalidRange { .. })));
+        assert!(matches!(
+            m.patch("k", 99, body(b"d")),
+            Err(StoreError::InvalidRange { .. })
+        ));
         assert_eq!(&m.get("k").unwrap()[..], b"aaaabcc");
         assert_eq!(&m.get_range("k", 3, 2).unwrap()[..], b"ab");
         assert!(m.get_range("k", 6, 2).is_err());
@@ -260,7 +281,10 @@ mod tests {
     fn layout_keys() {
         let l = Layout::new("disks/test/").unwrap();
         assert_eq!(l.zone_key(32 << 20), "disks/test/0000000002000000");
-        assert_eq!(l.parse_zone_key("disks/test/0000000002000000"), Some(32 << 20));
+        assert_eq!(
+            l.parse_zone_key("disks/test/0000000002000000"),
+            Some(32 << 20)
+        );
         assert_eq!(l.parse_zone_key("disks/test/disk.json"), None);
         assert_eq!(l.parse_zone_key("disks/test2/0000000002000000"), None);
         assert!(Layout::new("/").is_err());

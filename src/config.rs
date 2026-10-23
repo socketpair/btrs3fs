@@ -70,7 +70,7 @@ impl DiskConfig {
             self.zone_size
         );
         ensure!(
-            self.disk_size > 0 && self.disk_size % self.zone_size == 0,
+            self.disk_size > 0 && self.disk_size.is_multiple_of(self.zone_size),
             "disk_size {} must be a positive multiple of zone_size {}",
             self.disk_size,
             self.zone_size
@@ -105,7 +105,11 @@ impl DiskConfig {
 
     /// Zone limit as reported to the kernel: 0 means "no limit".
     pub fn effective_limit(&self, limit: u32) -> u32 {
-        if limit as u64 >= self.nr_zones() { 0 } else { limit }
+        if limit as u64 >= self.nr_zones() {
+            0
+        } else {
+            limit
+        }
     }
 
     pub fn from_json(data: &[u8]) -> anyhow::Result<Self> {
@@ -175,10 +179,16 @@ pub fn parse_size(s: &str) -> anyhow::Result<u64> {
             (&s[..i], mult)
         }
     };
-    let value: f64 = num.trim().parse().with_context(|| format!("invalid size {s:?}"))?;
+    let value: f64 = num
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid size {s:?}"))?;
     ensure!(value >= 0.0, "size must not be negative: {s:?}");
     let bytes = value * mult as f64;
-    ensure!(bytes.fract() == 0.0, "size {s:?} is not a whole number of bytes");
+    ensure!(
+        bytes.fract() == 0.0,
+        "size {s:?} is not a whole number of bytes"
+    );
     Ok(bytes as u64)
 }
 
@@ -199,7 +209,11 @@ mod tests {
     fn rejects_bad_geometry() {
         assert!(DiskConfig::new(10 << 30, 3 << 20).validate().is_err()); // not a power of two
         assert!(DiskConfig::new(10 << 30, 64 << 20).validate().is_err()); // > 10000 blocks
-        assert!(DiskConfig::new((10 << 30) + 4096, 32 << 20).validate().is_err()); // not a multiple
+        assert!(
+            DiskConfig::new((10 << 30) + 4096, 32 << 20)
+                .validate()
+                .is_err()
+        ); // not a multiple
     }
 
     #[test]
