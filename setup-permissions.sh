@@ -21,7 +21,7 @@
 # After install the user must start a new login session to get the group,
 # or run commands via: sg btrs3fs -c '<command>'
 set -euo pipefail
-
+set -x
 GROUP=btrs3fs
 DEVICE=/dev/ublkb0
 MOUNTPOINT=/mnt/btrs3fs
