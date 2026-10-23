@@ -2,12 +2,13 @@
 # One-time host setup for btrs3fs so that no sudo is needed during development.
 #
 #   install     runtime packages + permissions:
-#               - group "ublk" gets rw access to /dev/ublk-control, /dev/ublkcN, /dev/ublkbN
+#               - group "btrs3fs" gets rw access to /dev/ublk-control, /dev/ublkcN, /dev/ublkbN
+#                 (note: this covers ALL ublk devices on the host, not only btrs3fs ones);
 #                 (the daemon uses unprivileged ublk mode: UBLK_F_UNPRIVILEGED_DEV);
 #               - ublk_drv is loaded at boot;
 #               - /dev/ublkb0 can be mounted/unmounted by a regular user via fstab "user"
 #                 option ("user" implies nosuid,nodev,noexec).
-#   uninstall   revert permissions (packages are kept).
+#   uninstall   revert permissions and delete the group (packages are kept).
 #   build-deps  packages needed to build btrs3fs from source.
 #   diag-tools  packages for testing and diagnostics.
 #
@@ -18,10 +19,10 @@
 #   sudo ./setup-permissions.sh diag-tools
 #
 # After install the user must start a new login session to get the group,
-# or run commands via: sg ublk -c '<command>'
+# or run commands via: sg btrs3fs -c '<command>'
 set -euo pipefail
 
-GROUP=ublk
+GROUP=btrs3fs
 DEVICE=/dev/ublkb0
 MOUNTPOINT=/mnt/btrs3fs
 UDEV_RULES=/etc/udev/rules.d/99-btrs3fs-ublk.rules
@@ -126,8 +127,11 @@ uninstall() {
     udevadm control --reload
     udevadm trigger --action=change --sysname-match='ublk*'
 
-    gpasswd --delete "$user" "$GROUP" 2>/dev/null || true
-    echo "uninstalled; group '$GROUP' and packages kept (remove group with: groupdel $GROUP)"
+    if getent group "$GROUP" >/dev/null; then
+        gpasswd --delete "$user" "$GROUP" 2>/dev/null || true
+        groupdel "$GROUP"
+    fi
+    echo "uninstalled; packages kept"
 }
 
 case "$ACTION" in

@@ -306,7 +306,7 @@ struct Zone {
 ## 11. Права доступа и окружение
 
 - Демон, `mkfs.btrfs`, `blkzone` — **от обычного пользователя**: непривилегированный
-  ublk (`UBLK_F_UNPRIVILEGED_DEV`) + группа `ublk` с доступом к
+  ublk (`UBLK_F_UNPRIVILEGED_DEV`) + группа `btrs3fs` с доступом к
   `/dev/ublk-control`, `/dev/ublkcN`, `/dev/ublkbN`.
 - Монтирование — без sudo, через строку в `/etc/fstab` с опцией `user`
   (подразумевает `nosuid,nodev,noexec`).
@@ -316,13 +316,13 @@ struct Zone {
   | Действие | Что делает |
   |---|---|
   | `install` | Пакеты для работы готовой системы + права (группа, udev, модуль, fstab) |
-  | `uninstall` | Откат прав (пакеты остаются) |
+  | `uninstall` | Откат прав, удаление группы (пакеты остаются) |
   | `build-deps` | Пакеты для сборки: `rust`, `cargo`, `gcc`, `clang-devel` (libclang для bindgen в `libublk-rs-sys`), `kernel-headers`, `glibc-devel`, `git` |
   | `diag-tools` | Тесты и диагностика: `fio`, `blktrace`, `sysstat`, `strace`, `gdb`, `perf`, `jq`, `awscli2` |
 
   Пакеты для работы: `kernel-modules-core` (`ublk_drv`), `systemd-udev`, `shadow-utils`,
   `util-linux`, `btrfs-progs`, `ca-certificates`.
-- Новая группа без перелогина: `sg ublk -c '<команда>'`.
+- Новая группа без перелогина: `sg btrs3fs -c '<команда>'`.
 - **Запасной план**, если ядро не разрешит `UBLK_F_ZONED` в непривилегированном режиме:
   бинарник в `/usr/local/bin` (владелец root, устанавливает пользователь после ревью) +
   правила sudoers с регулярками (`/usr/bin/mount ^-t btrfs /dev/ublkb[0-9]+ /mnt/btrs3fs$`).
