@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
-# One-time host setup for btrs3fs so that no sudo is needed during development.
+# One-time host setup for btrs3fs development.
+#
+# A zoned ublk device requires UBLK_F_USER_COPY, which the kernel forbids for
+# unprivileged ublk devices, so the daemon must run as root (CAP_SYS_ADMIN).
 #
 #   install     runtime packages + permissions:
-#               - group "btrs3fs" gets rw access to /dev/ublk-control, /dev/ublkcN, /dev/ublkbN
-#                 (the daemon uses unprivileged ublk mode: UBLK_F_UNPRIVILEGED_DEV);
-#                 note: this covers ALL ublk devices on the host, not only btrs3fs ones;
+#               - sudoers: the user may run the development build
+#                 <repo>/target/debug/btrs3fs as root without a password
+#                 (and nothing else). NOTE: whoever can rewrite that file
+#                 effectively has root;
+#               - group "btrs3fs" gets rw access to /dev/ublkbN, so mkfs.btrfs,
+#                 blkzone and test I/O run as the regular user
+#                 (this covers ALL ublk block devices on the host, not only btrs3fs ones);
 #               - ublk_drv is loaded at boot;
 #               - /dev/ublkb0 can be mounted/unmounted by a regular user via fstab "user"
 #                 option ("user" implies nosuid,nodev,noexec).
@@ -27,6 +34,8 @@ DEVICE=/dev/ublkb0
 MOUNTPOINT=/mnt/btrs3fs
 UDEV_RULES=/etc/udev/rules.d/99-btrs3fs-ublk.rules
 MODULES_LOAD=/etc/modules-load.d/btrs3fs-ublk.conf
+SUDOERS=/etc/sudoers.d/btrs3fs
+DEV_BINARY="$(dirname "$(readlink -f "$0")")/target/debug/btrs3fs"
 FSTAB_LINE="$DEVICE $MOUNTPOINT btrfs noauto,user 0 0"
 
 # Strictly required to run a ready-made btrs3fs binary.
@@ -34,6 +43,7 @@ RUNTIME_PACKAGES=(
     kernel-modules-core   # ublk_drv.ko
     systemd-udev          # udevadm, device node permissions
     shadow-utils          # groupadd, usermod, gpasswd, sg
+    sudo                  # run the daemon as root
     util-linux            # mount/umount with fstab "user" option
     btrfs-progs           # mkfs.btrfs
     ca-certificates       # TLS to the S3 endpoint
@@ -90,15 +100,21 @@ install() {
     echo ublk_drv > "$MODULES_LOAD"
 
     cat > "$UDEV_RULES" <<EOF
-KERNEL=="ublk-control", GROUP="$GROUP", MODE="0660"
-KERNEL=="ublkc[0-9]*",  GROUP="$GROUP", MODE="0660"
-KERNEL=="ublkb[0-9]*",  GROUP="$GROUP", MODE="0660"
+KERNEL=="ublkb[0-9]*", GROUP="$GROUP", MODE="0660"
 EOF
     udevadm control --reload
     modprobe ublk_drv
     # Re-apply rules to nodes that may already exist (module loaded earlier).
     udevadm trigger --action=change --sysname-match='ublk*'
     udevadm settle
+
+    # Validate before installing: a broken sudoers file can lock out sudo.
+    local tmp
+    tmp="$(mktemp)"
+    echo "$user ALL=(root) NOPASSWD: $DEV_BINARY" > "$tmp"
+    visudo --check --quiet --file="$tmp"
+    command install --mode=0440 --owner=root --group=root "$tmp" "$SUDOERS"
+    rm -f "$tmp"
 
     mkdir -p "$MOUNTPOINT"
     if ! grep -qF "$FSTAB_LINE" /etc/fstab; then
@@ -107,7 +123,7 @@ EOF
     fi
 
     echo "installed for user '$user':"
-    ls -l /dev/ublk-control
+    cat "$SUDOERS"
     grep -F "$FSTAB_LINE" /etc/fstab
 }
 
@@ -123,7 +139,7 @@ uninstall() {
     fi
     rmdir "$MOUNTPOINT" 2>/dev/null || true
 
-    rm -f "$UDEV_RULES" "$MODULES_LOAD"
+    rm -f "$SUDOERS" "$UDEV_RULES" "$MODULES_LOAD"
     udevadm control --reload
     udevadm trigger --action=change --sysname-match='ublk*'
 
