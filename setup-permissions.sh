@@ -7,7 +7,8 @@
 #   install     runtime packages + permissions:
 #               - sudoers: the user may run the development build
 #                 <repo>/target/debug/btrs3fs as root without a password
-#                 (and nothing else). NOTE: whoever can rewrite that file
+#                 and "chown <user> /mnt/btrs3fs" with exactly these arguments
+#                 (and nothing else). NOTE: whoever can rewrite that binary
 #                 effectively has root;
 #               - group "btrs3fs" gets rw access to /dev/ublkbN, so mkfs.btrfs,
 #                 blkzone and test I/O run as the regular user
@@ -121,7 +122,12 @@ EOF
     # Validate before installing: a broken sudoers file can lock out sudo.
     local tmp
     tmp="$(mktemp)"
-    echo "$user ALL=(root) NOPASSWD: $DEV_BINARY" > "$tmp"
+    {
+        echo "$user ALL=(root) NOPASSWD: $DEV_BINARY"
+        # mkfs.btrfs cannot set the root owner in zoned mode (--rootdir is
+        # incompatible), so allow exactly this one chown of the mounted root.
+        echo "$user ALL=(root) NOPASSWD: /usr/bin/chown $user $MOUNTPOINT"
+    } > "$tmp"
     visudo --check --quiet --file="$tmp"
     command install --mode=0440 --owner=root --group=root "$tmp" "$SUDOERS"
     rm -f "$tmp"

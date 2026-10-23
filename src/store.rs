@@ -1,0 +1,264 @@
+//! Object storage abstraction: one object per zone plus `disk.json`.
+//!
+//! `MemStore` mirrors the semantics observed on Yandex Object Storage
+//! (see SPEC.md §13.3): PATCH of a missing object fails with "not found",
+//! PATCH starting past the end of the object fails with "invalid range",
+//! PATCH may overlap the tail and extend the object.
+
+use bytes::Bytes;
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("object {0} not found")]
+    NotFound(String),
+    #[error("invalid range for object {key}: {detail}")]
+    InvalidRange { key: String, detail: String },
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+pub type StoreResult<T> = Result<T, StoreError>;
+
+/// Object body as a list of chunks, sent without concatenation.
+#[derive(Clone, Default, Debug)]
+pub struct Body {
+    pub chunks: Vec<Bytes>,
+}
+
+impl Body {
+    pub fn new(chunks: Vec<Bytes>) -> Self {
+        Self { chunks }
+    }
+
+    pub fn len(&self) -> u64 {
+        self.chunks.iter().map(|c| c.len() as u64).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn to_vec(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.len() as usize);
+        for c in &self.chunks {
+            out.extend_from_slice(c);
+        }
+        out
+    }
+}
+
+pub struct ObjectInfo {
+    pub key: String,
+    pub size: u64,
+}
+
+pub enum Store {
+    Mem(MemStore),
+}
+
+impl Store {
+    /// Whole object, `None` if it does not exist.
+    pub async fn get(&self, key: &str) -> StoreResult<Option<Bytes>> {
+        let res = match self {
+            Store::Mem(m) => m.get(key),
+        };
+        match res {
+            Ok(b) => Ok(Some(b)),
+            Err(StoreError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Creates or replaces an object.
+    pub async fn put(&self, key: &str, body: Body) -> StoreResult<()> {
+        match self {
+            Store::Mem(m) => m.put(key, body),
+        }
+    }
+
+    /// Writes `body` at `offset` of an existing object; `offset` must not exceed its size.
+    pub async fn patch(&self, key: &str, offset: u64, body: Body) -> StoreResult<()> {
+        match self {
+            Store::Mem(m) => m.patch(key, offset, body),
+        }
+    }
+
+    /// Exactly `len` bytes starting at `offset`.
+    pub async fn get_range(&self, key: &str, offset: u64, len: u64) -> StoreResult<Bytes> {
+        match self {
+            Store::Mem(m) => m.get_range(key, offset, len),
+        }
+    }
+
+    /// Deletes an object; deleting a missing object is not an error.
+    pub async fn delete(&self, key: &str) -> StoreResult<()> {
+        match self {
+            Store::Mem(m) => m.delete(key),
+        }
+    }
+
+    /// All objects whose key starts with `prefix`.
+    pub async fn list(&self, prefix: &str) -> StoreResult<Vec<ObjectInfo>> {
+        match self {
+            Store::Mem(m) => m.list(prefix),
+        }
+    }
+}
+
+/// In-memory store for tests and `run --memory`.
+#[derive(Default)]
+pub struct MemStore {
+    objects: Mutex<BTreeMap<String, Vec<u8>>>,
+    fail: AtomicBool,
+}
+
+impl MemStore {
+    /// Makes every subsequent operation fail (failure injection for tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_fail(&self, fail: bool) {
+        self.fail.store(fail, Ordering::SeqCst);
+    }
+
+    fn check_fail(&self) -> StoreResult<()> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("injected store failure").into());
+        }
+        Ok(())
+    }
+
+    fn get(&self, key: &str) -> StoreResult<Bytes> {
+        self.check_fail()?;
+        let objects = self.objects.lock().unwrap();
+        let data = objects.get(key).ok_or_else(|| StoreError::NotFound(key.to_string()))?;
+        Ok(Bytes::copy_from_slice(data))
+    }
+
+    fn put(&self, key: &str, body: Body) -> StoreResult<()> {
+        self.check_fail()?;
+        self.objects.lock().unwrap().insert(key.to_string(), body.to_vec());
+        Ok(())
+    }
+
+    fn patch(&self, key: &str, offset: u64, body: Body) -> StoreResult<()> {
+        self.check_fail()?;
+        let mut objects = self.objects.lock().unwrap();
+        let data = objects.get_mut(key).ok_or_else(|| StoreError::NotFound(key.to_string()))?;
+        if offset > data.len() as u64 {
+            return Err(StoreError::InvalidRange {
+                key: key.to_string(),
+                detail: format!("patch offset {offset} beyond object size {}", data.len()),
+            });
+        }
+        let offset = offset as usize;
+        let body = body.to_vec();
+        let end = offset + body.len();
+        if end > data.len() {
+            data.resize(end, 0);
+        }
+        data[offset..end].copy_from_slice(&body);
+        Ok(())
+    }
+
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> StoreResult<Bytes> {
+        self.check_fail()?;
+        let objects = self.objects.lock().unwrap();
+        let data = objects.get(key).ok_or_else(|| StoreError::NotFound(key.to_string()))?;
+        let end = offset.checked_add(len).filter(|&e| e <= data.len() as u64).ok_or_else(|| {
+            StoreError::InvalidRange {
+                key: key.to_string(),
+                detail: format!("range {offset}+{len} beyond object size {}", data.len()),
+            }
+        })?;
+        Ok(Bytes::copy_from_slice(&data[offset as usize..end as usize]))
+    }
+
+    fn delete(&self, key: &str) -> StoreResult<()> {
+        self.check_fail()?;
+        self.objects.lock().unwrap().remove(key);
+        Ok(())
+    }
+
+    fn list(&self, prefix: &str) -> StoreResult<Vec<ObjectInfo>> {
+        self.check_fail()?;
+        let objects = self.objects.lock().unwrap();
+        Ok(objects
+            .range(prefix.to_string()..)
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| ObjectInfo { key: k.clone(), size: v.len() as u64 })
+            .collect())
+    }
+}
+
+/// Object key layout inside the bucket (SPEC.md §3.1).
+#[derive(Clone, Debug)]
+pub struct Layout {
+    prefix: String,
+}
+
+impl Layout {
+    pub fn new(prefix: &str) -> anyhow::Result<Self> {
+        let prefix = prefix.trim_end_matches('/');
+        anyhow::ensure!(!prefix.is_empty(), "prefix must not be empty");
+        anyhow::ensure!(!prefix.starts_with('/'), "prefix must not start with '/'");
+        Ok(Self { prefix: prefix.to_string() })
+    }
+
+    /// `<prefix>/` — every object of the disk starts with it.
+    pub fn dir(&self) -> String {
+        format!("{}/", self.prefix)
+    }
+
+    pub fn config_key(&self) -> String {
+        format!("{}/disk.json", self.prefix)
+    }
+
+    /// Zone object name: byte offset of the zone, 16 lowercase hex digits.
+    pub fn zone_key(&self, zone_offset: u64) -> String {
+        format!("{}/{zone_offset:016x}", self.prefix)
+    }
+
+    /// Byte offset of the zone if `key` is a zone object of this disk.
+    pub fn parse_zone_key(&self, key: &str) -> Option<u64> {
+        let name = key.strip_prefix(&self.prefix)?.strip_prefix('/')?;
+        if name.len() != 16 || !name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return None;
+        }
+        u64::from_str_radix(name, 16).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn body(data: &[u8]) -> Body {
+        Body::new(vec![Bytes::copy_from_slice(data)])
+    }
+
+    #[test]
+    fn mem_patch_semantics() {
+        let m = MemStore::default();
+        assert!(matches!(m.patch("k", 0, body(b"x")), Err(StoreError::NotFound(_))));
+        m.put("k", body(b"aaaa")).unwrap();
+        m.patch("k", 4, body(b"bb")).unwrap();
+        m.patch("k", 4, body(b"bb")).unwrap(); // idempotent repeat
+        m.patch("k", 5, body(b"cc")).unwrap(); // overlap + extend
+        assert!(matches!(m.patch("k", 99, body(b"d")), Err(StoreError::InvalidRange { .. })));
+        assert_eq!(&m.get("k").unwrap()[..], b"aaaabcc");
+        assert_eq!(&m.get_range("k", 3, 2).unwrap()[..], b"ab");
+        assert!(m.get_range("k", 6, 2).is_err());
+    }
+
+    #[test]
+    fn layout_keys() {
+        let l = Layout::new("disks/test/").unwrap();
+        assert_eq!(l.zone_key(32 << 20), "disks/test/0000000002000000");
+        assert_eq!(l.parse_zone_key("disks/test/0000000002000000"), Some(32 << 20));
+        assert_eq!(l.parse_zone_key("disks/test/disk.json"), None);
+        assert_eq!(l.parse_zone_key("disks/test2/0000000002000000"), None);
+        assert!(Layout::new("/").is_err());
+    }
+}

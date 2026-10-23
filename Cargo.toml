@@ -1,0 +1,36 @@
+[package]
+name = "btrs3fs"
+version = "0.1.0"
+edition = "2024"
+description = "Zoned ublk block device backed by S3 (one object per zone)"
+license = "MIT"
+
+[dependencies]
+# ublk
+libublk = "0.4.8"
+io-uring = "0.7.12"
+smol = "2.0.2"
+libc = "0.2"
+
+# async runtime and HTTP/S3
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream"] }
+aws-sigv4 = "1.6"
+aws-credential-types = "1"
+http = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
+
+# common
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+signal-hook = "0.4"
+
+[profile.release]
+debug = 1
