@@ -24,8 +24,8 @@ set -euo pipefail
 GROUP=ublk
 DEVICE=/dev/ublkb0
 MOUNTPOINT=/mnt/btrs3fs
-UDEV_RULES=/etc/udev/rules.d/99-ublk.rules
-MODULES_LOAD=/etc/modules-load.d/ublk.conf
+UDEV_RULES=/etc/udev/rules.d/99-btrs3fs-ublk.rules
+MODULES_LOAD=/etc/modules-load.d/btrs3fs-ublk.conf
 FSTAB_LINE="$DEVICE $MOUNTPOINT btrfs noauto,user 0 0"
 
 # Strictly required to run a ready-made btrs3fs binary.
