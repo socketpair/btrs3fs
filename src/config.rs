@@ -16,6 +16,9 @@ pub const MAX_APPENDS_PER_OBJECT: u64 = 10_000;
 /// addresses at most 32 MiB per request.
 pub const MAX_ZONE_SIZE: u64 = 32 << 20;
 
+/// btrfs needs at least this many active zones (`BTRFS_MIN_ACTIVE_ZONES`).
+const MIN_ACTIVE_ZONES: u32 = 8;
+
 /// Maximum queue depth accepted by the ublk driver.
 const UBLK_MAX_QUEUE_DEPTH: u16 = 4096;
 
@@ -88,6 +91,20 @@ impl DiskConfig {
             self.nr_zones() <= u32::MAX as u64,
             "too many zones: {}",
             self.nr_zones()
+        );
+        let (open, active) = (
+            self.effective_limit(self.max_open_zones),
+            self.effective_limit(self.max_active_zones),
+        );
+        ensure!(
+            active == 0 || active >= MIN_ACTIVE_ZONES,
+            "max_active_zones {active} is below the btrfs minimum of {MIN_ACTIVE_ZONES}"
+        );
+        ensure!(
+            active == 0 || (open != 0 && open <= active),
+            "max_open_zones {} must not exceed max_active_zones {}",
+            self.max_open_zones,
+            self.max_active_zones
         );
         ensure!(
             self.dirty_limit_bytes >= BLOCK_SIZE,
@@ -223,6 +240,21 @@ mod tests {
                 .validate()
                 .is_err()
         ); // not a multiple
+    }
+
+    #[test]
+    fn zone_limits() {
+        let mut cfg = DiskConfig::new(1 << 30, 16 << 20); // 64 zones
+        cfg.max_open_zones = 32;
+        cfg.max_active_zones = 16;
+        assert!(cfg.validate().is_err()); // open > active
+        cfg.max_open_zones = 16;
+        cfg.validate().unwrap();
+        cfg.max_open_zones = 4;
+        cfg.max_active_zones = 4;
+        assert!(cfg.validate().is_err()); // below the btrfs minimum
+        cfg.max_active_zones = 1024; // >= zone count: no limit
+        cfg.validate().unwrap();
     }
 
     #[test]
