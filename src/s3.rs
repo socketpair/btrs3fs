@@ -6,7 +6,7 @@
 //! so they are streamed from the zone chunks without hashing or concatenation.
 
 use crate::config::{Creds, DiskConfig};
-use crate::store::{Body, ObjectInfo, StoreError, StoreResult};
+use crate::store::{Body, FINISHED_TAG, ObjectInfo, StoreError, StoreResult};
 use anyhow::{Context, anyhow};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
@@ -288,6 +288,38 @@ impl S3Store {
         .await
     }
 
+    /// PutObjectTagging: sets `FINISHED_TAG` without rewriting the data.
+    pub async fn mark_finished(&self, key: &str) -> StoreResult<()> {
+        let url = format!("{}?tagging", self.object_url(key));
+        let xml = format!(
+            "<Tagging><TagSet><Tag><Key>{}</Key><Value>{}</Value></Tag></TagSet></Tagging>",
+            FINISHED_TAG.0, FINISHED_TAG.1
+        );
+        let body = Body::new(vec![Bytes::from(xml)]);
+        self.with_retries(&format!("PUT {key}?tagging"), || async {
+            let headers = [("content-type", "application/xml".to_string())];
+            let resp = self
+                .send(reqwest::Method::PUT, &url, &headers, Some(&body))
+                .await?;
+            check(resp, key).await.map(drop)
+        })
+        .await
+    }
+
+    /// GetObjectTagging: whether the object carries `FINISHED_TAG`.
+    pub async fn is_finished(&self, key: &str) -> StoreResult<bool> {
+        let url = format!("{}?tagging", self.object_url(key));
+        self.with_retries(&format!("GET {key}?tagging"), || async {
+            let resp = self.send(reqwest::Method::GET, &url, &[], None).await?;
+            let xml = check(resp, key).await?.text().await?;
+            let tagging: Tagging = quick_xml::de::from_str(&xml).map_err(|e| {
+                Attempt::Fatal(anyhow!("cannot parse tagging response: {e}").into())
+            })?;
+            Ok(tagging.tag_set.has_finished())
+        })
+        .await
+    }
+
     pub async fn list(&self, prefix: &str) -> StoreResult<Vec<ObjectInfo>> {
         let mut out = Vec::new();
         let mut token: Option<String> = None;
@@ -309,6 +341,8 @@ impl S3Store {
             out.extend(page.contents.into_iter().map(|c| ObjectInfo {
                 key: c.key,
                 size: c.size,
+                // Yandex lists tags with each object; standard S3 does not.
+                finished: c.tag_set.map(|t| t.has_finished()),
             }));
             match (page.is_truncated, page.next_continuation_token) {
                 (true, Some(t)) => token = Some(t),
@@ -333,6 +367,35 @@ struct ListResult {
 struct ListEntry {
     key: String,
     size: u64,
+    tag_set: Option<TagSet>,
+}
+
+#[derive(Deserialize, Default)]
+struct TagSet {
+    #[serde(rename = "Tag", default)]
+    tags: Vec<Tag>,
+}
+
+impl TagSet {
+    fn has_finished(&self) -> bool {
+        self.tags
+            .iter()
+            .any(|t| t.key == FINISHED_TAG.0 && t.value == FINISHED_TAG.1)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct Tag {
+    key: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct Tagging {
+    #[serde(default)]
+    tag_set: TagSet,
 }
 
 /// Maps the HTTP status to success, a retryable or a fatal error.
@@ -426,6 +489,27 @@ mod tests {
         );
         assert!(r.is_truncated);
         assert_eq!(r.next_continuation_token.as_deref(), Some("tok/1"));
+
+        assert!(r.contents[0].tag_set.is_none()); // standard S3: no tags in listings
+
+        // Yandex lists tags with every object.
+        let yandex = r#"<ListBucketResult><IsTruncated>false</IsTruncated>
+<Contents><Key>p/a</Key><Size>0</Size><TagSet>
+</TagSet></Contents>
+<Contents><Key>p/b</Key><Size>4096</Size><TagSet><Tag><Key>btrs3fs-zone</Key><Value>finished</Value></Tag></TagSet></Contents>
+</ListBucketResult>"#;
+        let r: ListResult = quick_xml::de::from_str(yandex).unwrap();
+        let tags: Vec<Option<bool>> = r
+            .contents
+            .iter()
+            .map(|c| c.tag_set.as_ref().map(|t| t.has_finished()))
+            .collect();
+        assert_eq!(tags, vec![Some(false), Some(true)]);
+        let t: Tagging = quick_xml::de::from_str(
+            r#"<Tagging xmlns="x"><TagSet><Tag><Key>btrs3fs-zone</Key><Value>finished</Value></Tag></TagSet></Tagging>"#,
+        )
+        .unwrap();
+        assert!(t.tag_set.has_finished());
 
         let empty = r#"<ListBucketResult><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>"#;
         let r: ListResult = quick_xml::de::from_str(empty).unwrap();
@@ -544,7 +628,7 @@ mod bucket_tests {
             e.flush_all(Reason::Explicit).await.unwrap(); // PATCH zone 0
         }
         let store = Arc::new(Store::S3(s3.clone()));
-        let e = Engine::open(&cfg, layout, store).await.unwrap();
+        let e = Engine::open(&cfg, layout.clone(), store).await.unwrap();
         let r = e.report(0, 2);
         assert_eq!((r[0].wp, r[1].wp), (3 * 4096, (1 << 20) + 3 * 4096));
         let pieces = e.read_plan(4096, 3 * 4096).unwrap();
@@ -552,7 +636,21 @@ mod bucket_tests {
         assert_eq!(&data[..4096], &block(1, 1)[..]);
         assert_eq!(&data[4096..8192], &block(3, 1)[..]);
         assert!(data[8192..].iter().all(|&b| b == 0));
+        // FINISH tags the object; the listing (or GetObjectTagging) brings it back.
+        e.finish_zone(1 << 20).await.unwrap();
+        e.finish_zone(2 << 20).await.unwrap(); // empty zone: empty tagged object
+        assert!(s3.is_finished(&layout.zone_key(1 << 20)).await.unwrap());
+        drop(e);
+        let e = Engine::open(&cfg, layout.clone(), Arc::new(Store::S3(s3.clone())))
+            .await
+            .unwrap();
+        let r = e.report(0, 3);
+        assert_eq!(
+            r.iter().map(|z| z.wp).collect::<Vec<_>>(),
+            vec![3 * 4096, 2 << 20, 3 << 20]
+        );
         e.reset_zone(0).await.unwrap();
+        e.reset_zone(2 << 20).await.unwrap();
         assert_eq!(s3.list(&format!("{prefix}/")).await.unwrap().len(), 1);
         cleanup(&s3, &format!("{prefix}/")).await;
     }

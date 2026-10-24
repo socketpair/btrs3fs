@@ -213,6 +213,7 @@ function render(s, p, dt) {
     ["reason: FUA", num(s.uploads_fua), num(d("uploads_fua"))],
     ["reason: buffer limit", num(s.uploads_background), num(d("uploads_background"))],
     ["reason: explicit", num(s.uploads_explicit), num(d("uploads_explicit"))],
+    ["reason: zone FINISH", num(s.uploads_finish), num(d("uploads_finish"))],
     ["S3 retries", num(s.retries), num(d("retries"))],
     ["failed uploads", num(s.upload_errors), num(d("upload_errors"))],
   ]);

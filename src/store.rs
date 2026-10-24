@@ -46,9 +46,14 @@ impl Body {
     }
 }
 
+/// Object tag marking a zone closed by FINISH (SPEC.md §4.4).
+pub const FINISHED_TAG: (&str, &str) = ("btrs3fs-zone", "finished");
+
 pub struct ObjectInfo {
     pub key: String,
     pub size: u64,
+    /// Whether the object carries `FINISHED_TAG`, if the listing told us.
+    pub finished: Option<bool>,
 }
 
 pub enum Store {
@@ -110,12 +115,34 @@ impl Store {
             Store::S3(s) => s.list(prefix).await,
         }
     }
+
+    /// Tags an existing object with `FINISHED_TAG` (data is not rewritten).
+    pub async fn mark_finished(&self, key: &str) -> StoreResult<()> {
+        match self {
+            Store::Mem(m) => m.mark_finished(key),
+            Store::S3(s) => s.mark_finished(key).await,
+        }
+    }
+
+    /// Whether an existing object carries `FINISHED_TAG`.
+    pub async fn is_finished(&self, key: &str) -> StoreResult<bool> {
+        match self {
+            Store::Mem(m) => m.is_finished(key),
+            Store::S3(s) => s.is_finished(key).await,
+        }
+    }
+}
+
+#[derive(Default)]
+struct MemObject {
+    data: Vec<u8>,
+    finished: bool,
 }
 
 /// In-memory store for tests and `run --memory`.
 #[derive(Default)]
 pub struct MemStore {
-    objects: Mutex<BTreeMap<String, Vec<u8>>>,
+    objects: Mutex<BTreeMap<String, MemObject>>,
     fail: AtomicBool,
 }
 
@@ -136,27 +163,30 @@ impl MemStore {
     fn get(&self, key: &str) -> StoreResult<Bytes> {
         self.check_fail()?;
         let objects = self.objects.lock().unwrap();
-        let data = objects
+        let obj = objects
             .get(key)
             .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
-        Ok(Bytes::copy_from_slice(data))
+        Ok(Bytes::copy_from_slice(&obj.data))
     }
 
     fn put(&self, key: &str, body: Body) -> StoreResult<()> {
         self.check_fail()?;
-        self.objects
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), body.to_vec());
+        // Like S3: a new object replaces the old one together with its tags.
+        let obj = MemObject {
+            data: body.to_vec(),
+            finished: false,
+        };
+        self.objects.lock().unwrap().insert(key.to_string(), obj);
         Ok(())
     }
 
     fn patch(&self, key: &str, offset: u64, body: Body) -> StoreResult<()> {
         self.check_fail()?;
         let mut objects = self.objects.lock().unwrap();
-        let data = objects
+        let data = &mut objects
             .get_mut(key)
-            .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
+            .ok_or_else(|| StoreError::NotFound(key.to_string()))?
+            .data;
         if offset > data.len() as u64 {
             return Err(StoreError::InvalidRange {
                 key: key.to_string(),
@@ -176,9 +206,10 @@ impl MemStore {
     fn get_range(&self, key: &str, offset: u64, len: u64) -> StoreResult<Bytes> {
         self.check_fail()?;
         let objects = self.objects.lock().unwrap();
-        let data = objects
+        let data = &objects
             .get(key)
-            .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
+            .ok_or_else(|| StoreError::NotFound(key.to_string()))?
+            .data;
         let end = offset
             .checked_add(len)
             .filter(|&e| e <= data.len() as u64)
@@ -203,9 +234,29 @@ impl MemStore {
             .take_while(|(k, _)| k.starts_with(prefix))
             .map(|(k, v)| ObjectInfo {
                 key: k.clone(),
-                size: v.len() as u64,
+                size: v.data.len() as u64,
+                finished: Some(v.finished),
             })
             .collect())
+    }
+
+    fn mark_finished(&self, key: &str) -> StoreResult<()> {
+        self.check_fail()?;
+        let mut objects = self.objects.lock().unwrap();
+        let obj = objects
+            .get_mut(key)
+            .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
+        obj.finished = true;
+        Ok(())
+    }
+
+    fn is_finished(&self, key: &str) -> StoreResult<bool> {
+        self.check_fail()?;
+        let objects = self.objects.lock().unwrap();
+        let obj = objects
+            .get(key)
+            .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
+        Ok(obj.finished)
     }
 }
 
@@ -275,6 +326,20 @@ mod tests {
         assert_eq!(&m.get("k").unwrap()[..], b"aaaabcc");
         assert_eq!(&m.get_range("k", 3, 2).unwrap()[..], b"ab");
         assert!(m.get_range("k", 6, 2).is_err());
+    }
+
+    #[test]
+    fn mem_finished_tag() {
+        let m = MemStore::default();
+        assert!(m.mark_finished("k").is_err()); // no object
+        m.put("k", body(b"aa")).unwrap();
+        assert!(!m.is_finished("k").unwrap());
+        m.mark_finished("k").unwrap();
+        m.patch("k", 2, body(b"bb")).unwrap(); // PATCH keeps tags
+        assert!(m.is_finished("k").unwrap());
+        assert_eq!(m.list("k").unwrap()[0].finished, Some(true));
+        m.put("k", body(b"cc")).unwrap(); // PUT replaces the object and its tags
+        assert!(!m.is_finished("k").unwrap());
     }
 
     #[test]

@@ -12,7 +12,7 @@
 
 use crate::config::{BLOCK_SIZE, DiskConfig};
 use crate::stats::{Reason, STATS, ZoneCounts};
-use crate::store::{Body, Layout, Store, StoreError};
+use crate::store::{Body, Layout, Store, StoreError, StoreResult};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use log::{debug, info, warn};
@@ -40,8 +40,6 @@ pub enum Cond {
 pub enum ZoneError {
     #[error("{0}")]
     Invalid(String),
-    #[error("open zone limit reached")]
-    OpenLimit,
     #[error("active zone limit reached")]
     ActiveLimit,
     #[error("store error: {0}")]
@@ -49,11 +47,10 @@ pub enum ZoneError {
 }
 
 impl ZoneError {
-    /// Errno reported to the kernel; the ublk driver maps ETOOMANYREFS and
-    /// EOVERFLOW to the zone open/active resource block statuses.
+    /// Errno reported to the kernel; the ublk driver maps EOVERFLOW to the
+    /// zone active resource block status.
     pub fn errno(&self) -> i32 {
         match self {
-            ZoneError::OpenLimit => libc::ETOOMANYREFS,
             ZoneError::ActiveLimit => libc::EOVERFLOW,
             _ => libc::EIO,
         }
@@ -94,6 +91,8 @@ struct ZoneState {
     flushed: u64,
     /// Data `[flushed, data_end)`, one chunk per write request.
     chunks: VecDeque<Bytes>,
+    /// The zone object exists in the store (an empty one for a finished empty zone).
+    object: bool,
 }
 
 impl ZoneState {
@@ -137,8 +136,7 @@ impl Counters {
 pub struct Engine {
     zone_size: u64,
     disk_size: u64,
-    /// Effective limits, 0 = unlimited.
-    max_open: u32,
+    /// Effective active zone limit, 0 = unlimited (open zones are never limited).
     max_active: u32,
     dirty_limit: u64,
     layout: Layout,
@@ -153,10 +151,12 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Restores zone state from the objects present in the store.
+    /// Restores zone state from the objects present in the store: the object
+    /// size is the write pointer, the finished tag marks zones closed by FINISH.
     pub async fn open(cfg: &DiskConfig, layout: Layout, store: Arc<Store>) -> anyhow::Result<Self> {
         let nr_zones = cfg.nr_zones() as usize;
-        let mut sizes = vec![0u64; nr_zones];
+        // Per zone: object size and whether it is finished (None: not listed).
+        let mut objects: Vec<Option<(u64, Option<bool>)>> = vec![None; nr_zones];
         let config_key = layout.config_key();
         for obj in store.list(&layout.dir()).await? {
             let Some(offset) = layout.parse_zone_key(&obj.key) else {
@@ -176,30 +176,54 @@ impl Engine {
                 obj.key,
                 obj.size
             );
-            sizes[(offset / cfg.zone_size) as usize] = obj.size;
+            objects[(offset / cfg.zone_size) as usize] = Some((obj.size, obj.finished));
+        }
+
+        // Standard S3 does not list tags: ask for them where they matter.
+        let unknown: Vec<usize> = (0..nr_zones)
+            .filter(|&i| matches!(objects[i], Some((size, None)) if size < cfg.zone_size))
+            .collect();
+        let results: Vec<(usize, StoreResult<bool>)> = futures_util::stream::iter(unknown)
+            .map(|i| {
+                let key = layout.zone_key(i as u64 * cfg.zone_size);
+                let store = &store;
+                async move { (i, store.is_finished(&key).await) }
+            })
+            .buffer_unordered(FLUSH_PARALLELISM)
+            .collect()
+            .await;
+        for (i, finished) in results {
+            if let Some((_, f)) = &mut objects[i] {
+                *f = Some(finished?);
+            }
         }
 
         let mut counters = Counters::default();
-        let zones = sizes
+        let (mut full, mut empty) = (0, 0);
+        let zones = objects
             .iter()
             .enumerate()
-            .map(|(i, &size)| {
-                let cond = if size == 0 {
-                    Cond::Empty
-                } else if size == cfg.zone_size {
-                    Cond::Full
+            .map(|(i, obj)| {
+                let (size, finished) = obj.map_or((0, false), |(s, f)| (s, f == Some(true)));
+                let (cond, wp) = if finished || size == cfg.zone_size {
+                    full += 1;
+                    (Cond::Full, cfg.zone_size)
+                } else if size == 0 {
+                    empty += 1;
+                    (Cond::Empty, 0)
                 } else {
                     counters.closed += 1;
-                    Cond::Closed
+                    (Cond::Closed, size)
                 };
                 Zone {
                     start: i as u64 * cfg.zone_size,
                     state: Mutex::new(ZoneState {
                         cond,
-                        wp: size,
+                        wp,
                         data_end: size,
                         flushed: size,
                         chunks: VecDeque::new(),
+                        object: obj.is_some(),
                     }),
                     upload: tokio::sync::Mutex::new(()),
                 }
@@ -209,7 +233,6 @@ impl Engine {
         let engine = Self {
             zone_size: cfg.zone_size,
             disk_size: cfg.disk_size,
-            max_open: cfg.effective_limit(cfg.max_open_zones),
             max_active: cfg.effective_limit(cfg.max_active_zones),
             dirty_limit: cfg.dirty_limit_bytes,
             layout,
@@ -227,11 +250,9 @@ impl Engine {
                 engine.max_active
             );
         }
-        let full = sizes.iter().filter(|&&s| s == cfg.zone_size).count();
         info!(
-            "restored {nr_zones} zones: {} closed, {full} full, {} empty",
-            counters.closed,
-            nr_zones - counters.closed as usize - full
+            "restored {nr_zones} zones: {} closed, {full} full, {empty} empty",
+            counters.closed
         );
         *engine.counters.lock().unwrap() = counters;
         Ok(engine)
@@ -260,45 +281,15 @@ impl Engine {
         st.cond = cond;
     }
 
-    /// Checks that a zone in `cond` (EMPTY or CLOSED) may become open, implicitly
-    /// closing another implicitly open zone if the open limit is reached.
-    fn check_resources(&self, zone: usize, cond: Cond) -> ZResult<()> {
-        let (open, active, imp_open) = {
-            let c = self.counters.lock().unwrap();
-            (c.open(), c.active(), c.imp_open)
-        };
-        if cond == Cond::Empty && self.max_active != 0 && active >= self.max_active {
+    /// An EMPTY zone may become open only below the active zone limit.
+    fn check_active(&self, cond: Cond) -> ZResult<()> {
+        if cond == Cond::Empty
+            && self.max_active != 0
+            && self.counters.lock().unwrap().active() >= self.max_active
+        {
             return Err(ZoneError::ActiveLimit);
         }
-        if self.max_open == 0 || open < self.max_open {
-            return Ok(());
-        }
-        if imp_open > 0 && self.close_one_implicit(zone) {
-            return Ok(());
-        }
-        Err(ZoneError::OpenLimit)
-    }
-
-    fn close_one_implicit(&self, except: usize) -> bool {
-        for (i, z) in self.zones.iter().enumerate() {
-            if i == except {
-                continue;
-            }
-            // The caller holds its own zone lock: never block on another one.
-            if let Ok(mut st) = z.state.try_lock()
-                && st.cond == Cond::ImpOpen
-            {
-                let to = if st.wp == 0 {
-                    Cond::Empty
-                } else {
-                    Cond::Closed
-                };
-                self.set_cond(&mut st, to);
-                debug!("zone {i} implicitly closed");
-                return true;
-            }
-        }
-        false
+        Ok(())
     }
 
     /// WRITE (at the write pointer) or ZONE_APPEND (anywhere in the zone, `offset`
@@ -334,7 +325,7 @@ impl Engine {
         }
         match st.cond {
             Cond::Empty | Cond::Closed => {
-                self.check_resources(zi, st.cond)?;
+                self.check_active(st.cond)?;
                 self.set_cond(&mut st, Cond::ImpOpen);
             }
             Cond::ImpOpen | Cond::ExpOpen => {}
@@ -429,8 +420,13 @@ impl Engine {
     /// Uploads buffered data of one zone. Returns once everything that was
     /// buffered when the call started is confirmed by the store.
     pub async fn flush_zone(&self, zi: usize, reason: Reason) -> ZResult<()> {
+        let _upload = self.zones[zi].upload.lock().await;
+        self.flush_locked(zi, reason).await
+    }
+
+    /// `flush_zone` for a caller already holding the zone's `upload` lock.
+    async fn flush_locked(&self, zi: usize, reason: Reason) -> ZResult<()> {
         let zone = &self.zones[zi];
-        let _upload = zone.upload.lock().await;
         let (from, chunks) = {
             let st = zone.state.lock().unwrap();
             if st.buffered() == 0 {
@@ -472,6 +468,7 @@ impl Engine {
             // Only the holder of `upload` removes chunks, so the front ones are ours.
             st.chunks.drain(..nr_chunks);
             st.flushed = from + len;
+            st.object = true;
         }
         self.dirty.fetch_sub(len, Ordering::SeqCst);
         self.room.notify_waiters();
@@ -499,7 +496,7 @@ impl Engine {
         let mut st = self.zones[zi].state.lock().unwrap();
         match st.cond {
             Cond::ExpOpen => return Ok(()),
-            Cond::Empty | Cond::Closed => self.check_resources(zi, st.cond)?,
+            Cond::Empty | Cond::Closed => self.check_active(st.cond)?,
             Cond::ImpOpen => {}
             Cond::Full => return invalid(format!("open of full zone {zi}")),
         }
@@ -525,17 +522,28 @@ impl Engine {
         }
     }
 
-    /// FINISH: the zone becomes FULL; buffered data stays and is flushed as usual.
-    pub fn finish_zone(&self, offset: u64) -> ZResult<()> {
+    /// FINISH: stores the zone data, tags the zone object as finished
+    /// (creating an empty object if there is none) and makes the zone FULL.
+    /// Persisting it keeps finished zones FULL after a restart (SPEC.md §4.4).
+    pub async fn finish_zone(&self, offset: u64) -> ZResult<()> {
         let (zi, _) = self.locate(offset)?;
-        let mut st = self.zones[zi].state.lock().unwrap();
-        match st.cond {
-            Cond::Full => return Ok(()),
-            Cond::Empty | Cond::Closed => self.check_resources(zi, st.cond)?,
-            Cond::ImpOpen | Cond::ExpOpen => {}
+        let zone = &self.zones[zi];
+        let _upload = zone.upload.lock().await;
+        if zone.state.lock().unwrap().cond == Cond::Full {
+            return Ok(());
         }
+        self.flush_locked(zi, Reason::Finish).await?;
+        let key = self.layout.zone_key(zone.start);
+        if !zone.state.lock().unwrap().object {
+            self.store.put(&key, Body::default()).await?;
+            zone.state.lock().unwrap().object = true;
+        }
+        self.store.mark_finished(&key).await?;
+
+        let mut st = zone.state.lock().unwrap();
         self.set_cond(&mut st, Cond::Full);
         st.wp = self.zone_size;
+        debug!("zone {zi} finished");
         Ok(())
     }
 
@@ -552,10 +560,10 @@ impl Engine {
         let _upload = zone.upload.lock().await;
         let had_object = {
             let st = zone.state.lock().unwrap();
-            if st.cond == Cond::Empty && st.data_end == 0 {
+            if st.cond == Cond::Empty && st.data_end == 0 && !st.object {
                 return Ok(());
             }
-            st.flushed > 0
+            st.object
         };
         // Delete first: if it fails the zone keeps its state and stays consistent.
         if had_object {
@@ -569,6 +577,7 @@ impl Engine {
             st.data_end = 0;
             st.flushed = 0;
             st.chunks.clear();
+            st.object = false;
             dropped
         };
         if dropped > 0 {
@@ -707,9 +716,8 @@ mod tests {
     const ZS: u64 = 1 << 20;
     const B: u64 = BLOCK_SIZE;
 
-    async fn engine_with(store: Arc<Store>, max_open: u32, max_active: u32) -> Engine {
+    async fn engine_with(store: Arc<Store>, max_active: u32) -> Engine {
         let mut cfg = DiskConfig::new(8 * ZS, ZS);
-        cfg.max_open_zones = max_open;
         cfg.max_active_zones = max_active;
         cfg.dirty_limit_bytes = 64 * B;
         // No validate(): the engine handles any limits, while the config
@@ -742,7 +750,7 @@ mod tests {
     #[tokio::test]
     async fn write_flush_read() {
         let store = mem();
-        let e = engine_with(store.clone(), 0, 0).await;
+        let e = engine_with(store.clone(), 0).await;
         assert_eq!(e.write(ZS, blk(1, 2), false).unwrap(), ZS);
         assert_eq!(e.write(ZS, blk(2, 1), true).unwrap(), ZS + 2 * B);
         assert_eq!(e.dirty_bytes(), 3 * B);
@@ -768,7 +776,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_rules() {
-        let e = engine_with(mem(), 0, 0).await;
+        let e = engine_with(mem(), 0).await;
         assert!(e.write(B, blk(1, 1), false).is_err()); // not at wp
         assert!(e.write(B, blk(1, 1), true).is_err()); // append not at zone start
         assert!(e.write(0, Bytes::from(vec![0; 512]), false).is_err()); // partial block
@@ -782,91 +790,94 @@ mod tests {
     #[tokio::test]
     async fn reset_and_finish() {
         let store = mem();
-        let e = engine_with(store.clone(), 0, 0).await;
+        let e = engine_with(store.clone(), 0).await;
         e.write(0, blk(7, 2), false).unwrap();
         e.flush_all(Reason::Explicit).await.unwrap();
         e.write(2 * B, blk(8, 1), false).unwrap();
 
-        e.finish_zone(0).unwrap();
+        // FINISH stores buffered data and tags the object.
+        e.finish_zone(0).await.unwrap();
         let z = &e.report(0, 1)[0];
         assert_eq!((z.cond, z.wp), (Cond::Full, ZS));
-        let data = read(&e, 0, 4 * B).await; // data, data, buffered, zeros
+        assert_eq!(e.dirty_bytes(), 0);
+        assert!(store.is_finished("t/0000000000000000").await.unwrap());
+        let data = read(&e, 0, 4 * B).await; // stored data, then zeros
         assert_eq!(&data[2 * B as usize..3 * B as usize], &blk(8, 1)[..]);
         assert!(data[3 * B as usize..].iter().all(|&b| b == 0));
 
         e.reset_zone(0).await.unwrap();
         assert_eq!(e.report(0, 1)[0].cond, Cond::Empty);
-        assert_eq!(e.dirty_bytes(), 0);
         assert!(store.get("t/0000000000000000").await.unwrap().is_none());
         assert!(read(&e, 0, 2 * B).await.iter().all(|&b| b == 0));
 
         e.write(0, blk(9, 1), false).unwrap(); // fresh object after reset: PUT
         e.flush_all(Reason::Explicit).await.unwrap();
-        assert_eq!(
-            store
-                .get("t/0000000000000000")
-                .await
-                .unwrap()
-                .unwrap()
-                .len() as u64,
-            B
-        );
+        let obj = store.get("t/0000000000000000").await.unwrap().unwrap();
+        assert_eq!(obj.len() as u64, B);
+        assert!(!store.is_finished("t/0000000000000000").await.unwrap());
+
+        // FINISH of an empty zone creates an empty tagged object; RESET removes it.
+        e.finish_zone(ZS).await.unwrap();
+        let obj = store.get("t/0000000000100000").await.unwrap().unwrap();
+        assert!(obj.is_empty() && store.is_finished("t/0000000000100000").await.unwrap());
+        e.reset_zone(ZS).await.unwrap();
+        assert!(store.get("t/0000000000100000").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn restore_from_store() {
         let store = mem();
         {
-            let e = engine_with(store.clone(), 0, 0).await;
+            let e = engine_with(store.clone(), 0).await;
             e.write(0, blk(1, 3), false).unwrap();
             e.write(ZS, blk(2, ZS / B), false).unwrap();
             e.write(2 * ZS, blk(3, 1), false).unwrap(); // never flushed
             e.flush_zone(0, Reason::Explicit).await.unwrap();
             e.flush_zone(1, Reason::Explicit).await.unwrap();
+            e.write(3 * ZS, blk(5, 2), false).unwrap();
+            e.finish_zone(3 * ZS).await.unwrap(); // partially written, finished
+            e.finish_zone(4 * ZS).await.unwrap(); // empty, finished
         }
-        let e = engine_with(store, 0, 0).await;
-        let r = e.report(0, 3);
+        let e = engine_with(store, 0).await;
+        let r = e.report(0, 5);
         assert_eq!((r[0].cond, r[0].wp), (Cond::Closed, 3 * B));
         assert_eq!((r[1].cond, r[1].wp), (Cond::Full, 2 * ZS));
         assert_eq!((r[2].cond, r[2].wp), (Cond::Empty, 2 * ZS));
+        assert_eq!((r[3].cond, r[3].wp), (Cond::Full, 4 * ZS));
+        assert_eq!((r[4].cond, r[4].wp), (Cond::Full, 5 * ZS));
         assert_eq!(&read(&e, 2 * B, B).await[..], &blk(1, 1)[..]);
+        assert_eq!(&read(&e, 3 * ZS + B, B).await[..], &blk(5, 1)[..]);
+        assert!(read(&e, 3 * ZS + 2 * B, B).await.iter().all(|&b| b == 0));
+        assert!(read(&e, 4 * ZS, B).await.iter().all(|&b| b == 0));
         e.write(3 * B, blk(4, 1), false).unwrap(); // continues at restored wp
+        assert!(e.write(3 * ZS, blk(1, 1), true).is_err()); // finished zone stays full
     }
 
     #[tokio::test]
-    async fn open_and_active_limits() {
-        let e = engine_with(mem(), 2, 3).await;
-        e.write(0, blk(1, 1), false).unwrap();
-        e.write(ZS, blk(1, 1), false).unwrap();
-        // Third implicit open closes one implicitly open zone.
-        e.write(2 * ZS, blk(1, 1), false).unwrap();
-        let conds: Vec<Cond> = e.report(0, 3).iter().map(|z| z.cond).collect();
-        assert_eq!(conds.iter().filter(|&&c| c == Cond::Closed).count(), 1);
-        // Three active zones: a fourth cannot be opened.
+    async fn active_limit() {
+        let e = engine_with(mem(), 3).await;
+        for z in 0..3 {
+            e.write(z * ZS, blk(1, 1), false).unwrap();
+        }
+        // Three active zones: a fourth cannot become active, by write or open.
         assert!(matches!(
             e.write(3 * ZS, blk(1, 1), false),
             Err(ZoneError::ActiveLimit)
         ));
-        // Explicitly open zones cannot be implicitly closed.
-        e.close_zone(0).ok();
-        e.close_zone(ZS).ok();
-        e.close_zone(2 * ZS).ok();
+        assert!(matches!(e.open_zone(3 * ZS), Err(ZoneError::ActiveLimit)));
+        // Closing keeps a written zone active; reopening it is fine.
+        e.close_zone(0).unwrap();
         e.open_zone(0).unwrap();
-        e.open_zone(ZS).unwrap();
-        assert!(matches!(e.open_zone(2 * ZS), Err(ZoneError::OpenLimit)));
-        // Finishing frees an open and an active slot.
-        e.finish_zone(0).unwrap();
+        assert!(e.write(3 * ZS, blk(1, 1), false).is_err());
+        // Finishing frees an active slot.
+        e.finish_zone(0).await.unwrap();
         e.write(3 * ZS, blk(1, 1), false).unwrap();
-        assert!(matches!(
-            e.write(4 * ZS, blk(1, 1), false),
-            Err(ZoneError::ActiveLimit)
-        ));
     }
 
     #[tokio::test]
     async fn failed_flush_keeps_data() {
         let store = mem();
-        let e = engine_with(store.clone(), 0, 0).await;
+        let e = engine_with(store.clone(), 0).await;
         e.write(0, blk(5, 2), false).unwrap();
         mem_store(&store).set_fail(true);
         assert!(e.flush_all(Reason::Explicit).await.is_err());
@@ -881,7 +892,7 @@ mod tests {
     #[tokio::test]
     async fn background_flusher_drains_over_limit() {
         let store = mem();
-        let e = Arc::new(engine_with(store, 0, 0).await);
+        let e = Arc::new(engine_with(store, 0).await);
         tokio::spawn(e.clone().background_flusher());
         for z in 0..4 {
             e.write(z * ZS, blk(1, 40), false).unwrap(); // 160 blocks > limit of 64

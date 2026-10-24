@@ -131,6 +131,8 @@ pub enum Reason {
     Background,
     /// Explicit flush by btrs3fs itself (`create`).
     Explicit,
+    /// Zone FINISH: data is stored before the zone is tagged as finished.
+    Finish,
 }
 
 pub struct Stats {
@@ -138,7 +140,7 @@ pub struct Stats {
     pub upload_latency_ms: Histogram,
     pub uploads_put: Counter,
     pub uploads_patch: Counter,
-    pub upload_reason: [Counter; 4],
+    pub upload_reason: [Counter; 5],
     pub uploads: InFlight,
     pub upload_errors: Counter,
     pub retries: Counter,
@@ -168,12 +170,7 @@ pub static STATS: Stats = Stats {
     upload_latency_ms: Histogram::new(LATENCY_BOUNDS_MS),
     uploads_put: Counter::new(),
     uploads_patch: Counter::new(),
-    upload_reason: [
-        Counter::new(),
-        Counter::new(),
-        Counter::new(),
-        Counter::new(),
-    ],
+    upload_reason: [const { Counter::new() }; 5],
     uploads: InFlight::new(),
     upload_errors: Counter::new(),
     retries: Counter::new(),
@@ -238,6 +235,7 @@ pub struct Snapshot {
     pub uploads_fua: u64,
     pub uploads_background: u64,
     pub uploads_explicit: u64,
+    pub uploads_finish: u64,
     pub uploads_in_flight: u64,
     pub uploads_in_flight_max: u64,
     pub upload_errors: u64,
@@ -293,6 +291,7 @@ impl Stats {
             uploads_fua: self.reason(Reason::Fua).get(),
             uploads_background: self.reason(Reason::Background).get(),
             uploads_explicit: self.reason(Reason::Explicit).get(),
+            uploads_finish: self.reason(Reason::Finish).get(),
             uploads_in_flight: self.uploads.current.load(Relaxed),
             uploads_in_flight_max: self.uploads.max.load(Relaxed),
             upload_errors: self.upload_errors.get(),

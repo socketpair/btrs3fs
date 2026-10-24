@@ -16,8 +16,10 @@ pub const MAX_APPENDS_PER_OBJECT: u64 = 10_000;
 /// addresses at most 32 MiB per request.
 pub const MAX_ZONE_SIZE: u64 = 32 << 20;
 
-/// btrfs needs at least this many active zones (`BTRFS_MIN_ACTIVE_ZONES`).
-const MIN_ACTIVE_ZONES: u32 = 8;
+/// Smallest usable active zone limit. btrfs accepts 8 (`BTRFS_MIN_ACTIVE_ZONES`),
+/// but with DUP metadata it keeps 6 active zones reserved for metadata and
+/// system block groups; at 8 it deadlocked waiting for data space (SPEC.md §2).
+const MIN_ACTIVE_ZONES: u32 = 16;
 
 /// Maximum queue depth accepted by the ublk driver.
 const UBLK_MAX_QUEUE_DEPTH: u16 = 4096;
@@ -30,7 +32,10 @@ pub struct DiskConfig {
     pub version: u32,
     pub disk_size: u64,
     pub zone_size: u64,
-    pub max_open_zones: u32,
+    /// Obsolete: open zones are never limited (SPEC.md §2). Accepted in old
+    /// disk.json files, never written.
+    #[serde(default, skip_serializing)]
+    pub max_open_zones: Option<u32>,
     pub max_active_zones: u32,
     pub dirty_limit_bytes: u64,
     pub retry_timeout_seconds: u64,
@@ -49,7 +54,7 @@ impl DiskConfig {
             version: CONFIG_VERSION,
             disk_size,
             zone_size,
-            max_open_zones: 1024,
+            max_open_zones: None,
             max_active_zones: 1024,
             dirty_limit_bytes: 256 << 20,
             retry_timeout_seconds: 60,
@@ -92,19 +97,10 @@ impl DiskConfig {
             "too many zones: {}",
             self.nr_zones()
         );
-        let (open, active) = (
-            self.effective_limit(self.max_open_zones),
-            self.effective_limit(self.max_active_zones),
-        );
+        let active = self.effective_limit(self.max_active_zones);
         ensure!(
             active == 0 || active >= MIN_ACTIVE_ZONES,
             "max_active_zones {active} is below the btrfs minimum of {MIN_ACTIVE_ZONES}"
-        );
-        ensure!(
-            active == 0 || (open != 0 && open <= active),
-            "max_open_zones {} must not exceed max_active_zones {}",
-            self.max_open_zones,
-            self.max_active_zones
         );
         ensure!(
             self.dirty_limit_bytes >= BLOCK_SIZE,
@@ -245,16 +241,21 @@ mod tests {
     #[test]
     fn zone_limits() {
         let mut cfg = DiskConfig::new(1 << 30, 16 << 20); // 64 zones
-        cfg.max_open_zones = 32;
         cfg.max_active_zones = 16;
-        assert!(cfg.validate().is_err()); // open > active
-        cfg.max_open_zones = 16;
         cfg.validate().unwrap();
-        cfg.max_open_zones = 4;
-        cfg.max_active_zones = 4;
-        assert!(cfg.validate().is_err()); // below the btrfs minimum
+        cfg.max_active_zones = 8;
+        assert!(cfg.validate().is_err()); // btrfs deadlocks this low
         cfg.max_active_zones = 1024; // >= zone count: no limit
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn old_config_with_open_limit() {
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&DiskConfig::new(1 << 30, 16 << 20).to_json()).unwrap();
+        assert!(json.get("max_open_zones").is_none()); // not written any more
+        json["max_open_zones"] = 1024.into();
+        DiskConfig::from_json(json.to_string().as_bytes()).unwrap(); // still accepted
     }
 
     #[test]
