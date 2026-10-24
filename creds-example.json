@@ -1,0 +1,7 @@
+{
+  "endpoint": "https://storage.yandexcloud.net",
+  "region": "ru-central1",
+  "bucket": "iyr-bucket-name",
+  "access_key": "",
+  "secret_key": ""
+}
