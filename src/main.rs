@@ -148,6 +148,11 @@ struct RunArgs {
 struct DetachArgs {
     #[arg(long, default_value_t = 0)]
     dev_id: i32,
+    /// Kill the server with SIGKILL at once, even if the device is mounted
+    /// (like pulling the power cord: unflushed data is lost, the filesystem
+    /// gets I/O errors). For hung servers and crash tests.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Args)]
@@ -168,6 +173,7 @@ fn main() {
         Command::Mount(a) => cmd_mount(a, cli.log_to_stderr),
         Command::Umount(a) => cmd_umount(a),
         Command::Run(a) => cmd_run(a),
+        Command::Detach(a) if a.force => kill_server(a.dev_id),
         Command::Detach(a) => detach(a.dev_id),
         Command::Destroy(a) => cmd_destroy(a),
     };
@@ -535,17 +541,39 @@ fn detach(dev_id: i32) -> anyhow::Result<i32> {
     }
 
     let pid = ctrl.dev_info().ublksrv_pid;
-    ensure!(pid > 0, "device {dev_id} has no server process");
     // SAFETY: plain syscall.
-    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-        bail!(
-            "cannot signal server process {pid}: {}",
-            std::io::Error::last_os_error()
-        );
+    if pid <= 0 || unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        // The server crashed or was killed: the device is dead, only remove it.
+        warn!("server process {pid} of device {dev_id} is gone, removing the device");
+        ctrl.del_dev()
+            .map_err(|e| anyhow::anyhow!("cannot remove device {dev_id}: {e:?}"))?;
+        info!("device {dev_id} removed");
+        return Ok(0);
     }
     info!("sent SIGTERM to server process {pid}, waiting for it to exit");
     wait_for_exit(pid);
     info!("device {dev_id} detached");
+    Ok(0)
+}
+
+/// `detach --force`: SIGKILL the device server; the kernel then fails all I/O.
+fn kill_server(dev_id: i32) -> anyhow::Result<i32> {
+    let ctrl = libublk::ctrl::UblkCtrl::new_simple(dev_id)
+        .with_context(|| format!("ublk device {dev_id} not found"))?;
+    let pid = ctrl.dev_info().ublksrv_pid;
+    ensure!(pid > 0, "device {dev_id} has no server process");
+    warn!("killing server process {pid} of device {dev_id} with SIGKILL");
+    // SAFETY: plain syscall.
+    if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+        bail!(
+            "cannot kill process {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    wait_for_exit(pid);
+    info!(
+        "server process {pid} killed; unmount the filesystem and run detach to remove the device"
+    );
     Ok(0)
 }
 
