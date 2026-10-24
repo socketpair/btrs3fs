@@ -5,7 +5,7 @@
 #   EXTRA_ARGS=                     optional, e.g. "--queues 8 --http http1"
 #
 # Mount through fstab so the filesystem is unmounted before the device stops:
-#   /dev/ublkb0 /mnt/data btrfs _netdev,x-systemd.requires=btrs3fs@main.service 0 0
+#   /dev/ublkb0 /mnt/data btrfs noatime,lazytime,commit=300,_netdev,x-systemd.requires=btrs3fs@main.service 0 0
 
 [Unit]
 Description=btrs3fs S3-backed zoned block device (%i)

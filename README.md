@@ -82,7 +82,7 @@ sudo install -D -m 600 packaging/example.conf /etc/btrs3fs/main.conf   # отр�
 sudo systemctl enable --now btrs3fs@main
 ```
 
-В fstab: `/dev/ublkb0 /mnt/data btrfs _netdev,x-systemd.requires=btrs3fs@main.service 0 0` —
+В fstab: `/dev/ublkb0 /mnt/data btrfs noatime,lazytime,commit=300,_netdev,x-systemd.requires=btrs3fs@main.service 0 0` —
 тогда при остановке файловая система размонтируется раньше устройства.
 
 ## Тесты
