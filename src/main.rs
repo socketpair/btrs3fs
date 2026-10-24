@@ -2,6 +2,7 @@ mod config;
 mod device;
 mod logging;
 mod s3;
+mod stats;
 mod store;
 mod zones;
 
@@ -56,6 +57,8 @@ enum Command {
     Detach(DetachArgs),
     /// Delete all objects of a disk.
     Destroy(DestroyArgs),
+    /// Show statistics of a running device: uploads to S3, parallelism, reads (needs root).
+    Stats(StatsArgs),
 }
 
 #[derive(Args)]
@@ -156,6 +159,20 @@ struct DetachArgs {
 }
 
 #[derive(Args)]
+struct StatsArgs {
+    /// Mount point of a btrs3fs disk; without it --dev-id or the only running device is used.
+    mountpoint: Option<PathBuf>,
+    #[arg(long, conflicts_with = "mountpoint")]
+    dev_id: Option<u32>,
+    /// Print the raw JSON snapshot.
+    #[arg(long)]
+    json: bool,
+    /// Repeat every SECONDS, showing what happened during each interval.
+    #[arg(long, value_name = "SECONDS")]
+    watch: Option<u64>,
+}
+
+#[derive(Args)]
 struct DestroyArgs {
     #[command(flatten)]
     disk: DiskArgs,
@@ -176,6 +193,7 @@ fn main() {
         Command::Detach(a) if a.force => kill_server(a.dev_id),
         Command::Detach(a) => detach(a.dev_id),
         Command::Destroy(a) => cmd_destroy(a),
+        Command::Stats(a) => cmd_stats(a),
     };
     let code = match res {
         Ok(code) => code,
@@ -255,6 +273,7 @@ fn serve_disk(
         cfg.nr_zones(),
         cfg.zone_size
     );
+    let disk = layout.dir();
     let engine = Arc::new(rt.block_on(Engine::open(&cfg, layout, Arc::new(store)))?);
     rt.spawn(engine.clone().background_flusher());
     let opts = device::DeviceOptions {
@@ -262,8 +281,43 @@ fn serve_disk(
         nr_queues: cfg.nr_queues,
         queue_depth: cfg.queue_depth,
     };
-    let ctrl = device::serve(&cfg, engine.clone(), rt.handle().clone(), &opts, on_ready)?;
-    Ok((engine, ctrl))
+
+    // Statistics socket lives exactly as long as the device.
+    let started = Instant::now();
+    let stats_dev = Arc::new(Mutex::new(None));
+    let (stats_engine, stats_dev_set) = (engine.clone(), stats_dev.clone());
+    let on_ready: device::OnReady = Box::new(move |bdev| {
+        if let Some(id) = ublk_dev_id(bdev) {
+            let device = bdev.to_string();
+            let snapshot = move || {
+                let (zones, dirty_zones) = stats_engine.zone_summary();
+                stats::STATS.snapshot(stats::DiskState {
+                    disk: disk.clone(),
+                    device: device.clone(),
+                    uptime_secs: started.elapsed().as_secs(),
+                    dirty_bytes: stats_engine.dirty_bytes(),
+                    dirty_limit: stats_engine.dirty_limit(),
+                    dirty_zones,
+                    zones,
+                })
+            };
+            match stats::serve(id, snapshot) {
+                Ok(()) => *stats_dev_set.lock().unwrap() = Some(id),
+                Err(e) => warn!("statistics are not available: {e:#}"),
+            }
+        }
+        on_ready(bdev)
+    });
+    let ctrl = device::serve(&cfg, engine.clone(), rt.handle().clone(), &opts, on_ready);
+    if let Some(id) = stats_dev.lock().unwrap().take() {
+        stats::remove_socket(id);
+    }
+    Ok((engine, ctrl?))
+}
+
+/// `N` of `/dev/ublkbN`.
+fn ublk_dev_id(bdev: &str) -> Option<u32> {
+    bdev.strip_prefix("/dev/ublkb")?.parse().ok()
 }
 
 /// Data not covered by a FLUSH is not stored on shutdown (SPEC.md §10).
@@ -497,10 +551,8 @@ fn cmd_umount(a: UmountArgs) -> anyhow::Result<i32> {
         .with_context(|| format!("mount point {}", a.mountpoint.display()))?;
     let entry = find_mount(&mountpoint)?
         .with_context(|| format!("{} is not mounted", mountpoint.display()))?;
-    let dev_id: i32 = entry
-        .source
-        .strip_prefix("/dev/ublkb")
-        .and_then(|n| n.parse().ok())
+    let dev_id = ublk_dev_id(&entry.source)
+        .map(|id| id as i32)
         .with_context(|| {
             format!(
                 "{} is mounted from {}, not from a btrs3fs device",
@@ -703,7 +755,7 @@ fn format_disk(
         on_ready,
     )?;
     // Formatting is part of creating the disk: store it even without a FLUSH.
-    let flushed = rt.block_on(engine.flush_all());
+    let flushed = rt.block_on(engine.flush_all(stats::Reason::Explicit));
     device::delete(&ctrl);
     mkfs_result
         .lock()
@@ -754,6 +806,58 @@ fn destroy_prefix(rt: &Runtime, s3: &S3Store, layout: &Layout) -> anyhow::Result
         s3.delete(&config_key).await?;
         anyhow::Ok(n)
     })
+}
+
+fn cmd_stats(a: StatsArgs) -> anyhow::Result<i32> {
+    let dev_id = match (&a.mountpoint, a.dev_id) {
+        (Some(mp), _) => {
+            let mp = std::fs::canonicalize(mp)
+                .with_context(|| format!("mount point {}", mp.display()))?;
+            let entry =
+                find_mount(&mp)?.with_context(|| format!("{} is not mounted", mp.display()))?;
+            ublk_dev_id(&entry.source).with_context(|| {
+                format!(
+                    "{} is mounted from {}, not from a btrs3fs device",
+                    mp.display(),
+                    entry.source
+                )
+            })?
+        }
+        (None, Some(id)) => id,
+        (None, None) => match stats::served_devices().as_slice() {
+            [id] => *id,
+            [] => bail!(
+                "no statistics sockets in {} (no device running, not root, or the \
+                 device was started by an older btrs3fs: remount it)",
+                stats::SOCKET_DIR
+            ),
+            ids => bail!("several devices are running ({ids:?}); pass a mount point or --dev-id"),
+        },
+    };
+    let show = |s: &stats::Snapshot, interval: Option<u64>| -> anyhow::Result<()> {
+        if a.json {
+            println!("{}", serde_json::to_string(s)?);
+        } else {
+            print!("{}", stats::render(s, interval));
+        }
+        Ok(())
+    };
+
+    let Some(secs) = a.watch else {
+        show(&stats::fetch(dev_id)?, None)?;
+        return Ok(0);
+    };
+    ensure!(secs > 0, "--watch needs a positive interval");
+    let mut prev = stats::fetch(dev_id)?;
+    loop {
+        std::thread::sleep(Duration::from_secs(secs));
+        let cur = stats::fetch(dev_id)?;
+        show(&cur.delta(&prev), Some(secs))?;
+        if !a.json {
+            println!("{}", "-".repeat(78));
+        }
+        prev = cur;
+    }
 }
 
 #[cfg(test)]

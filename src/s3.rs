@@ -215,6 +215,7 @@ impl S3Store {
                     }
                     let wait = delay.min(left);
                     warn!("{what}: attempt {tries} failed ({e:#}), retrying in {wait:?}");
+                    crate::stats::STATS.retries.inc();
                     tokio::time::sleep(wait).await;
                     delay = delay.mul_f64(self.retry.backoff_factor);
                 }
@@ -446,6 +447,7 @@ mod tests {
 #[cfg(test)]
 mod bucket_tests {
     use super::*;
+    use crate::stats::Reason;
     use crate::store::{Layout, Store};
     use crate::zones::Engine;
     use std::sync::Arc;
@@ -537,9 +539,9 @@ mod bucket_tests {
             let e = Engine::open(&cfg, layout.clone(), store).await.unwrap();
             e.write(0, block(1, 2), false).unwrap();
             e.write(1 << 20, block(2, 3), true).unwrap();
-            e.flush_all().await.unwrap(); // PUT both zones
+            e.flush_all(Reason::Explicit).await.unwrap(); // PUT both zones
             e.write(2 * 4096, block(3, 1), false).unwrap();
-            e.flush_all().await.unwrap(); // PATCH zone 0
+            e.flush_all(Reason::Explicit).await.unwrap(); // PATCH zone 0
         }
         let store = Arc::new(Store::S3(s3.clone()));
         let e = Engine::open(&cfg, layout, store).await.unwrap();

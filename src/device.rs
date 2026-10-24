@@ -8,6 +8,7 @@
 //! reads with an io_uring READ (SPEC.md §9).
 
 use crate::config::{BLOCK_SIZE, DiskConfig};
+use crate::stats::{Reason, STATS};
 use crate::zones::{Cond, Engine, Piece, ZResult, ZoneError};
 use anyhow::{Context, bail};
 use bytes::Bytes;
@@ -223,6 +224,7 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, ctx: &Ctx) -> Result<(), UblkError
                     ZoneError::Invalid(_) | ZoneError::OpenLimit | ZoneError::ActiveLimit
                 ) {
                     error!("I/O error: {e}");
+                    STATS.req_errors.inc();
                 }
                 (-e.errno(), 0)
             }
@@ -246,9 +248,12 @@ async fn handle_io(
     let cdev = q.dev.tgt.fds[0];
     let copy_pos = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
     let engine = &ctx.engine;
+    let _in_flight = STATS.requests.enter();
 
     match op {
         sys::UBLK_IO_OP_READ => {
+            STATS.req_read.inc();
+            STATS.req_read_bytes.add(len);
             let pieces = engine.read_plan(offset, len)?;
             let bufs = if pieces.iter().any(|p| matches!(p, Piece::Store { .. })) {
                 let e = engine.clone();
@@ -261,6 +266,13 @@ async fn handle_io(
             Ok((len as i32, 0))
         }
         sys::UBLK_IO_OP_WRITE | sys::UBLK_IO_OP_ZONE_APPEND => {
+            if op == sys::UBLK_IO_OP_ZONE_APPEND {
+                STATS.req_append.inc();
+                STATS.req_append_bytes.add(len);
+            } else {
+                STATS.req_write.inc();
+                STATS.req_write_bytes.add(len);
+            }
             let data = copy_from_request(cdev, copy_pos, len)?;
             if engine.over_hard_limit() {
                 let e = engine.clone();
@@ -269,30 +281,50 @@ async fn handle_io(
             let append = op == sys::UBLK_IO_OP_ZONE_APPEND;
             let at = engine.write(offset, data, append)?;
             if iod.op_flags & sys::UBLK_IO_F_FUA != 0 {
+                STATS.req_fua.inc();
                 let (zi, _) = engine.locate(at)?;
                 let e = engine.clone();
-                on_tokio(q, ctx, efd, async move { e.flush_zone(zi).await }).await??;
+                on_tokio(
+                    q,
+                    ctx,
+                    efd,
+                    async move { e.flush_zone(zi, Reason::Fua).await },
+                )
+                .await??;
             }
             Ok((len as i32, if append { at >> SECTOR_SHIFT } else { 0 }))
         }
         sys::UBLK_IO_OP_FLUSH => {
+            STATS.req_flush.inc();
             let e = engine.clone();
-            on_tokio(q, ctx, efd, async move { e.flush_all().await }).await??;
+            on_tokio(q, ctx, efd, async move { e.flush_all(Reason::Flush).await }).await??;
             Ok((0, 0))
         }
         sys::UBLK_IO_OP_REPORT_ZONES => {
+            STATS.req_report.inc();
             let n = report_zones(engine, cdev, copy_pos, offset, iod.nr_sectors as usize)?;
             Ok((n as i32, 0))
         }
-        sys::UBLK_IO_OP_ZONE_OPEN => engine.open_zone(offset).map(|_| (0, 0)),
-        sys::UBLK_IO_OP_ZONE_CLOSE => engine.close_zone(offset).map(|_| (0, 0)),
-        sys::UBLK_IO_OP_ZONE_FINISH => engine.finish_zone(offset).map(|_| (0, 0)),
+        sys::UBLK_IO_OP_ZONE_OPEN => {
+            STATS.req_zone_mgmt.inc();
+            engine.open_zone(offset).map(|_| (0, 0))
+        }
+        sys::UBLK_IO_OP_ZONE_CLOSE => {
+            STATS.req_zone_mgmt.inc();
+            engine.close_zone(offset).map(|_| (0, 0))
+        }
+        sys::UBLK_IO_OP_ZONE_FINISH => {
+            STATS.req_zone_mgmt.inc();
+            engine.finish_zone(offset).map(|_| (0, 0))
+        }
         sys::UBLK_IO_OP_ZONE_RESET => {
+            STATS.req_zone_reset.inc();
             let e = engine.clone();
             on_tokio(q, ctx, efd, async move { e.reset_zone(offset).await }).await??;
             Ok((0, 0))
         }
         sys::UBLK_IO_OP_ZONE_RESET_ALL => {
+            STATS.req_zone_reset.inc();
             let e = engine.clone();
             on_tokio(q, ctx, efd, async move { e.reset_all().await }).await??;
             Ok((0, 0))

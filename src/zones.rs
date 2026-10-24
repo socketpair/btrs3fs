@@ -11,6 +11,7 @@
 //! zone's `state` is held.
 
 use crate::config::{BLOCK_SIZE, DiskConfig};
+use crate::stats::{Reason, STATS, ZoneCounts};
 use crate::store::{Body, Layout, Store, StoreError};
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -18,7 +19,7 @@ use log::{debug, info, warn};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 /// Number of zones uploaded in parallel by a FLUSH.
@@ -404,10 +405,22 @@ impl Engine {
         for p in pieces {
             match p {
                 Piece::Store { key, offset, len } => {
-                    out.push(self.store.get_range(&key, offset, len).await?)
+                    let started = Instant::now();
+                    out.push(self.store.get_range(&key, offset, len).await?);
+                    STATS.gets.inc();
+                    STATS.read_from_s3.add(len);
+                    STATS
+                        .get_latency_ms
+                        .record(started.elapsed().as_millis() as u64);
                 }
-                Piece::Mem(b) => out.push(b),
-                Piece::Zero(len) => out.extend(zeros(len)),
+                Piece::Mem(b) => {
+                    STATS.read_from_ram.add(b.len() as u64);
+                    out.push(b);
+                }
+                Piece::Zero(len) => {
+                    STATS.read_zeros.add(len);
+                    out.extend(zeros(len));
+                }
             }
         }
         Ok(out)
@@ -415,7 +428,7 @@ impl Engine {
 
     /// Uploads buffered data of one zone. Returns once everything that was
     /// buffered when the call started is confirmed by the store.
-    pub async fn flush_zone(&self, zi: usize) -> ZResult<()> {
+    pub async fn flush_zone(&self, zi: usize, reason: Reason) -> ZResult<()> {
         let zone = &self.zones[zi];
         let _upload = zone.upload.lock().await;
         let (from, chunks) = {
@@ -429,12 +442,30 @@ impl Engine {
         let body = Body::new(chunks);
         let len = body.len();
         let key = self.layout.zone_key(zone.start);
-        if from == 0 {
-            self.store.put(&key, body).await?;
-        } else {
-            self.store.patch(&key, from, body).await?;
+        let started = Instant::now();
+        let uploaded = {
+            let _in_flight = STATS.uploads.enter();
+            if from == 0 {
+                self.store.put(&key, body).await
+            } else {
+                self.store.patch(&key, from, body).await
+            }
+        };
+        if let Err(e) = uploaded {
+            STATS.upload_errors.inc();
+            return Err(e.into());
         }
-        debug!("zone {zi}: uploaded {len} bytes at {from}");
+        STATS
+            .upload_latency_ms
+            .record(started.elapsed().as_millis() as u64);
+        STATS.upload_size.record(len);
+        if from == 0 {
+            STATS.uploads_put.inc();
+        } else {
+            STATS.uploads_patch.inc();
+        }
+        STATS.reason(reason).inc();
+        debug!("zone {zi}: uploaded {len} bytes at {from} ({reason:?})");
 
         {
             let mut st = zone.state.lock().unwrap();
@@ -448,12 +479,15 @@ impl Engine {
     }
 
     /// Uploads every zone with buffered data; fails if any upload failed.
-    pub async fn flush_all(&self) -> ZResult<()> {
+    pub async fn flush_all(&self, reason: Reason) -> ZResult<()> {
         let dirty: Vec<usize> = (0..self.zones.len())
             .filter(|&i| self.zones[i].state.lock().unwrap().buffered() > 0)
             .collect();
+        if matches!(reason, Reason::Flush) {
+            STATS.zones_per_flush.record(dirty.len() as u64);
+        }
         let results: Vec<ZResult<()>> = futures_util::stream::iter(dirty)
-            .map(|zi| self.flush_zone(zi))
+            .map(|zi| self.flush_zone(zi, reason))
             .buffer_unordered(FLUSH_PARALLELISM)
             .collect()
             .await;
@@ -605,7 +639,7 @@ impl Engine {
             let Some(zi) = self.largest_buffer() else {
                 continue;
             };
-            if let Err(e) = self.flush_zone(zi).await {
+            if let Err(e) = self.flush_zone(zi, Reason::Background).await {
                 warn!("background flush of zone {zi} failed: {e}");
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -618,6 +652,29 @@ impl Engine {
             .filter(|&(b, _)| b > 0)
             .max()
             .map(|(_, i)| i)
+    }
+
+    pub fn dirty_limit(&self) -> u64 {
+        self.dirty_limit
+    }
+
+    /// Zone conditions and the number of zones with buffered data.
+    pub fn zone_summary(&self) -> (ZoneCounts, u64) {
+        let mut c = ZoneCounts::default();
+        let mut dirty = 0;
+        for z in &self.zones {
+            let st = z.state.lock().unwrap();
+            match st.cond {
+                Cond::Empty => c.empty += 1,
+                Cond::ImpOpen | Cond::ExpOpen => c.open += 1,
+                Cond::Closed => c.closed += 1,
+                Cond::Full => c.full += 1,
+            }
+            if st.buffered() > 0 {
+                dirty += 1;
+            }
+        }
+        (c, dirty)
     }
 
     /// Zones that still hold data not confirmed by the store: (zone, bytes).
@@ -689,7 +746,7 @@ mod tests {
         assert_eq!(e.write(ZS, blk(2, 1), true).unwrap(), ZS + 2 * B);
         assert_eq!(e.dirty_bytes(), 3 * B);
 
-        e.flush_all().await.unwrap();
+        e.flush_all(Reason::Explicit).await.unwrap();
         assert_eq!(e.dirty_bytes(), 0);
         let obj = store.get("t/0000000000100000").await.unwrap().unwrap();
         assert_eq!(obj.len() as u64, 3 * B);
@@ -702,7 +759,7 @@ mod tests {
         assert_eq!(&data[2 * B as usize..3 * B as usize], &blk(3, 1)[..]);
         assert!(data[3 * B as usize..].iter().all(|&b| b == 0));
 
-        e.flush_zone(1).await.unwrap(); // second upload is a PATCH
+        e.flush_zone(1, Reason::Explicit).await.unwrap(); // second upload is a PATCH
         let obj = store.get("t/0000000000100000").await.unwrap().unwrap();
         assert_eq!(obj.len() as u64, 4 * B);
         assert_eq!(&obj[3 * B as usize..], &blk(3, 1)[..]);
@@ -726,7 +783,7 @@ mod tests {
         let store = mem();
         let e = engine_with(store.clone(), 0, 0).await;
         e.write(0, blk(7, 2), false).unwrap();
-        e.flush_all().await.unwrap();
+        e.flush_all(Reason::Explicit).await.unwrap();
         e.write(2 * B, blk(8, 1), false).unwrap();
 
         e.finish_zone(0).unwrap();
@@ -743,7 +800,7 @@ mod tests {
         assert!(read(&e, 0, 2 * B).await.iter().all(|&b| b == 0));
 
         e.write(0, blk(9, 1), false).unwrap(); // fresh object after reset: PUT
-        e.flush_all().await.unwrap();
+        e.flush_all(Reason::Explicit).await.unwrap();
         assert_eq!(
             store
                 .get("t/0000000000000000")
@@ -763,8 +820,8 @@ mod tests {
             e.write(0, blk(1, 3), false).unwrap();
             e.write(ZS, blk(2, ZS / B), false).unwrap();
             e.write(2 * ZS, blk(3, 1), false).unwrap(); // never flushed
-            e.flush_zone(0).await.unwrap();
-            e.flush_zone(1).await.unwrap();
+            e.flush_zone(0, Reason::Explicit).await.unwrap();
+            e.flush_zone(1, Reason::Explicit).await.unwrap();
         }
         let e = engine_with(store, 0, 0).await;
         let r = e.report(0, 3);
@@ -811,11 +868,11 @@ mod tests {
         let e = engine_with(store.clone(), 0, 0).await;
         e.write(0, blk(5, 2), false).unwrap();
         mem_store(&store).set_fail(true);
-        assert!(e.flush_all().await.is_err());
+        assert!(e.flush_all(Reason::Explicit).await.is_err());
         assert_eq!(e.dirty_bytes(), 2 * B);
         assert_eq!(&read(&e, 0, B).await[..], &blk(5, 1)[..]); // still readable from RAM
         mem_store(&store).set_fail(false);
-        e.flush_all().await.unwrap();
+        e.flush_all(Reason::Explicit).await.unwrap();
         assert_eq!(e.dirty_bytes(), 0);
         assert!(e.unflushed().is_empty());
     }

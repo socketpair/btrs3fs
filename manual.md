@@ -21,6 +21,7 @@ btrs3fs превращает префикс в S3-бакете в диск, на
 11. [Типичные ситуации](#11-типичные-ситуации)
 12. [Ограничения](#12-ограничения)
 13. [Освобождение места (reclaim)](#13-освобождение-места-reclaim)
+14. [Статистика](#14-статистика)
 
 ## 1. Требования
 
@@ -99,6 +100,7 @@ sudo btrs3fs umount /mnt/data
 | `run --memory --size S` | Устройство в RAM без S3 — для экспериментов. |
 | `detach [--dev-id 0]` | Остановить несмонтированное устройство (запущенное через `run`), либо убрать устройство, чей демон умер. |
 | `detach --force [--dev-id N]` | Убить демон устройства немедленно (SIGKILL), даже если ФС смонтирована — как выдернуть питание. Для зависшего демона. |
+| `stats [<точка> \| --dev-id N] [--watch S] [--json]` | Статистика работающего устройства: выгрузки в S3, параллельность, чтения (§14). |
 
 Общие флаги:
 
@@ -254,4 +256,45 @@ echo 1 | sudo tee $A/{data,metadata}/{dynamic,periodic}_reclaim
 
 Наблюдать: `allocation/{data,metadata}/reclaim_count`, `reclaim_bytes`, `reclaim_errors`;
 `sudo btrfs filesystem usage /mnt/data`.
+
+## 14. Статистика
+
+```bash
+sudo btrs3fs stats /mnt/data            # итоги с момента запуска демона
+sudo btrs3fs stats /mnt/data --watch 5  # что произошло за каждые 5 секунд
+sudo btrs3fs stats --json               # то же в JSON (единственное устройство)
+```
+
+Пример (`fio`, 4 параллельных писателя, `fsync` каждые 8 записей):
+
+```
+test/st/ on /dev/ublkb1 (last 4s)
+RAM buffers: 1.4 MiB in 3 zones (limit 256.0 MiB); zones: 4 open, 0 closed, 0 full, 124 empty
+
+Uploads to S3: 25 (0 PUT, 25 PATCH), 10.6 MiB, avg 432.6 KiB
+  reason:      FLUSH 25, FUA 0, buffer limit 0, explicit 0
+  size:        <=64K: 2  <=256K: 2  <=1M: 21
+  latency:     p50 <=500ms, p90 <=500ms, p99 <=500ms
+  in parallel: 3 now, 4 max; retries 0, failed 0
+  zones per FLUSH: 1: 5  2: 5  3-4: 10
+
+Reads: 0 requests, 0 B: from S3 0 B (0 GETs, p50 -, p90 -, p99 -), RAM 0 B, zeros 0 B
+Kernel requests: WRITE 84 (11.5 MiB), ZONE_APPEND 0 (0 B), FLUSH 20, FUA 0, zone reset 0, …
+  in parallel: 2 now, 4 max
+```
+
+| Строка | Что показывает |
+|---|---|
+| `RAM buffers` | Сколько данных ждёт выгрузки и в скольких зонах; состояние зон. |
+| `Uploads to S3` | Дозаписи в объекты: `PUT` — первая запись в зону, `PATCH` — дозапись; объём и средний размер. |
+| `reason` | Почему выгружено: `FLUSH` (fsync, sync, фиксация btrfs), `FUA`, `buffer limit` (превышен `--dirty-limit`), `explicit` (форматирование в `create`). |
+| `size` | Распределение размеров дозаписей (`<=1M: 21` — 21 дозапись размером от 256 КБ до 1 МБ). |
+| `latency` | Время выгрузки: медиана и 90/99-й процентили (с точностью до границы корзины). |
+| `in parallel` | Сколько выгрузок идёт сейчас и максимум; максимум — за всё время работы. |
+| `zones per FLUSH` | Сколько зон выгружалось за один FLUSH — степень параллельности сброса (до 16 одновременно). |
+| `Reads` | Чтения: сколько данных пришло из S3 (и время GET), из RAM, сколько — нули за указателем записи. |
+| `Kernel requests` | Запросы ядра к устройству; `ZONE_APPEND` — так btrfs пишет данные, `WRITE` — метаданные и суперблок; `in parallel` — запросы в обработке. |
+
+Статистика есть только у устройств, запущенных `mount` или `run`; отдаёт её сам демон через
+сокет `/run/btrs3fs/<N>.sock` (доступ — root). Счётчики обнуляются при перезапуске демона.
 
