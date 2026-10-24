@@ -71,6 +71,7 @@ DIAG_PACKAGES=(
     perf
     jq                    # inspect disk.json and JSON logs
     awscli2               # inspect bucket contents independently of btrs3fs
+    bpftrace              # kernel tracing (tools/trace-zone-append.sh)
 )
 
 die() { echo "error: $*" >&2; exit 1; }
