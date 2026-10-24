@@ -49,7 +49,7 @@ cargo build                              # target/debug/btrs3fs
 ```bash
 B=target/debug/btrs3fs
 
-# Создать диск: пишет <prefix>/disk.json (размер зоны по умолчанию 32M)
+# Создать диск: пишет <prefix>/disk.json (размер зоны по умолчанию 16M)
 $B create --creds creds.json --prefix disks/test --size 10G
 
 # Поднять /dev/ublkb0 (работает на переднем плане)

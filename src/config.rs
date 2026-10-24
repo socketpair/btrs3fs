@@ -34,7 +34,7 @@ pub struct DiskConfig {
 }
 
 impl DiskConfig {
-    pub const DEFAULT_ZONE_SIZE: u64 = 32 << 20;
+    pub const DEFAULT_ZONE_SIZE: u64 = 16 << 20;
 
     /// Configuration with default tunables; call `validate()` before use.
     pub fn new(disk_size: u64, zone_size: u64) -> Self {
@@ -200,7 +200,7 @@ mod tests {
     fn default_config_is_valid() {
         let cfg = DiskConfig::new(10 << 30, DiskConfig::DEFAULT_ZONE_SIZE);
         cfg.validate().unwrap();
-        assert_eq!(cfg.nr_zones(), 320);
+        assert_eq!(cfg.nr_zones(), 640);
         assert_eq!(cfg.effective_limit(1024), 0);
         assert_eq!(cfg.effective_limit(16), 16);
     }

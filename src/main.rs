@@ -60,7 +60,7 @@ struct CreateArgs {
     /// Disk size, e.g. 10G.
     #[arg(long, value_parser = parse_size)]
     size: u64,
-    #[arg(long, value_parser = parse_size, default_value = "32M")]
+    #[arg(long, value_parser = parse_size, default_value = "16M")]
     zone_size: u64,
     #[arg(long)]
     max_open_zones: Option<u32>,
@@ -93,7 +93,7 @@ struct RunArgs {
     #[arg(long, value_parser = parse_size)]
     size: Option<u64>,
     /// Zone size for --memory.
-    #[arg(long, value_parser = parse_size, default_value = "32M")]
+    #[arg(long, value_parser = parse_size, default_value = "16M")]
     zone_size: u64,
     /// ublk device id: the device is /dev/ublkb<dev-id>.
     #[arg(long, default_value_t = 0)]
