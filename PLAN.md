@@ -98,6 +98,14 @@ src/
       sha256 совпали; запись без fsync + detach → в журнале «not storing 3145728 bytes»;
       логи — в journald (`journalctl -t btrs3fs`).
 
+## Этап 7 — аварии
+
+- [x] 7.1 `kill -9` демона на смонтированной ФС (`detach --force`): ядро убирает
+      `/dev/ublkbN`, btrfs прерывает транзакцию, «emergency shutdown», ФС размонтирована;
+      `detach` удаляет устройство с мёртвым сервером; повторный `mount` из S3 — без ошибок
+      в журнале ядра; 11/11 файлов после `sync`/`fsync` целы, 10 файлов без fsync
+      (после последнего commit) пропали — ожидаемо при `commit=300`; 37 старых файлов целы.
+
 ## Этап 5 — поставка
 
 - [x] 5.1 systemd unit для `run` (`packaging/btrs3fs@.service`, `Type=notify` через `sd_notify`).
