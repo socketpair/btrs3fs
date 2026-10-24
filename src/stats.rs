@@ -25,6 +25,7 @@ const SIZE_BOUNDS: &[u64] = &[
     MIB,
     4 * MIB,
     16 * MIB,
+    32 * MIB, // largest zone
 ];
 const LATENCY_BOUNDS_MS: &[u64] = &[10, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000];
 const ZONES_BOUNDS: &[u64] = &[0, 1, 2, 4, 8, 16, 32, 64];

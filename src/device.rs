@@ -411,22 +411,50 @@ fn copy_from_request(cdev: RawFd, pos: u64, len: u64) -> ZResult<Bytes> {
 
 /// Writes read data into the request through /dev/ublkcN.
 fn copy_to_request(cdev: RawFd, bufs: &[Bytes], pos: u64, len: u64) -> ZResult<()> {
-    let iov: Vec<libc::iovec> = bufs
-        .iter()
-        .map(|b| libc::iovec {
-            iov_base: b.as_ptr() as *mut _,
-            iov_len: b.len(),
-        })
-        .collect();
-    // SAFETY: iovecs point into live Bytes borrowed for the duration of the call.
-    let n = unsafe { libc::pwritev(cdev, iov.as_ptr(), iov.len() as i32, pos as libc::off_t) };
-    if n != len as isize {
+    let n = pwritev_all(cdev, bufs, pos)
+        .map_err(|e| ZoneError::Invalid(format!("user copy to request failed: {e}")))?;
+    if n != len {
         return Err(ZoneError::Invalid(format!(
-            "user copy to request failed: {n} of {len} bytes, {}",
-            std::io::Error::last_os_error()
+            "user copy to request: {n} of {len} bytes"
         )));
     }
     Ok(())
+}
+
+/// Most iovecs one `pwritev` accepts (`IOV_MAX` on Linux).
+const MAX_IOVECS: usize = 1024;
+
+/// Writes all buffers at `pos`, in batches of at most `MAX_IOVECS`: a request
+/// as large as a zone may be served from thousands of small RAM chunks.
+fn pwritev_all(fd: RawFd, bufs: &[Bytes], pos: u64) -> std::io::Result<u64> {
+    let mut written = 0u64;
+    for batch in bufs.chunks(MAX_IOVECS) {
+        let iov: Vec<libc::iovec> = batch
+            .iter()
+            .map(|b| libc::iovec {
+                iov_base: b.as_ptr() as *mut _,
+                iov_len: b.len(),
+            })
+            .collect();
+        let want: u64 = batch.iter().map(|b| b.len() as u64).sum();
+        // SAFETY: iovecs point into live Bytes borrowed for the duration of the call.
+        let n = unsafe {
+            libc::pwritev(
+                fd,
+                iov.as_ptr(),
+                iov.len() as i32,
+                (pos + written) as libc::off_t,
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        written += n as u64;
+        if n as u64 != want {
+            break;
+        }
+    }
+    Ok(written)
 }
 
 fn report_zones(engine: &Engine, cdev: RawFd, pos: u64, offset: u64, max: usize) -> ZResult<usize> {
@@ -468,6 +496,35 @@ fn report_zones(engine: &Engine, cdev: RawFd, pos: u64, offset: u64, max: usize)
 mod tests {
     use super::*;
     use std::os::unix::net::UnixDatagram;
+
+    #[test]
+    fn pwritev_more_than_iov_max() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let path = std::env::temp_dir().join(format!("btrs3fs-pwritev-{}", std::process::id()));
+        let file = std::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let bufs: Vec<Bytes> = (0..3000u32)
+            .map(|i| Bytes::from(vec![(i % 251) as u8; 16]))
+            .collect();
+        assert_eq!(
+            pwritev_all(file.as_raw_fd(), &bufs, 100).unwrap(),
+            3000 * 16
+        );
+        let mut data = Vec::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_end(&mut data)
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(data.len(), 100 + 3000 * 16);
+        assert_eq!(&data[100 + 2999 * 16..], &[(2999 % 251) as u8; 16]);
+    }
 
     #[test]
     fn notifies_systemd_socket() {

@@ -78,8 +78,9 @@ struct CreateArgs {
     /// Disk size, e.g. 10G.
     #[arg(long, value_parser = parse_size)]
     size: u64,
-    #[arg(long, value_parser = parse_size, default_value = "16M")]
-    zone_size: u64,
+    /// Zone size, a power of two up to 32M [default: 16M].
+    #[arg(long, value_parser = parse_size)]
+    zone_size: Option<u64>,
     #[arg(long)]
     max_open_zones: Option<u32>,
     #[arg(long)]
@@ -145,9 +146,9 @@ struct RunArgs {
     /// Disk size for --memory.
     #[arg(long, value_parser = parse_size)]
     size: Option<u64>,
-    /// Zone size for --memory.
-    #[arg(long, value_parser = parse_size, default_value = "16M")]
-    zone_size: u64,
+    /// Zone size for --memory [default: 16M].
+    #[arg(long, value_parser = parse_size)]
+    zone_size: Option<u64>,
     /// ublk device id: the device is /dev/ublkb<dev-id>.
     #[arg(long, default_value_t = 0)]
     dev_id: i32,
@@ -354,7 +355,10 @@ fn report_discarded(engine: &Engine) {
 fn cmd_run(a: RunArgs) -> anyhow::Result<i32> {
     let rt = runtime()?;
     let (cfg, layout, store) = if a.memory {
-        let cfg = DiskConfig::new(a.size.unwrap(), a.zone_size);
+        let cfg = DiskConfig::new(
+            a.size.unwrap(),
+            a.zone_size.unwrap_or(DiskConfig::DEFAULT_ZONE_SIZE),
+        );
         cfg.validate()?;
         (cfg, Layout::new("memory")?, Store::Mem(MemStore::default()))
     } else {
@@ -704,7 +708,7 @@ fn wait_for_exit(pid: i32) {
 
 fn cmd_create(a: CreateArgs) -> anyhow::Result<i32> {
     ensure_root("create (it formats the disk)")?;
-    let mut cfg = DiskConfig::new(a.size, a.zone_size);
+    let mut cfg = DiskConfig::new(a.size, a.zone_size.unwrap_or(DiskConfig::DEFAULT_ZONE_SIZE));
     if let Some(v) = a.max_open_zones {
         cfg.max_open_zones = v;
     }

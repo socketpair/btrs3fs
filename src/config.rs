@@ -12,6 +12,10 @@ pub const BLOCK_SIZE: u64 = 4096;
 /// so a zone may hold at most this many blocks.
 pub const MAX_APPENDS_PER_OBJECT: u64 = 10_000;
 
+/// Largest zone: one ublk request covers up to a zone, and ublk user copy
+/// addresses at most 32 MiB per request.
+pub const MAX_ZONE_SIZE: u64 = 32 << 20;
+
 /// Maximum queue depth accepted by the ublk driver.
 const UBLK_MAX_QUEUE_DEPTH: u16 = 4096;
 
@@ -62,6 +66,11 @@ impl DiskConfig {
         ensure!(
             self.zone_size.is_power_of_two() && self.zone_size >= BLOCK_SIZE,
             "zone_size {} must be a power of two and at least {BLOCK_SIZE}",
+            self.zone_size
+        );
+        ensure!(
+            self.zone_size <= MAX_ZONE_SIZE,
+            "zone_size {} is larger than {MAX_ZONE_SIZE} (largest ublk request)",
             self.zone_size
         );
         ensure!(
