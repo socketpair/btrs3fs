@@ -49,28 +49,29 @@ cargo build                              # target/debug/btrs3fs
 ```bash
 B=target/debug/btrs3fs
 
-# Создать диск: пишет <prefix>/disk.json (размер зоны по умолчанию 16M)
-$B create --creds creds.json --prefix disks/test --size 10G
+# Создать диск: <prefix>/disk.json + zoned btrfs (зона по умолчанию 16M; нужен root)
+sudo $B create --creds creds.json --prefix disks/test --size 10G
 
-# Поднять /dev/ublkb0 (работает на переднем плане)
-sudo $B run --creds creds.json --prefix disks/test &
+# Смонтировать: демон уходит в фон, btrfs монтируется с noatime,lazytime,commit=300
+sudo $B mount --creds creds.json --prefix disks/test /mnt/data [-o compress=zstd]
 
-# Файловая система
-mkfs.btrfs -O zoned /dev/ublkb0          # один раз
-mount /mnt/btrs3fs
-sudo chown $USER /mnt/btrs3fs            # один раз после mkfs
-
-# Остановить: размонтировать, затем detach (сбрасывает буферы в S3)
-umount /mnt/btrs3fs
-sudo $B detach
+# Размонтировать и остановить устройство
+sudo $B umount /mnt/data
 
 # Удалить все данные диска
 $B destroy --creds creds.json --prefix disks/test --yes
 ```
 
-Полезные флаги: `--log-level debug`, `run --queues N`, `--http auto|http1|http2`, `--proxy URL`,
-`run --memory --size 1G` (без S3, для тестов). Параметры диска (`create --help`):
-лимиты открытых/активных зон, лимит буфера, политика повторов, очереди.
+Логи — в journald (`journalctl -t btrs3fs`), без journald — в `/dev/log`; `--log-to-stderr`
+дублирует их в stderr (цветные на терминале), `--log-level debug` — подробнее.
+
+`commit=300`: без `fsync` btrfs сбрасывает данные раз в 5 минут. Данные, не подтверждённые
+FLUSH/fsync, при остановке демона не дописываются (как кеш записи диска при отключении
+питания) — в журнал пишется их объём. После `umount` таких данных нет.
+
+Низкоуровневые команды: `run` (устройство без монтирования, на переднем плане — для systemd),
+`detach` (остановить несмонтированное устройство), `run --memory --size 1G` (без S3, для
+тестов). Параметры диска — `create --help`; сеть — `--http auto|http1|http2`, `--proxy URL`.
 
 ## systemd
 
@@ -96,4 +97,4 @@ BTRS3FS_CREDS=creds.json cargo test -- --ignored      # против насто�
 - Один хост на диск: защиты от одновременного подключения нет.
 - Нет кеша чтения: каждое чтение сброшенных данных — запрос к S3.
 - Состояние FINISH не сохраняется: после перезапуска такая зона — CLOSED (для btrfs безопасно).
-- Данные, не подтверждённые FLUSH, при падении процесса теряются (как у диска с кешем записи).
+- Данные, не подтверждённые FLUSH, при остановке или падении демона не сохраняются (как у диска с кешем записи).

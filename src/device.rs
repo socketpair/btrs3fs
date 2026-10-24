@@ -40,14 +40,19 @@ struct Ctx {
     rt: Handle,
 }
 
-/// Creates the device and serves it until SIGTERM/SIGINT/SIGHUP or until the
-/// device is removed externally. Returns after all queues stopped; the caller
-/// flushes remaining data and then calls `delete()`.
+/// Called once the device is live with its path (`/dev/ublkbN`); returns
+/// whether to keep serving until a signal (`true`) or to stop right away.
+pub type OnReady = Box<dyn FnOnce(&str) -> bool + Send + Sync>;
+
+/// Creates the device and serves it until `on_ready` asks to stop, a
+/// SIGTERM/SIGINT/SIGHUP arrives or the device is removed externally. Returns
+/// after all queues stopped; the caller then calls `delete()`.
 pub fn serve(
     cfg: &DiskConfig,
     engine: Arc<Engine>,
     rt: Handle,
     opts: &DeviceOptions,
+    on_ready: OnReady,
 ) -> anyhow::Result<UblkCtrl> {
     let features = UblkCtrl::get_features().context("ublk driver is not available")?;
     let needed = (sys::UBLK_F_USER_COPY | sys::UBLK_F_ZONED) as u64;
@@ -109,23 +114,24 @@ pub fn serve(
     };
 
     let device_fn = move |ctrl: &UblkCtrl| {
+        let bdev = ctrl.get_bdev_path();
         info!(
-            "device {} is ready ({} queues, depth {})",
-            ctrl.get_bdev_path(),
+            "device {bdev} is ready ({} queues, depth {})",
             ctrl.dev_info().nr_hw_queues,
             ctrl.dev_info().queue_depth
         );
-        sd_notify("READY=1");
-        loop {
-            if let Some(sig) = signals.pending().next() {
-                info!("signal {sig} received, stopping device");
-                break;
+        if on_ready(&bdev) {
+            loop {
+                if let Some(sig) = signals.pending().next() {
+                    info!("signal {sig} received, stopping device");
+                    break;
+                }
+                if live_queues.load(Ordering::SeqCst) == 0 {
+                    warn!("all queues stopped, device was removed externally");
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
-            if live_queues.load(Ordering::SeqCst) == 0 {
-                warn!("all queues stopped, device was removed externally");
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
         }
         if let Err(e) = ctrl.kill_dev() {
             warn!("stopping device failed: {e:?}");
@@ -138,7 +144,7 @@ pub fn serve(
 }
 
 /// Tells systemd (Type=notify) about state changes; no-op outside systemd.
-fn sd_notify(state: &str) {
+pub fn sd_notify(state: &str) {
     use std::os::linux::net::SocketAddrExt;
     use std::os::unix::net::{SocketAddr, UnixDatagram};
 

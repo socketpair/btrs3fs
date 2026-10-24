@@ -31,6 +31,8 @@ thiserror = "2"
 log = "0.4"
 env_logger = "0.11"
 signal-hook = "0.4"
+systemd-journal-logger = "2.2"
+syslog = "7"
 
 [profile.release]
 debug = 1
