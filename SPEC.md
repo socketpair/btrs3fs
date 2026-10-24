@@ -430,6 +430,14 @@ struct Zone {
   **Решение (2026-10-24): зона 16 МиБ, без уплотнения.**
 - [x] `UNSIGNED-PAYLOAD` принимается. Если же передан хеш тела, сервер его проверяет
   (неверный → `400`, в ответе `ClientContentSHA256` / `ServerContentSHA256`).
+- [x] Переработка зон btrfs (reclaim), ядро 7.2, исходники `fs/btrfs/{space-info,block-group,zoned,sysfs}.c`
+  и опыт: на свежей zoned-ФС `allocation/{data,metadata}`: `bg_reclaim_threshold=75`,
+  `dynamic_reclaim=0`, `periodic_reclaim=0`; общий `bg_reclaim_threshold=75` — в zoned-режиме
+  это шлагбаум «распределено ≥ N % диска» (`btrfs_zoned_should_reclaim`), 0 выключает
+  переработку. Динамический порог: цель — 10 нераспределённых чанков (в zoned чанк = зона,
+  т. е. 160 МБ при 16 МиБ), порог = доля нехватки до цели (0…99 %). Кандидаты сортируются по
+  возрастанию заполненности. При `dynamic_reclaim=1` запись статического порога — `EINVAL`.
+  Пользовательская рекомендация — `manual.md` §13.
 - [x] API `libublk` для моста с tokio: `UblkQueue::ublk_submit_sqe(sqe)` отправляет произвольный
   SQE в io_uring очереди и возвращает future ⇒ задача IO ждёт `opcode::Read` на своём eventfd,
   поток tokio пишет в eventfd по завершении запроса к S3.
