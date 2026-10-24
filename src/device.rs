@@ -92,7 +92,9 @@ pub fn serve(
         p.basic.logical_bs_shift = BLOCK_SHIFT;
         p.basic.physical_bs_shift = BLOCK_SHIFT;
         p.basic.io_min_shift = BLOCK_SHIFT;
-        p.basic.io_opt_shift = BLOCK_SHIFT;
+        // The kernel sizes writeback I/O by io_opt: with io_opt = 4 KiB btrfs
+        // sent its data as 4 KiB zone appends (SPEC.md §13.3).
+        p.basic.io_opt_shift = IO_BUF_BYTES.trailing_zeros() as u8;
         p.basic.chunk_sectors = zone_sectors;
         p.zoned = sys::ublk_param_zoned {
             max_open_zones: max_open,
