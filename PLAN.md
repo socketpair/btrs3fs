@@ -80,6 +80,18 @@ src/
       досылает их; `detach` при обрыве — через бюджет лог «data lost: zone N, X bytes»,
       устройство удаляется, код выхода 2.
 
+## Этап 6 — монтирование и логи (запрос пользователя 2026-10-24)
+
+- [ ] 6.1 Логи: journald → `/dev/log` → (ничего); `--log-to-stderr` (цвет на терминале);
+      итоговая ошибка команды — всегда в stderr.
+- [ ] 6.2 `serve()` с колбэком готовности и программной остановкой; `create` делает mkfs
+      на временном устройстве, откат при ошибке.
+- [ ] 6.3 `mount`: fork демона до запуска потоков, готовность по pipe, `mount -t btrfs -o
+      noatime,lazytime,commit=300[,…]`, остановка демона при ошибке монтирования.
+- [ ] 6.4 `umount`: точка → устройство по mountinfo → umount → detach.
+- [ ] 6.5 Проверка: create → mount → файлы → umount → mount → сверка; журнал в journald.
+- [ ] 6.6 README, systemd unit, CLAUDE.md.
+
 ## Этап 5 — поставка
 
 - [x] 5.1 systemd unit для `run` (`packaging/btrs3fs@.service`, `Type=notify` через `sd_notify`).

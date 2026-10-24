@@ -313,14 +313,32 @@ struct Zone {
 
 ## 10. CLI
 
+Решения пользователя 2026-10-24: «монтирование бакета» одной командой, mkfs — в `create`,
+демон `mount` уходит в фон, логи — в journald.
+
 | Команда | Что делает |
 |---|---|
-| `btrs3fs create --creds F --prefix P --size S [--zone-size Z] [...]` | Проверяет параметры, пишет `P/disk.json`. Отказ, если `disk.json` уже есть. |
-| `btrs3fs run --creds F --prefix P [--queues N] [--dev-id 0]` | Читает конфиг, восстанавливает зоны, поднимает `/dev/ublkb<id>`. Работает на переднем плане. |
+| `btrs3fs create --creds F --prefix P --size S [--zone-size Z] [...]` | Проверяет параметры, отказ, если под префиксом уже есть объекты; пишет `P/disk.json`, поднимает временное устройство, делает `mkfs.btrfs -O zoned`, сбрасывает всё в S3 и удаляет устройство. При ошибке mkfs откатывает созданные объекты. Нужен root. |
+| `btrs3fs mount --creds F --prefix P <точка> [-o опции] [--dev-id N]` | Порождает демон в фоне (fork до запуска потоков), ждёт по pipe готовности устройства, монтирует `mount -t btrfs -o noatime,lazytime,commit=300[,опции]`. Если монтирование не удалось — останавливает демон. По умолчанию `--dev-id` выбирает ядро. Нужен root. |
+| `btrs3fs umount <точка>` | Находит `/dev/ublkbN` в `/proc/self/mountinfo`, размонтирует, затем `detach` (сброс в S3, ожидание выхода демона). Нужен root. |
+| `btrs3fs run --creds F --prefix P [--queues N] [--dev-id 0]` | Устройство без монтирования, на переднем плане (для systemd, `Type=notify`). |
 | `btrs3fs detach [--dev-id 0]` | Отказ, если устройство смонтировано (`O_EXCL` на `/dev/ublkbN` даёт `EBUSY`). Иначе SIGTERM демону (pid из `GET_DEV_INFO`) и ожидание выхода. |
 | `btrs3fs destroy --creds F --prefix P --yes` | Удаляет все объекты зон и `disk.json`. |
 
-### Остановка (`detach` / SIGTERM / SIGINT)
+Опции монтирования по умолчанию `noatime,lazytime,commit=300`. Следствие `commit=300`: без
+явного `fsync` btrfs фиксирует транзакцию (и шлёт FLUSH) раз в 5 минут — при падении теряется
+до 5 минут записей; объём несброшенного ограничен `dirty_limit_bytes` (сверх — фоновая выгрузка).
+
+### Логирование
+
+- Всегда — в journald (крейт `systemd-journal-logger`, родной протокол через
+  `/run/systemd/journal/socket`); если journald нет — в syslog через `/dev/log` (крейт `syslog`).
+  В файлы — никогда.
+- `--log-to-stderr` — дополнительно в stderr (`env_logger`), цветной, если stderr — терминал.
+- Итоговая ошибка команды печатается в stderr всегда, чтобы её видел запустивший.
+- Уровень — `--log-level` (env_logger-синтаксис).
+
+### Остановка (`detach` / `umount` / SIGTERM / SIGINT)
 
 1. Сбросить все буферы в S3 (с обычной политикой повторов).
 2. Удалить ublk-устройство, выйти с кодом 0.
