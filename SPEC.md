@@ -418,8 +418,8 @@ struct Zone {
 
 ### 13.2. Входит в объём, ещё не сделано
 
-- [ ] Этапы 1–5 из §12 (включая systemd unit — пользователь подтвердил, что нужен).
-- [ ] `.gitignore` с `creds.txt` / `creds.json` при инициализации git.
+- [x] Этапы 1–6 из `PLAN.md` (включая systemd unit).
+- [x] `.gitignore` с `creds.json`.
 - [x] `creds.json` в формате §3.3 (сделан из `creds.txt`, `creds.txt` удалён).
 
 ### 13.3. Проверить при реализации
@@ -482,9 +482,9 @@ struct Zone {
 
 ### 13.5. Действия пользователя
 
-- [ ] `sudo ./setup-permissions.sh install`
-- [ ] `sudo ./setup-permissions.sh build-deps`
-- [ ] `sudo ./setup-permissions.sh diag-tools` — для тестов (этап 4).
+- [x] `sudo ./setup-permissions.sh install`
+- [x] `sudo ./setup-permissions.sh build-deps`
+- [x] `sudo ./setup-permissions.sh diag-tools` — для тестов (этап 4).
 - [ ] После завершения разработки — `sudo ./setup-permissions.sh uninstall`.
 
 ---
