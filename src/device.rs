@@ -25,8 +25,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Handle;
 
-/// Largest single request; also the zone append limit.
-const IO_BUF_BYTES: u32 = 512 << 10;
 const SECTOR_SHIFT: u32 = 9;
 const BLOCK_SHIFT: u8 = BLOCK_SIZE.trailing_zeros() as u8;
 
@@ -73,7 +71,9 @@ pub fn serve(
         .id(opts.dev_id)
         .nr_queues(opts.nr_queues)
         .depth(opts.queue_depth)
-        .io_buf_bytes(IO_BUF_BYTES)
+        // Largest request = zone size (zones are at most 32 MiB, the user-copy
+        // limit of ublk is 32 MiB per request).
+        .io_buf_bytes(cfg.zone_size as u32)
         .ctrl_flags(needed)
         .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
         .build()
@@ -93,8 +93,9 @@ pub fn serve(
         p.basic.physical_bs_shift = BLOCK_SHIFT;
         p.basic.io_min_shift = BLOCK_SHIFT;
         // The kernel sizes writeback I/O by io_opt: with io_opt = 4 KiB btrfs
-        // sent its data as 4 KiB zone appends (SPEC.md §13.3).
-        p.basic.io_opt_shift = IO_BUF_BYTES.trailing_zeros() as u8;
+        // sent its data as 4 KiB zone appends (SPEC.md §13.3). Zone size is a
+        // power of two, so the shift is exact.
+        p.basic.io_opt_shift = zone_sectors.trailing_zeros() as u8 + SECTOR_SHIFT as u8;
         p.basic.chunk_sectors = zone_sectors;
         p.zoned = sys::ublk_param_zoned {
             max_open_zones: max_open,
