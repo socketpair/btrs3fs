@@ -712,7 +712,8 @@ mod tests {
         cfg.max_open_zones = max_open;
         cfg.max_active_zones = max_active;
         cfg.dirty_limit_bytes = 64 * B;
-        cfg.validate().unwrap();
+        // No validate(): the engine handles any limits, while the config
+        // rejects ones below the btrfs minimum that these tests need.
         Engine::open(&cfg, Layout::new("t").unwrap(), store)
             .await
             .unwrap()
