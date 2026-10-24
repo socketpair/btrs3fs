@@ -57,8 +57,6 @@ enum Command {
     Detach(DetachArgs),
     /// Delete all objects of a disk.
     Destroy(DestroyArgs),
-    /// Show statistics of a running device: uploads to S3, parallelism, reads (needs root).
-    Stats(StatsArgs),
 }
 
 #[derive(Args)]
@@ -115,6 +113,19 @@ struct MountArgs {
     /// Override nr_queues from disk.json.
     #[arg(long)]
     queues: Option<u16>,
+    #[command(flatten)]
+    stats: StatsArgs,
+}
+
+/// Statistics web page of the device server.
+#[derive(Args, Clone, Copy)]
+struct StatsArgs {
+    /// Port of the statistics page on 127.0.0.1 [default: 9470 + device number].
+    #[arg(long)]
+    stats_port: Option<u16>,
+    /// Do not serve the statistics page.
+    #[arg(long, conflicts_with = "stats_port")]
+    no_stats: bool,
 }
 
 #[derive(Args)]
@@ -144,6 +155,8 @@ struct RunArgs {
     #[arg(long)]
     queues: Option<u16>,
     #[command(flatten)]
+    stats: StatsArgs,
+    #[command(flatten)]
     transport: Transport,
 }
 
@@ -156,20 +169,6 @@ struct DetachArgs {
     /// gets I/O errors). For hung servers and crash tests.
     #[arg(long)]
     force: bool,
-}
-
-#[derive(Args)]
-struct StatsArgs {
-    /// Mount point of a btrs3fs disk; without it --dev-id or the only running device is used.
-    mountpoint: Option<PathBuf>,
-    #[arg(long, conflicts_with = "mountpoint")]
-    dev_id: Option<u32>,
-    /// Print the raw JSON snapshot.
-    #[arg(long)]
-    json: bool,
-    /// Repeat every SECONDS, showing what happened during each interval.
-    #[arg(long, value_name = "SECONDS")]
-    watch: Option<u64>,
 }
 
 #[derive(Args)]
@@ -193,7 +192,6 @@ fn main() {
         Command::Detach(a) if a.force => kill_server(a.dev_id),
         Command::Detach(a) => detach(a.dev_id),
         Command::Destroy(a) => cmd_destroy(a),
-        Command::Stats(a) => cmd_stats(a),
     };
     let code = match res {
         Ok(code) => code,
@@ -258,10 +256,14 @@ fn serve_disk(
     mut cfg: DiskConfig,
     layout: Layout,
     store: Store,
-    dev_id: i32,
-    queues: Option<u16>,
+    serve: ServeOptions,
     on_ready: device::OnReady,
 ) -> anyhow::Result<(Arc<Engine>, libublk::ctrl::UblkCtrl)> {
+    let ServeOptions {
+        dev_id,
+        queues,
+        stats: stats_opt,
+    } = serve;
     if let Some(q) = queues {
         cfg.nr_queues = q;
     }
@@ -282,12 +284,16 @@ fn serve_disk(
         queue_depth: cfg.queue_depth,
     };
 
-    // Statistics socket lives exactly as long as the device.
+    // The statistics page starts once the device number is known.
     let started = Instant::now();
-    let stats_dev = Arc::new(Mutex::new(None));
-    let (stats_engine, stats_dev_set) = (engine.clone(), stats_dev.clone());
+    let stats_engine = engine.clone();
     let on_ready: device::OnReady = Box::new(move |bdev| {
-        if let Some(id) = ublk_dev_id(bdev) {
+        let port = stats_opt.filter(|o| !o.no_stats).and_then(|o| {
+            o.stats_port.or_else(|| {
+                ublk_dev_id(bdev).and_then(|id| stats::BASE_PORT.checked_add(id.try_into().ok()?))
+            })
+        });
+        if let Some(port) = port {
             let device = bdev.to_string();
             let snapshot = move || {
                 let (zones, dirty_zones) = stats_engine.zone_summary();
@@ -301,19 +307,31 @@ fn serve_disk(
                     zones,
                 })
             };
-            match stats::serve(id, snapshot) {
-                Ok(()) => *stats_dev_set.lock().unwrap() = Some(id),
-                Err(e) => warn!("statistics are not available: {e:#}"),
+            match stats::serve_http(port, snapshot) {
+                Ok(()) => {
+                    let _ = STATS_PORT.set(port);
+                }
+                Err(e) => warn!("statistics page is not available: {e:#}"),
             }
         }
         on_ready(bdev)
     });
-    let ctrl = device::serve(&cfg, engine.clone(), rt.handle().clone(), &opts, on_ready);
-    if let Some(id) = stats_dev.lock().unwrap().take() {
-        stats::remove_socket(id);
-    }
-    Ok((engine, ctrl?))
+    let ctrl = device::serve(&cfg, engine.clone(), rt.handle().clone(), &opts, on_ready)?;
+    Ok((engine, ctrl))
 }
+
+/// How `serve_disk` exposes the device.
+struct ServeOptions {
+    /// ublk device id; -1 lets the kernel choose.
+    dev_id: i32,
+    /// Overrides `nr_queues` from disk.json.
+    queues: Option<u16>,
+    /// `None` — no statistics page (temporary device of `create`).
+    stats: Option<StatsArgs>,
+}
+
+/// Port the statistics page actually listens on, once started.
+static STATS_PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
 
 /// `N` of `/dev/ublkbN`.
 fn ublk_dev_id(bdev: &str) -> Option<u32> {
@@ -351,7 +369,18 @@ fn cmd_run(a: RunArgs) -> anyhow::Result<i32> {
         device::sd_notify("READY=1");
         true
     });
-    let (engine, ctrl) = serve_disk(&rt, cfg, layout, store, a.dev_id, a.queues, on_ready)?;
+    let (engine, ctrl) = serve_disk(
+        &rt,
+        cfg,
+        layout,
+        store,
+        ServeOptions {
+            dev_id: a.dev_id,
+            queues: a.queues,
+            stats: Some(a.stats),
+        },
+        on_ready,
+    )?;
     report_discarded(&engine);
     device::delete(&ctrl);
     info!("device removed");
@@ -410,8 +439,12 @@ fn cmd_mount(a: MountArgs, keep_stderr: bool) -> anyhow::Result<i32> {
     let mut status = String::new();
     status_rx.read_to_string(&mut status).ok();
     let line = status.lines().next().unwrap_or_default();
-    let bdev = match (line.strip_prefix("READY "), line.strip_prefix("ERROR ")) {
-        (Some(bdev), _) => bdev.to_string(),
+    let (bdev, stats_port) = match (line.strip_prefix("READY "), line.strip_prefix("ERROR ")) {
+        (Some(rest), _) => {
+            let mut parts = rest.split(' ');
+            let bdev = parts.next().unwrap_or_default().to_string();
+            (bdev, parts.next().and_then(|p| p.parse::<u16>().ok()))
+        }
         (_, Some(err)) => bail!("device server failed: {err}"),
         _ => bail!("device server exited unexpectedly, see `journalctl -t btrs3fs`"),
     };
@@ -431,10 +464,13 @@ fn cmd_mount(a: MountArgs, keep_stderr: bool) -> anyhow::Result<i32> {
         "{bdev} mounted on {} with {options}; server process {pid}",
         mountpoint.display()
     );
+    if let Some(port) = stats_port {
+        info!("statistics: http://127.0.0.1:{port}/");
+    }
     Ok(0)
 }
 
-/// Background device server of `mount`. Reports `READY <bdev>` or `ERROR <msg>`
+/// Background device server of `mount`. Reports `READY <bdev> <stats port|->` or `ERROR <msg>`
 /// to the parent through `status`.
 fn mount_daemon(a: &MountArgs, creds: &Path, status: File, keep_stderr: bool) -> i32 {
     detach_from_terminal(keep_stderr);
@@ -445,11 +481,23 @@ fn mount_daemon(a: &MountArgs, creds: &Path, status: File, keep_stderr: bool) ->
         let ready_status = status.clone();
         let on_ready: device::OnReady = Box::new(move |bdev| {
             if let Some(mut f) = ready_status.lock().unwrap().take() {
-                let _ = writeln!(f, "READY {bdev}");
+                let port = STATS_PORT.get().map_or("-".into(), |p| p.to_string());
+                let _ = writeln!(f, "READY {bdev} {port}");
             }
             true
         });
-        let (engine, ctrl) = serve_disk(&rt, cfg, layout, store, a.dev_id, a.queues, on_ready)?;
+        let (engine, ctrl) = serve_disk(
+            &rt,
+            cfg,
+            layout,
+            store,
+            ServeOptions {
+                dev_id: a.dev_id,
+                queues: a.queues,
+                stats: Some(a.stats),
+            },
+            on_ready,
+        )?;
         report_discarded(&engine);
         device::delete(&ctrl);
         info!("device removed");
@@ -750,8 +798,11 @@ fn format_disk(
         cfg.clone(),
         layout.clone(),
         Store::S3(s3.clone()),
-        -1,
-        None,
+        ServeOptions {
+            dev_id: -1,
+            queues: None,
+            stats: None,
+        },
         on_ready,
     )?;
     // Formatting is part of creating the disk: store it even without a FLUSH.
@@ -806,58 +857,6 @@ fn destroy_prefix(rt: &Runtime, s3: &S3Store, layout: &Layout) -> anyhow::Result
         s3.delete(&config_key).await?;
         anyhow::Ok(n)
     })
-}
-
-fn cmd_stats(a: StatsArgs) -> anyhow::Result<i32> {
-    let dev_id = match (&a.mountpoint, a.dev_id) {
-        (Some(mp), _) => {
-            let mp = std::fs::canonicalize(mp)
-                .with_context(|| format!("mount point {}", mp.display()))?;
-            let entry =
-                find_mount(&mp)?.with_context(|| format!("{} is not mounted", mp.display()))?;
-            ublk_dev_id(&entry.source).with_context(|| {
-                format!(
-                    "{} is mounted from {}, not from a btrs3fs device",
-                    mp.display(),
-                    entry.source
-                )
-            })?
-        }
-        (None, Some(id)) => id,
-        (None, None) => match stats::served_devices().as_slice() {
-            [id] => *id,
-            [] => bail!(
-                "no statistics sockets in {} (no device running, not root, or the \
-                 device was started by an older btrs3fs: remount it)",
-                stats::SOCKET_DIR
-            ),
-            ids => bail!("several devices are running ({ids:?}); pass a mount point or --dev-id"),
-        },
-    };
-    let show = |s: &stats::Snapshot, interval: Option<u64>| -> anyhow::Result<()> {
-        if a.json {
-            println!("{}", serde_json::to_string(s)?);
-        } else {
-            print!("{}", stats::render(s, interval));
-        }
-        Ok(())
-    };
-
-    let Some(secs) = a.watch else {
-        show(&stats::fetch(dev_id)?, None)?;
-        return Ok(0);
-    };
-    ensure!(secs > 0, "--watch needs a positive interval");
-    let mut prev = stats::fetch(dev_id)?;
-    loop {
-        std::thread::sleep(Duration::from_secs(secs));
-        let cur = stats::fetch(dev_id)?;
-        show(&cur.delta(&prev), Some(secs))?;
-        if !a.json {
-            println!("{}", "-".repeat(78));
-        }
-        prev = cur;
-    }
 }
 
 #[cfg(test)]
