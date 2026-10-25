@@ -1,6 +1,6 @@
 //! Settings derived from the link to S3 (SPEC.md §6.1). The admin measures the
 //! link with `btrs3fs measure` and passes it to `mount`/`run`; the read window,
-//! the kernel request size, the btrfs readahead window and the number of
+//! the part size of large GETs, the btrfs readahead window and the number of
 //! parallel uploads all follow from it.
 
 use std::fmt;
@@ -9,7 +9,7 @@ use std::time::Duration;
 const KIB: u64 = 1 << 10;
 const MIB: u64 = 1 << 20;
 
-/// Bounds of the transfer unit (read window and kernel request size).
+/// Bounds of the transfer unit (read window and GET part).
 /// Judgement calls: below 128 KiB a window glues hardly any neighbouring
 /// small files; above 4 MiB a random small read downloads too much even on a
 /// fast link.
@@ -106,8 +106,9 @@ impl fmt::Display for Link {
 /// Settings derived from a `Link`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tuning {
-    /// Read-ahead window of the daemon and the largest kernel request: one
-    /// GET of this size costs about two latencies.
+    /// Read-ahead window of the daemon and the part size large reads are
+    /// split into for parallel GETs: one GET of this size costs about two
+    /// latencies.
     pub unit: u64,
     /// btrfs readahead window (`bdi/read_ahead_kb`): bytes in flight for a
     /// sequential reader.
@@ -120,7 +121,7 @@ impl fmt::Display for Tuning {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "read window and kernel request {} KiB (latency × read stream), \
+            "read window and GET part {} KiB (latency × read stream), \
              btrfs readahead {} MiB ({READAHEAD_FACTOR} × latency × total read), \
              {} parallel uploads (total write / one zone upload)",
             self.unit / KIB,

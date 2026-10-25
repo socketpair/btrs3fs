@@ -373,7 +373,7 @@ fn serve_disk(
     });
     let mut engine = engine.with_read_ahead(read_ahead)?;
     if let Some(t) = tuning {
-        engine = engine.with_uploads(t.uploads);
+        engine = engine.with_uploads(t.uploads).with_get_part(t.unit);
     }
     let engine = Arc::new(engine);
     rt.spawn(engine.clone().background_flusher());
@@ -381,7 +381,6 @@ fn serve_disk(
         dev_id,
         nr_queues: cfg.nr_queues,
         queue_depth: cfg.queue_depth,
-        max_request: tuning.map(|t| t.unit),
         fs_readahead: tuning.map(|t| t.fs_readahead),
     };
 

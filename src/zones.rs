@@ -144,6 +144,9 @@ pub struct Engine {
     /// `uploads` permits shared by every upload, whatever its reason
     /// (SPEC.md §5).
     upload_slots: Semaphore,
+    /// Store reads larger than this go out as parallel GETs of this size
+    /// (SPEC.md §6.2).
+    get_part: u64,
 }
 
 impl Engine {
@@ -239,6 +242,7 @@ impl Engine {
             read_cache: None,
             uploads: S3_PARALLELISM,
             upload_slots: Semaphore::new(S3_PARALLELISM),
+            get_part: u64::MAX,
         };
         info!("restored {nr_zones} zones: {closed} closed, {full} full, {empty} empty");
         Ok(engine)
@@ -262,6 +266,13 @@ impl Engine {
     pub fn with_uploads(mut self, uploads: usize) -> Self {
         self.uploads = uploads.max(1);
         self.upload_slots = Semaphore::new(self.uploads);
+        self
+    }
+
+    /// Splits store reads into parallel GETs of `part` bytes (SPEC.md §6.2);
+    /// without this call a read is one GET.
+    pub fn with_get_part(mut self, part: u64) -> Self {
+        self.get_part = part.max(BLOCK_SIZE);
         self
     }
 
@@ -398,7 +409,7 @@ impl Engine {
                         self.read_windows(c, &key, (zone, generation), offset, len, &mut out)
                             .await?
                     }
-                    _ => out.push(self.get(&key, offset, len).await?),
+                    _ => out.extend(self.get_parts(&key, offset, len).await?),
                 },
                 Piece::Mem(b) => {
                     STATS.read_from_ram.add(b.len() as u64);
@@ -411,6 +422,15 @@ impl Engine {
             }
         }
         Ok(out)
+    }
+
+    /// `[offset, offset + len)` of an object as parallel GETs of `get_part`.
+    async fn get_parts(&self, key: &str, offset: u64, len: u64) -> ZResult<Vec<Bytes>> {
+        let end = offset + len;
+        let parts = (offset..end)
+            .step_by(self.get_part as usize)
+            .map(|from| self.get(key, from, self.get_part.min(end - from)));
+        futures_util::future::try_join_all(parts).await
     }
 
     /// One GET, counted in the statistics.
@@ -1127,5 +1147,22 @@ mod tests {
         drop(taken);
         flush.await.unwrap().unwrap();
         assert!(e.unflushed().is_empty());
+    }
+    #[tokio::test]
+    async fn large_read_goes_out_in_parts() {
+        let store = mem();
+        let e = engine_with(store.clone()).await.with_get_part(16 * B);
+        for i in 0..5 {
+            e.write(0, blk(i, 8), true).unwrap();
+        }
+        e.flush_all(Reason::Explicit).await.unwrap();
+        // 38 blocks from block 2: parts of 16, 16 and 6 blocks.
+        let data = read(&e, 2 * B, 38 * B).await;
+        assert_eq!(mem_store(&store).range_gets(), 3);
+        let want: Vec<u8> = (0..5u8)
+            .flat_map(|i| vec![i; (8 * B) as usize])
+            .skip((2 * B) as usize)
+            .collect();
+        assert_eq!(data, want);
     }
 }

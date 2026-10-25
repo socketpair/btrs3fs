@@ -58,9 +58,6 @@ pub struct DeviceOptions {
     pub dev_id: i32,
     pub nr_queues: u16,
     pub queue_depth: u16,
-    /// Largest request the kernel sends (`queue/max_sectors_kb`), bytes;
-    /// `None` keeps the zone size.
-    pub max_request: Option<u64>,
     /// btrfs readahead window to set once the filesystem on the device is
     /// mounted (`bdi/read_ahead_kb`), bytes; `None` leaves btrfs's own.
     pub fs_readahead: Option<u64>,
@@ -161,7 +158,7 @@ pub fn serve(
         q_live.fetch_sub(1, Ordering::SeqCst);
     };
 
-    let max_request = opts.max_request;
+    let zone_size = cfg.zone_size;
     let fs_readahead = opts.fs_readahead;
     let device_fn = move |ctrl: &UblkCtrl| {
         let bdev = ctrl.get_bdev_path();
@@ -171,9 +168,7 @@ pub fn serve(
             ctrl.dev_info().queue_depth
         );
         disable_wbt(&bdev);
-        if let Some(bytes) = max_request {
-            set_max_request(&bdev, bytes);
-        }
+        set_max_request(&bdev, zone_size);
         if let (Some(bytes), Some(name)) = (fs_readahead, bdev.strip_prefix("/dev/")) {
             let name = name.to_string();
             // Lives until the process exits, like the device.
@@ -222,18 +217,19 @@ fn disable_wbt(bdev: &str) {
     }
 }
 
-/// Caps the size of a request the kernel sends to the device (SPEC.md §2).
-/// A readahead window larger than the cap goes out as several requests at
-/// once, i.e. parallel GETs. Only this device is affected; zone append (data)
-/// keeps its own limit, but btrfs mounted afterwards sizes appends by it too.
+/// Raises the largest request the kernel sends to the device to the zone
+/// size (SPEC.md §2): by default the kernel caps it below the hardware limit.
+/// btrfs mounted afterwards sizes its data appends by it, so a smaller cap
+/// would cut files into extents of that size. Large reads are split into
+/// parallel GETs by the daemon instead (SPEC.md §6.2).
 fn set_max_request(bdev: &str, bytes: u64) {
     let Some(name) = bdev.strip_prefix("/dev/") else {
         return;
     };
     let path = format!("/sys/block/{name}/queue/max_sectors_kb");
     match std::fs::write(&path, (bytes >> 10).to_string()) {
-        Ok(()) => info!("{path}: requests limited to {bytes} bytes"),
-        Err(e) => warn!("cannot limit request size in {path}: {e}"),
+        Ok(()) => info!("{path}: requests up to {bytes} bytes"),
+        Err(e) => warn!("cannot set request size in {path}: {e}"),
     }
 }
 
