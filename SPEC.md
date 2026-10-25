@@ -42,8 +42,8 @@
 | wbt (регулятор фоновой записи) | **Выключен**: демон пишет `0` в `queue/wbt_lat_usec`. Он урезает `WRITE`, когда чтения медленнее 2 мс, — у нас чтения медленные из-за S3, а запись идёт в RAM. `ZONE_APPEND` он не трогает. Ручное выключение переживает смену планировщика udev. |
 | Кеш записи, FUA | write back, FUA — иначе ядро не шлёт FLUSH/FUA |
 | Планировщик | `mq-deadline` (udev-правило btrfs для host-managed) |
-| Идентификация | Свойства udev из `/run/btrs3fs/ublkbN`: демон пишет файл до старта устройства и удаляет при выходе, правило из `setup-permissions.sh` его импортирует. `ID_MODEL` = `btrs3fs`, `ID_SERIAL_SHORT` = `serial`, `ID_WWN` = `wwn` (оба из `disk.json`), `ID_REVISION` = версия сборки; ссылка `/dev/disk/by-id/btrs3fs-<serial>`. Метка ФС — `on-<serial>` (mkfs при `create`). `VENDOR`, `TRAN`, `HCTL` lsblk берёт только из `/sys/block/…/device/`, которого у ublk нет. Решение пользователя. |
-| Версия сборки | `<версия пакета>-g<коммит>[-dirty]` из `git describe` (`build.rs`); без git — версия пакета. Её же печатает `--version`. |
+| Идентификация | Метка ФС — `on-<serial>` (mkfs при `create`). `MODEL`, `SERIAL`, `WWN`, `REV` в `lsblk` пусты: ublk их не передаёт, а единственный способ — свойства udev из файла, который пишет демон, — отвергнут: никаких файлов в `/run` (решение пользователя). `serial` и `wwn` хранятся в `disk.json` на будущее. |
+| Версия сборки | `<версия пакета>-g<коммит>[-dirty]` из `git describe` (`build.rs`); без git — версия пакета. Её печатает `--version`. |
 
 Проверки `disk.json`: `zone_size` — степень двойки, не больше 32 МиБ и `zone_size / 4096 ≤
 10 000` (лимит дозаписей в объект); btrfs сама требует зону ≥ 4 МиБ; `disk_size` кратен зоне. Суперблоки btrfs zoned — в

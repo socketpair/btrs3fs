@@ -113,7 +113,7 @@ struct CreateArgs {
     queues: Option<u16>,
     #[arg(long)]
     queue_depth: Option<u16>,
-    /// Disk serial number for lsblk and /dev/disk/by-id [default: 16 random hex digits].
+    /// Disk serial number, also in the filesystem label on-<serial> [default: 16 random hex digits].
     #[arg(long)]
     serial: Option<String>,
 }

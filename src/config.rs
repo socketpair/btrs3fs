@@ -93,21 +93,21 @@ pub struct DiskConfig {
     pub retry_backoff_factor: f64,
     pub nr_queues: u16,
     pub queue_depth: u16,
-    /// Disk serial number shown by lsblk (SPEC.md §2); absent in disks
-    /// created before it existed.
+    /// Disk serial number, also in the filesystem label (SPEC.md §2); absent
+    /// in disks created before it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial: Option<String>,
-    /// World Wide Name shown by lsblk, `0x3` + 15 hex digits.
+    /// World Wide Name, `0x3` + 15 hex digits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wwn: Option<String>,
 }
 
-/// Longest serial number: it goes into udev properties, a by-id link and
-/// the filesystem label. Judgement call, well above disks' 20 characters.
+/// Longest serial number; it goes into the filesystem label. Judgement
+/// call, well above disks' 20 characters.
 const SERIAL_MAX: usize = 64;
 
-/// Serial numbers: letters, digits, `.`, `_`, `-` — safe in udev property
-/// files, device links and labels.
+/// Serial numbers: letters, digits, `.`, `_`, `-` — safe in labels, file
+/// names and udev properties.
 pub fn validate_serial(s: &str) -> anyhow::Result<()> {
     ensure!(
         (1..=SERIAL_MAX).contains(&s.len())
