@@ -10,7 +10,6 @@ use anyhow::{Context, bail, ensure};
 use bytes::Bytes;
 use clap::{Args, Parser, Subcommand};
 use config::{DiskConfig, parse_size};
-use futures_util::StreamExt;
 use log::{error, info, warn};
 use s3::{RetryPolicy, S3Store, Transport};
 use std::fs::File;
@@ -40,9 +39,6 @@ const DEVICE_NODE_POLL: Duration = Duration::from_millis(50);
 /// how often the wait is reported in the log. Judgement calls.
 const EXIT_POLL: Duration = Duration::from_millis(100);
 const EXIT_REPORT_EVERY: Duration = Duration::from_secs(5);
-
-/// Objects `destroy` deletes at once. Judgement call, like zones::S3_PARALLELISM.
-const DESTROY_PARALLELISM: usize = 16;
 
 /// Zoned ublk block device backed by S3, one object per zone.
 #[derive(Parser)]
@@ -864,18 +860,10 @@ fn destroy_prefix(rt: &Runtime, s3: &S3Store, layout: &Layout) -> anyhow::Result
             .map(|o| o.key)
             .filter(|k| *k != config_key)
             .collect();
-        let n = keys.len();
-        let results: Vec<_> = futures_util::stream::iter(keys)
-            .map(|k| async move { s3.delete(&k).await })
-            .buffer_unordered(DESTROY_PARALLELISM)
-            .collect()
-            .await;
-        for r in results {
-            r?;
-        }
+        s3.delete_many(&keys).await?;
         // The config goes last so an interrupted destroy can be repeated.
         s3.delete(&config_key).await?;
-        anyhow::Ok(n)
+        anyhow::Ok(keys.len())
     })
 }
 

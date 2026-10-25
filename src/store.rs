@@ -109,6 +109,14 @@ impl Store {
         }
     }
 
+    /// Deletes many objects with few requests; missing objects are not an error.
+    pub async fn delete_many(&self, keys: &[String]) -> StoreResult<()> {
+        match self {
+            Store::Mem(m) => keys.iter().try_for_each(|k| m.delete(k)),
+            Store::S3(s) => s.delete_many(keys).await,
+        }
+    }
+
     /// All objects whose key starts with `prefix`.
     pub async fn list(&self, prefix: &str) -> StoreResult<Vec<ObjectInfo>> {
         match self {

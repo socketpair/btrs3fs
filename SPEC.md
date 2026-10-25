@@ -105,7 +105,7 @@ JSON (`endpoint`, `region`, `bucket`, `access_key`, `secret_key`), путь пе
 | `ZONE_OPEN` / `ZONE_CLOSE` | Только смена состояния в памяти (лимитов нет, §2). |
 | `ZONE_FINISH` | Выгрузить буфер, пометить объект тегом, состояние → FULL (§4.4). |
 | `ZONE_RESET` | Дождаться текущей выгрузки зоны, `DELETE` объекта, обнулить состояние. |
-| `ZONE_RESET_ALL` | `RESET` всех непустых зон. |
+| `ZONE_RESET_ALL` | Дождаться выгрузок всех зон, удалить все объекты зон пакетами `DeleteObjects` (§8), обнулить состояние. |
 
 Машина состояний зон и учёт implicit/explicit open — по модели ZBC/ZNS
 (эталон: `null_blk` zoned, `rublk` zoned).
@@ -246,8 +246,16 @@ struct Zone {
 | Последующие сбросы | `PATCH` + `Content-Range` |
 | Чтение сброшенных данных | `GET` + `Range: bytes=a-b` |
 | `ZONE_RESET` | `DELETE` |
+| `ZONE_RESET_ALL` | `DeleteObjects` (`POST ?delete`) — до 1000 ключей в запросе, до 4 запросов параллельно |
 | Старт | `GET disk.json`, `ListObjectsV2` (пагинация по continuation token) |
-| `create` / `destroy` | `PUT disk.json` / `List` + `DELETE` всех объектов |
+| `create` / `destroy` | `PUT disk.json` / `List` + `DeleteObjects` объектов зон, затем `DELETE disk.json` |
+
+`DeleteObjects` — пакетное удаление: тело — XML со списком ключей, режим `Quiet` (в ответе
+только ключи, которые удалить не удалось); отсутствующий ключ — не ошибка. Яндекс не требует
+`Content-MD5` (стандарт S3 требует; проверено 2026-10-25), поэтому MD5 не считаем. Диск 1 ТиБ
+(65 536 зон по 16 МиБ) удаляется 66 запросами вместо 65 536. Сбой части ключей с кодом
+`InternalError`/`SlowDown`/`ServiceUnavailable` — повтор всего пакета (удаление идемпотентно),
+остальные коды — ошибка.
 
 ### Транспорт
 

@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-/// S3 requests one bulk operation runs at once: zones uploaded by a FLUSH,
-/// zones deleted by RESET_ALL, tag lookups at start. Judgement call, not
+/// S3 requests one bulk operation runs at once: zones uploaded by a FLUSH or
+/// the background flusher, tag lookups at start. Judgement call, not
 /// measured: enough to keep a link busy with zone-sized bodies, few enough not
 /// to hit S3 request rate limits; one FLUSH touches 2–4 zones in practice
 /// (`stats`, SPEC.md §10).
@@ -508,8 +508,16 @@ impl Engine {
         if had_object {
             self.store.delete(&self.layout.zone_key(zone.start)).await?;
         }
+        self.clear_locked(zi);
+        debug!("zone {zi} reset");
+        Ok(())
+    }
+
+    /// Makes the zone EMPTY and drops its buffer; the caller holds `upload`
+    /// and has deleted the zone object.
+    fn clear_locked(&self, zi: usize) {
         let dropped = {
-            let mut st = zone.state.lock().unwrap();
+            let mut st = self.zones[zi].state.lock().unwrap();
             let dropped = st.buffered();
             st.cond = Cond::Empty;
             st.wp = 0;
@@ -523,17 +531,31 @@ impl Engine {
             self.dirty.fetch_sub(dropped, Ordering::SeqCst);
             self.room.notify_waiters();
         }
-        debug!("zone {zi} reset");
-        Ok(())
     }
 
+    /// RESET_ALL: all zone objects go in DeleteObjects batches of up to 1000
+    /// keys instead of one DELETE per zone (SPEC.md §4.2).
     pub async fn reset_all(&self) -> ZResult<()> {
-        let results: Vec<ZResult<()>> = futures_util::stream::iter(0..self.zones.len())
-            .map(|zi| self.reset_index(zi))
-            .buffer_unordered(S3_PARALLELISM)
-            .collect()
-            .await;
-        results.into_iter().collect()
+        // Every `upload` lock, so no flush re-creates an object between the
+        // delete and the state change. Taken in zone order; nothing else holds
+        // two of them, so this cannot deadlock.
+        let mut guards = Vec::with_capacity(self.zones.len());
+        let mut keys = Vec::new();
+        for zone in &self.zones {
+            guards.push(zone.upload.lock().await);
+            if zone.state.lock().unwrap().object {
+                keys.push(self.layout.zone_key(zone.start));
+            }
+        }
+        // On failure no zone changes state, as with a failed single DELETE,
+        // though some objects may be gone: their zones then fail I/O until the
+        // next RESET or restart, which restores them from the store as EMPTY.
+        self.store.delete_many(&keys).await?;
+        for zi in 0..self.zones.len() {
+            self.clear_locked(zi);
+        }
+        debug!("all zones reset, {} objects deleted", keys.len());
+        Ok(())
     }
 
     /// Zone descriptors for REPORT_ZONES starting at zone `first`.
@@ -790,6 +812,22 @@ mod tests {
         assert!(obj.is_empty() && store.is_finished("t/0000000000100000").await.unwrap());
         e.reset_zone(ZS).await.unwrap();
         assert!(store.get("t/0000000000100000").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn reset_all_deletes_every_object() {
+        let store = mem();
+        let e = engine_with(store.clone()).await;
+        e.write(0, blk(1, 2), false).unwrap();
+        e.write(ZS, blk(2, 2), false).unwrap();
+        e.flush_all(Reason::Explicit).await.unwrap();
+        e.write(2 * B, blk(3, 1), false).unwrap(); // stored data plus a buffer
+        e.write(2 * ZS, blk(4, 1), false).unwrap(); // buffer only
+        e.finish_zone(3 * ZS).await.unwrap(); // empty tagged object
+        e.reset_all().await.unwrap();
+        assert!(e.report(0, 8).iter().all(|z| z.cond == Cond::Empty));
+        assert_eq!(e.dirty_bytes(), 0);
+        assert!(store.list("t/").await.unwrap().is_empty());
     }
 
     #[tokio::test]

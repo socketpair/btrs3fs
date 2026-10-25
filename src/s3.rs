@@ -15,6 +15,7 @@ use aws_sigv4::http_request::{
 };
 use aws_sigv4::sign::v4;
 use bytes::Bytes;
+use futures_util::StreamExt;
 use log::{debug, warn};
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -306,6 +307,56 @@ impl S3Store {
         .await
     }
 
+    /// DeleteObjects: deletes `keys` in batches of `DELETE_BATCH`, up to
+    /// `DELETE_PARALLELISM` batches at once; missing keys are not an error.
+    /// Yandex does not require `Content-MD5` here (checked 2026-10-25, SPEC.md §8).
+    pub async fn delete_many(&self, keys: &[String]) -> StoreResult<()> {
+        // Futures built up front: a borrowing closure inside the stream would
+        // make the future not provably `Send` (a known rustc limitation).
+        let batches: Vec<_> = keys
+            .chunks(DELETE_BATCH)
+            .map(|batch| self.delete_batch(batch))
+            .collect();
+        let results: Vec<StoreResult<()>> = futures_util::stream::iter(batches)
+            .buffer_unordered(DELETE_PARALLELISM)
+            .collect()
+            .await;
+        results.into_iter().collect()
+    }
+
+    async fn delete_batch(&self, keys: &[String]) -> StoreResult<()> {
+        let url = format!("{}?delete", self.base);
+        let body = Body::new(vec![Bytes::from(delete_xml(keys))]);
+        let what = format!("DELETE {} objects from {}", keys.len(), keys[0]);
+        self.with_retries(&what, || async {
+            let headers = [("content-type", "application/xml".to_string())];
+            let resp = self
+                .send(reqwest::Method::POST, &url, &headers, Some(&body))
+                .await?;
+            let xml = check(resp, &keys[0]).await?.text().await?;
+            let result: DeleteResult = quick_xml::de::from_str(&xml)
+                .map_err(|e| Attempt::Fatal(anyhow!("cannot parse delete response: {e}").into()))?;
+            // Quiet mode lists only the keys that failed.
+            let Some(e) = result.errors.first() else {
+                return Ok(());
+            };
+            let err = anyhow!(
+                "{} of {} keys not deleted, first {}: {}: {}",
+                result.errors.len(),
+                keys.len(),
+                e.key,
+                e.code,
+                e.message
+            );
+            // Deleting is idempotent: the whole batch is simply sent again.
+            Err(match e.code.as_str() {
+                "InternalError" | "ServiceUnavailable" | "SlowDown" => Attempt::Retry(err),
+                _ => Attempt::Fatal(err.into()),
+            })
+        })
+        .await
+    }
+
     /// PutObjectTagging with `FINISHED_TAG` as the only tag; the data is not
     /// rewritten. It replaces the whole tag set: labels set on a zone object
     /// by hand are dropped on purpose (user decision, SPEC.md §4.4).
@@ -429,6 +480,34 @@ struct Tagging {
     tag_set: TagSet,
 }
 
+#[derive(Deserialize)]
+struct DeleteResult {
+    #[serde(rename = "Error", default)]
+    errors: Vec<DeleteError>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DeleteError {
+    key: String,
+    code: String,
+    #[serde(default)]
+    message: String,
+}
+
+/// DeleteObjects request body; quiet: the answer lists only failures.
+fn delete_xml(keys: &[String]) -> String {
+    let mut xml = String::from("<Delete><Quiet>true</Quiet>");
+    for k in keys {
+        xml.push_str(&format!(
+            "<Object><Key>{}</Key></Object>",
+            quick_xml::escape::escape(k.as_str())
+        ));
+    }
+    xml.push_str("</Delete>");
+    xml
+}
+
 /// PutObjectTagging request body.
 fn tagging_xml(tags: &[(String, String)]) -> String {
     let mut xml = String::from("<Tagging><TagSet>");
@@ -464,6 +543,13 @@ async fn check(resp: reqwest::Response, key: &str) -> Result<reqwest::Response, 
         _ => Attempt::Fatal(anyhow!("{key}: {detail}").into()),
     })
 }
+
+/// Keys in one DeleteObjects request: the S3 API maximum.
+const DELETE_BATCH: usize = 1000;
+/// DeleteObjects requests `delete_many` runs at once. Judgement call: the
+/// largest disk (65536 zones of 16 MiB, 1 TiB) needs 66 requests; a few in
+/// parallel finish it in seconds without bursting the request rate.
+const DELETE_PARALLELISM: usize = 4;
 
 /// Characters of a non-XML error body kept in a log line (proxies and load
 /// balancers answer with whole HTML pages).
@@ -582,6 +668,33 @@ mod tests {
         assert!(parsed_has_finished(&xml));
     }
 
+    #[test]
+    fn delete_body_and_errors() {
+        assert_eq!(
+            delete_xml(&["p/a".into(), "p/<b>".into()]),
+            "<Delete><Quiet>true</Quiet><Object><Key>p/a</Key></Object>\
+             <Object><Key>p/&lt;b&gt;</Key></Object></Delete>"
+        );
+        let ok: DeleteResult = quick_xml::de::from_str(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+            <DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>"#,
+        )
+        .unwrap();
+        assert!(ok.errors.is_empty());
+        let failed: DeleteResult = quick_xml::de::from_str(
+            "<DeleteResult><Error><Key>p/a</Key><Code>AccessDenied</Code>\
+             <Message>Access Denied</Message></Error></DeleteResult>",
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                failed.errors[0].key.as_str(),
+                failed.errors[0].code.as_str()
+            ),
+            ("p/a", "AccessDenied")
+        );
+    }
+
     fn parsed_has_finished(xml: &str) -> bool {
         quick_xml::de::from_str::<Tagging>(xml)
             .unwrap()
@@ -639,9 +752,15 @@ mod bucket_tests {
     }
 
     async fn cleanup(s3: &S3Store, prefix: &str) {
-        for o in s3.list(prefix).await.unwrap() {
-            s3.delete(&o.key).await.unwrap();
-        }
+        let keys: Vec<String> = s3
+            .list(prefix)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|o| o.key)
+            .collect();
+        s3.delete_many(&keys).await.unwrap();
+        assert!(s3.list(prefix).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -698,6 +817,24 @@ mod bucket_tests {
         s3.delete(&key).await.unwrap();
         s3.delete(&key).await.unwrap(); // missing object is fine
         assert!(s3.list(&format!("{prefix}/")).await.unwrap().is_empty());
+
+        // Batch delete; a missing key is fine there too.
+        let keys: Vec<String> = (0..3).map(|i| format!("{prefix}/k{i}")).collect();
+        for k in &keys {
+            s3.put(k, body(&[1; 8])).await.unwrap();
+        }
+        s3.delete_many(&[keys[0].clone(), keys[2].clone(), format!("{prefix}/none")])
+            .await
+            .unwrap();
+        let left: Vec<String> = s3
+            .list(&format!("{prefix}/"))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|o| o.key)
+            .collect();
+        assert_eq!(left, vec![keys[1].clone()]);
+        cleanup(&s3, &format!("{prefix}/")).await;
     }
 
     #[tokio::test]
