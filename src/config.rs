@@ -5,21 +5,68 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
 
-/// Logical and physical block size of the device. Fixed, never 512.
+// Where every number comes from: a hard external limit (with its source), a
+// measurement (with a SPEC.md reference) or a judgement call (said so).
+
+/// Logical and physical block size of the device. Requirement of the task
+/// ("the smallest write is 4 KiB, sectors are strictly 4 KiB, never 512");
+/// also the btrfs sector size and the page size on x86-64.
 pub const BLOCK_SIZE: u64 = 4096;
 
-/// Limit of appends into one S3 object; every append is at least one block,
-/// so a zone may hold at most this many blocks.
+/// Most appends one S3 object may receive. Requirement of the task (taken
+/// from the Yandex Object Storage append limit as the user knows it; 5228
+/// appends in a row were verified, the real limit was not reached, SPEC.md
+/// §13.3). Every append carries at least one block, so a zone holds at most
+/// this many blocks: 10 000 × 4 KiB = 40 960 000 bytes, i.e. at most 32 MiB
+/// for a power-of-two zone size.
 pub const MAX_APPENDS_PER_OBJECT: u64 = 10_000;
 
-/// Largest zone: one ublk request covers up to a zone, and ublk user copy
-/// addresses at most 32 MiB per request.
-pub const MAX_ZONE_SIZE: u64 = 32 << 20;
+/// Largest zone. One ublk request covers up to a whole zone (SPEC.md §2), and
+/// ublk user copy encodes the byte offset inside a request in
+/// `UBLK_IO_BUF_BITS` = 25 bits (`linux/ublk_cmd.h`), so a request is at most
+/// 32 MiB. Today MAX_APPENDS_PER_OBJECT gives the same bound, but for an
+/// unrelated reason; this check keeps the ublk limit if that rule changes.
+pub const MAX_ZONE_SIZE: u64 = 1 << libublk::sys::UBLK_IO_BUF_BITS;
 
-/// Maximum queue depth accepted by the ublk driver.
-const UBLK_MAX_QUEUE_DEPTH: u16 = 4096;
+/// Deepest queue the ublk driver accepts (`UBLK_MAX_QUEUE_DEPTH`, `linux/ublk_cmd.h`).
+const UBLK_MAX_QUEUE_DEPTH: u16 = libublk::sys::UBLK_MAX_QUEUE_DEPTH as u16;
 
+/// Version of the disk.json format; bump on incompatible changes.
 pub const CONFIG_VERSION: u32 = 1;
+
+/// Zone size of new disks. Measured (SPEC.md §13.3): Yandex PATCH to an object
+/// grown by appends takes 9–30 s once it passes ~20 MB and 0.2–0.6 s below
+/// 16 MB, so the largest power of two under that threshold. User decision
+/// 2026-10-24 (instead of the originally chosen 32 MiB).
+pub const DEFAULT_ZONE_SIZE: u64 = 16 << 20;
+
+/// Buffered (not yet uploaded) data above which zones are uploaded in the
+/// background without waiting for a FLUSH; writes wait at twice this amount
+/// (SPEC.md §5.3). Judgement call proposed at the start and accepted by the
+/// user: room for one commit=300 interval of moderate writes while bounding the
+/// daemon's RAM; not measured. Per disk, `create --dirty-limit`.
+pub const DEFAULT_DIRTY_LIMIT: u64 = 256 << 20;
+
+/// Total time one S3 operation may retry before the request fails with EIO.
+/// Judgement call accepted by the user: long enough to ride out a short network
+/// or S3 hiccup, short enough that a FLUSH does not hang for minutes.
+pub const DEFAULT_RETRY_TIMEOUT_SECS: u64 = 60;
+
+/// First pause between retries; doubles each time (DEFAULT_RETRY_BACKOFF), so a
+/// 60 s budget gives about 9 attempts. Judgement call accepted by the user.
+pub const DEFAULT_RETRY_INITIAL_DELAY_MS: u64 = 100;
+
+/// Growth of the pause between retries (classic exponential backoff).
+pub const DEFAULT_RETRY_BACKOFF: f64 = 2.0;
+
+/// ublk queues (threads serving requests). User decision ("4 by default"); the
+/// bottleneck is S3, not CPU, so more rarely helps.
+pub const DEFAULT_QUEUES: u16 = 4;
+
+/// Requests in flight per ublk queue. Taken from the libublk/rublk examples;
+/// each tag costs only an eventfd and a small task, and 128 × 4 queues is more
+/// concurrency than the kernel sends to one disk in practice.
+pub const DEFAULT_QUEUE_DEPTH: u16 = 128;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -43,7 +90,7 @@ pub struct DiskConfig {
 }
 
 impl DiskConfig {
-    pub const DEFAULT_ZONE_SIZE: u64 = 16 << 20;
+    pub const DEFAULT_ZONE_SIZE: u64 = DEFAULT_ZONE_SIZE;
 
     /// Configuration with default tunables; call `validate()` before use.
     pub fn new(disk_size: u64, zone_size: u64) -> Self {
@@ -53,12 +100,12 @@ impl DiskConfig {
             zone_size,
             max_open_zones: None,
             max_active_zones: None,
-            dirty_limit_bytes: 256 << 20,
-            retry_timeout_seconds: 60,
-            retry_initial_delay_ms: 100,
-            retry_backoff_factor: 2.0,
-            nr_queues: 4,
-            queue_depth: 128,
+            dirty_limit_bytes: DEFAULT_DIRTY_LIMIT,
+            retry_timeout_seconds: DEFAULT_RETRY_TIMEOUT_SECS,
+            retry_initial_delay_ms: DEFAULT_RETRY_INITIAL_DELAY_MS,
+            retry_backoff_factor: DEFAULT_RETRY_BACKOFF,
+            nr_queues: DEFAULT_QUEUES,
+            queue_depth: DEFAULT_QUEUE_DEPTH,
         }
     }
 

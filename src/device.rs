@@ -25,8 +25,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Handle;
 
+/// ublk passes positions and lengths in 512-byte sectors (`ublksrv_io_desc`),
+/// whatever the logical block size of the device.
 const SECTOR_SHIFT: u32 = 9;
 const BLOCK_SHIFT: u8 = BLOCK_SIZE.trailing_zeros() as u8;
+
+/// How often the main thread checks for SIGTERM/SIGINT/SIGHUP and for queues
+/// that stopped on their own. Judgement call: the reaction delay is invisible
+/// next to the S3 work of stopping, and polling costs nothing.
+const STOP_POLL: Duration = Duration::from_millis(100);
+
+/// io_uring wait timeout of a queue thread, in seconds, before it re-checks
+/// whether all its tasks finished. Value of the rublk zoned target. Requests
+/// and eventfd completions wake the thread at once, so it does not affect
+/// latency; stopping is driven by `kill_dev()` aborting the queue's commands.
+const QUEUE_IDLE_SECS: u64 = 20;
 
 pub struct DeviceOptions {
     pub dev_id: i32,
@@ -110,7 +123,8 @@ pub fn serve(
             max_zone_append_sectors: zone_sectors.min(p.basic.max_sectors),
             ..Default::default()
         };
-        // Each tag may have its ublk command and an eventfd read in flight.
+        // Each tag may have two operations in flight at once: its ublk command
+        // and the eventfd read that waits for tokio (SPEC.md §9).
         dev.tgt.sq_depth = 2 * depth;
         dev.tgt.cq_depth = 2 * depth;
         Ok(())
@@ -141,7 +155,7 @@ pub fn serve(
                     warn!("all queues stopped, device was removed externally");
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(STOP_POLL);
             }
         }
         if let Err(e) = ctrl.kill_dev() {
@@ -205,7 +219,7 @@ fn run_queue(qid: u16, dev: &UblkDev, ctx: &Arc<Ctx>) {
     smol::block_on(exe.run(async {
         let run_ops = || while exe2.try_tick() {};
         let done = || tasks.iter().all(|t| t.is_finished());
-        if let Err(e) = wait_and_handle_io_events(&q, Some(20), run_ops, done).await {
+        if let Err(e) = wait_and_handle_io_events(&q, Some(QUEUE_IDLE_SECS), run_ops, done).await {
             error!("queue {qid}: event loop failed: {e:?}");
         }
     }));
@@ -427,7 +441,8 @@ fn copy_to_request(cdev: RawFd, bufs: &[Bytes], pos: u64, len: u64) -> ZResult<(
     Ok(())
 }
 
-/// Most iovecs one `pwritev` accepts (`IOV_MAX` on Linux).
+/// Most iovecs one `pwritev` accepts: `UIO_MAXIOV` in `linux/uio.h`, also
+/// `getconf IOV_MAX` (not exported by the libc crate for Linux).
 const MAX_IOVECS: usize = 1024;
 
 /// Writes all buffers at `pos`, in batches of at most `MAX_IOVECS`: a request

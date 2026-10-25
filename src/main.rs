@@ -24,8 +24,25 @@ use store::{Body, Layout, MemStore, Store};
 use tokio::runtime::Runtime;
 use zones::Engine;
 
-/// btrfs mount options always used by `mount` (SPEC.md §10).
+/// btrfs mount options always used by `mount`: user decision (SPEC.md §10);
+/// commit=300 makes btrfs commit (and FLUSH) every 5 minutes, so writes merge
+/// into fewer, larger S3 appends.
 const MOUNT_OPTIONS: &str = "noatime,lazytime,commit=300";
+
+/// How long `mount` waits for udev to create /dev/ublkbN after the device
+/// server reported it ready. Judgement call: udev needs milliseconds.
+const DEVICE_NODE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Polling interval while waiting for the device node.
+const DEVICE_NODE_POLL: Duration = Duration::from_millis(50);
+
+/// Polling interval while waiting for a device server process to exit, and
+/// how often the wait is reported in the log. Judgement calls.
+const EXIT_POLL: Duration = Duration::from_millis(100);
+const EXIT_REPORT_EVERY: Duration = Duration::from_secs(5);
+
+/// Objects `destroy` deletes at once. Judgement call, like zones::S3_PARALLELISM.
+const DESTROY_PARALLELISM: usize = 16;
 
 /// Zoned ublk block device backed by S3, one object per zone.
 #[derive(Parser)]
@@ -448,7 +465,7 @@ fn cmd_mount(a: MountArgs, keep_stderr: bool) -> anyhow::Result<i32> {
         (_, Some(err)) => bail!("device server failed: {err}"),
         _ => bail!("device server exited unexpectedly, see `journalctl -t btrs3fs`"),
     };
-    wait_for_path(Path::new(&bdev), Duration::from_secs(10))?;
+    wait_for_path(Path::new(&bdev), DEVICE_NODE_TIMEOUT)?;
 
     let mounted = Process::new("mount")
         .args(["-t", "btrfs", "-o", &options, &bdev])
@@ -542,7 +559,7 @@ fn wait_for_path(path: &Path, timeout: Duration) -> anyhow::Result<()> {
             "{} did not appear",
             path.display()
         );
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(DEVICE_NODE_POLL);
     }
     Ok(())
 }
@@ -573,7 +590,8 @@ fn find_mount(mountpoint: &Path) -> anyhow::Result<Option<MountEntry>> {
     Ok(found)
 }
 
-/// Decodes `\040`-style octal escapes used in mountinfo.
+/// Decodes `\040`-style escapes used in mountinfo: a backslash and three
+/// octal digits (value = d1·64 + d2·8 + d3), e.g. `\040` is a space.
 fn unescape_mountinfo(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -699,8 +717,8 @@ fn wait_for_exit(pid: i32) {
     while unsafe { libc::kill(pid, 0) } == 0 {
         // Reap it if it is our child; ignore errors for foreign processes.
         unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
-        std::thread::sleep(Duration::from_millis(100));
-        if reported.elapsed() >= Duration::from_secs(5) {
+        std::thread::sleep(EXIT_POLL);
+        if reported.elapsed() >= EXIT_REPORT_EVERY {
             info!(
                 "still waiting for process {pid} ({}s)",
                 started.elapsed().as_secs()
@@ -849,7 +867,7 @@ fn destroy_prefix(rt: &Runtime, s3: &S3Store, layout: &Layout) -> anyhow::Result
         let n = keys.len();
         let results: Vec<_> = futures_util::stream::iter(keys)
             .map(|k| async move { s3.delete(&k).await })
-            .buffer_unordered(16)
+            .buffer_unordered(DESTROY_PARALLELISM)
             .collect()
             .await;
         for r in results {

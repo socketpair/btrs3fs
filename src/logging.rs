@@ -5,7 +5,10 @@
 use log::{Log, Metadata, Record};
 use std::path::Path;
 
+/// SYSLOG_IDENTIFIER of our journal records: `journalctl -t btrs3fs`.
 const IDENTIFIER: &str = "btrs3fs";
+/// Native journald protocol socket (systemd's fixed path); if absent, there is
+/// no journald and syslog through /dev/log is used.
 const JOURNAL_SOCKET: &str = "/run/systemd/journal/socket";
 
 struct Tee {

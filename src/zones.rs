@@ -23,10 +23,22 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-/// Number of zones uploaded in parallel by a FLUSH.
-const FLUSH_PARALLELISM: usize = 16;
+/// S3 requests one bulk operation runs at once: zones uploaded by a FLUSH,
+/// zones deleted by RESET_ALL, tag lookups at start. Judgement call, not
+/// measured: enough to keep a link busy with zone-sized bodies, few enough not
+/// to hit S3 request rate limits; one FLUSH touches 2–4 zones in practice
+/// (`stats`, SPEC.md §10).
+const S3_PARALLELISM: usize = 16;
 
+/// Shared zero-filled buffer for reads past the write pointer; a larger read
+/// is served as several 1 MiB pieces. Size is a judgement call: 1 MiB of static
+/// memory, at most 32 iovecs for the largest (32 MiB) request.
 static ZEROS: [u8; 1 << 20] = [0; 1 << 20];
+
+/// Pause of the background flusher after a failed upload. The upload itself
+/// already retried for retry_timeout_seconds; this only avoids a busy loop
+/// while S3 stays unreachable.
+const BACKGROUND_RETRY_PAUSE: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cond {
@@ -155,7 +167,7 @@ impl Engine {
                 let store = &store;
                 async move { (i, store.is_finished(&key).await) }
             })
-            .buffer_unordered(FLUSH_PARALLELISM)
+            .buffer_unordered(S3_PARALLELISM)
             .collect()
             .await;
         for (i, finished) in results {
@@ -413,7 +425,7 @@ impl Engine {
         }
         let results: Vec<ZResult<()>> = futures_util::stream::iter(dirty)
             .map(|zi| self.flush_zone(zi, reason))
-            .buffer_unordered(FLUSH_PARALLELISM)
+            .buffer_unordered(S3_PARALLELISM)
             .collect()
             .await;
         results.into_iter().collect()
@@ -518,7 +530,7 @@ impl Engine {
     pub async fn reset_all(&self) -> ZResult<()> {
         let results: Vec<ZResult<()>> = futures_util::stream::iter(0..self.zones.len())
             .map(|zi| self.reset_index(zi))
-            .buffer_unordered(FLUSH_PARALLELISM)
+            .buffer_unordered(S3_PARALLELISM)
             .collect()
             .await;
         results.into_iter().collect()
@@ -577,7 +589,7 @@ impl Engine {
             };
             if let Err(e) = self.flush_zone(zi, Reason::Background).await {
                 warn!("background flush of zone {zi} failed: {e}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(BACKGROUND_RETRY_PAUSE).await;
             }
         }
     }

@@ -81,14 +81,32 @@ pub struct S3Store {
     retry: RetryPolicy,
 }
 
+/// TCP keepalive probes on idle connections: notices connections silently
+/// dropped by NAT or Wi-Fi (SPEC.md §8). Judgement call: well below the
+/// common 60+ s NAT idle timeouts.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+
+/// Idle connections are kept for reuse this long; the reqwest default.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Connection setup (TCP + TLS) longer than this counts as a failed attempt
+/// and is retried. Judgement call: a healthy setup takes well under a second.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Longest silence while waiting for response bytes before the attempt is
+/// retried (an idle timeout, not a limit on the whole transfer). Must exceed
+/// the server's own think time: the slowest PATCH measured was ~30 s, on
+/// objects grown past 20 MB, which 16 MiB zones avoid (SPEC.md §13.3).
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 impl S3Store {
     pub fn new(creds: &Creds, transport: &Transport, retry: RetryPolicy) -> anyhow::Result<Self> {
         let mut builder = reqwest::Client::builder()
             .tcp_nodelay(true)
-            .tcp_keepalive(Duration::from_secs(30))
-            .pool_idle_timeout(Duration::from_secs(90))
-            .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(60))
+            .tcp_keepalive(TCP_KEEPALIVE)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .http2_adaptive_window(true)
             .user_agent(concat!("btrs3fs/", env!("CARGO_PKG_VERSION")));
         if let Some(proxy) = &transport.proxy {
@@ -454,6 +472,10 @@ async fn check(resp: reqwest::Response, key: &str) -> Result<reqwest::Response, 
     })
 }
 
+/// Characters of a non-XML error body kept in a log line (proxies and load
+/// balancers answer with whole HTML pages).
+const ERROR_BODY_PREVIEW: usize = 200;
+
 /// `Code: Message` from an S3 XML error body.
 fn s3_error_summary(body: &str) -> String {
     let tag = |name: &str| {
@@ -465,7 +487,7 @@ fn s3_error_summary(body: &str) -> String {
     match (tag("Code"), tag("Message")) {
         (Some(c), Some(m)) => format!("{c}: {m}"),
         (Some(c), None) => c,
-        _ => body.chars().take(200).collect(),
+        _ => body.chars().take(ERROR_BODY_PREVIEW).collect(),
     }
 }
 

@@ -10,13 +10,19 @@ use log::{info, warn};
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-/// Default port is `BASE_PORT + device number`.
+/// Default port is `BASE_PORT + device number`, so several disks on one host
+/// get different ports. 9470 is an arbitrary port outside the well-known
+/// range with no common service on it; `--stats-port` overrides it.
 pub const BASE_PORT: u16 = 9470;
 
 const PAGE: &str = include_str!("stats.html");
 
 const KIB: u64 = 1 << 10;
 const MIB: u64 = 1 << 20;
+
+/// Buckets of the upload size histogram: ×4 steps from one block (4 KiB) to
+/// the largest zone (32 MiB, config::MAX_ZONE_SIZE) — an append is never
+/// smaller than a block nor larger than a zone.
 const SIZE_BOUNDS: &[u64] = &[
     4 * KIB,
     16 * KIB,
@@ -27,8 +33,15 @@ const SIZE_BOUNDS: &[u64] = &[
     16 * MIB,
     32 * MIB, // largest zone
 ];
+/// Buckets of S3 request time, ms: from in-datacenter latency (10 ms) up to
+/// the slow PATCHes measured on large appended objects (~30 s, SPEC.md §13.3).
 const LATENCY_BOUNDS_MS: &[u64] = &[10, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000];
+
+/// Buckets of zones uploaded per FLUSH: 0 (nothing to do), then powers of two;
+/// at most zones::S3_PARALLELISM (16) upload at once, the rest queue up.
 const ZONES_BOUNDS: &[u64] = &[0, 1, 2, 4, 8, 16, 32, 64];
+
+/// Room for the longest bounds list plus its open-ended last bucket.
 const MAX_BUCKETS: usize = 12;
 
 pub struct Counter(AtomicU64);

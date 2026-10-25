@@ -46,7 +46,8 @@ impl Body {
     }
 }
 
-/// Object tag marking a zone closed by FINISH (SPEC.md §4.4).
+/// Object tag marking a zone closed by FINISH (SPEC.md §4.4). The key carries
+/// the project name so it cannot clash with labels people set by hand.
 pub const FINISHED_TAG: (&str, &str) = ("btrs3fs-zone", "finished");
 
 pub struct ObjectInfo {
@@ -285,7 +286,9 @@ impl Layout {
         format!("{}/disk.json", self.prefix)
     }
 
-    /// Zone object name: byte offset of the zone, 16 lowercase hex digits.
+    /// Zone object name: byte offset of the zone in hex with leading zeros
+    /// (requirement of the task), 16 digits — the width of a u64 — so names
+    /// sort by offset; lowercase is our choice (SPEC.md §3.1).
     pub fn zone_key(&self, zone_offset: u64) -> String {
         format!("{}/{zone_offset:016x}", self.prefix)
     }
@@ -293,6 +296,7 @@ impl Layout {
     /// Byte offset of the zone if `key` is a zone object of this disk.
     pub fn parse_zone_key(&self, key: &str) -> Option<u64> {
         let name = key.strip_prefix(&self.prefix)?.strip_prefix('/')?;
+        // Exactly what zone_key() writes: 16 lowercase hex digits.
         if name.len() != 16 || !name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
             return None;
         }

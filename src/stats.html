@@ -87,7 +87,7 @@
 </main>
 <script>
 "use strict";
-const HISTORY = 300;
+const HISTORY = 300;  // chart length in samples: 5 minutes at one sample per second
 const series = { up: [], rd: [], par: [], dirty: [] };
 let prev = null, prevTime = 0;
 
@@ -252,7 +252,7 @@ async function tick() {
   }
 }
 tick();
-setInterval(tick, 1000);
+setInterval(tick, 1000);  // refresh every second (user requirement)
 </script>
 </body>
 </html>
