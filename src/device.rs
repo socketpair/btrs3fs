@@ -62,7 +62,9 @@ pub fn serve(
         | sys::UBLK_F_USER_RECOVERY
         | sys::UBLK_F_USER_RECOVERY_FAIL_IO) as u64;
     if features & needed != needed {
-        bail!("ublk driver lacks zoned/user-copy/recovery-fail-io support (features {features:#x})");
+        bail!(
+            "ublk driver lacks zoned/user-copy/recovery-fail-io support (features {features:#x})"
+        );
     }
 
     // Register before the device appears so a signal never kills us mid-setup.
@@ -87,7 +89,6 @@ pub fn serve(
 
     let disk_size = cfg.disk_size;
     let zone_sectors = (cfg.zone_size >> SECTOR_SHIFT) as u32;
-    let max_active = cfg.effective_limit(cfg.max_active_zones);
     let depth = opts.queue_depth;
     let tgt_init = move |dev: &mut UblkDev| {
         dev.set_default_params(disk_size);
@@ -103,9 +104,9 @@ pub fn serve(
         p.basic.io_opt_shift = zone_sectors.trailing_zeros() as u8 + SECTOR_SHIFT as u8;
         p.basic.chunk_sectors = zone_sectors;
         p.zoned = sys::ublk_param_zoned {
-            // Open zones are never limited; btrfs follows the active limit.
             max_open_zones: 0,
-            max_active_zones: max_active,
+            // No zone limits (SPEC.md §2): btrfs keeps its own active limit.
+            max_active_zones: 0,
             max_zone_append_sectors: zone_sectors.min(p.basic.max_sectors),
             ..Default::default()
         };
@@ -228,7 +229,7 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, ctx: &Ctx) -> Result<(), UblkError
                     iod.start_sector,
                     iod.nr_sectors
                 );
-                if !matches!(e, ZoneError::Invalid(_) | ZoneError::ActiveLimit) {
+                if !matches!(e, ZoneError::Invalid(_)) {
                     error!("I/O error: {e}");
                     STATS.req_errors.inc();
                 }

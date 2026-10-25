@@ -16,11 +16,6 @@ pub const MAX_APPENDS_PER_OBJECT: u64 = 10_000;
 /// addresses at most 32 MiB per request.
 pub const MAX_ZONE_SIZE: u64 = 32 << 20;
 
-/// Smallest usable active zone limit. btrfs accepts 8 (`BTRFS_MIN_ACTIVE_ZONES`),
-/// but with DUP metadata it keeps 6 active zones reserved for metadata and
-/// system block groups; at 8 it deadlocked waiting for data space (SPEC.md §2).
-const MIN_ACTIVE_ZONES: u32 = 16;
-
 /// Maximum queue depth accepted by the ublk driver.
 const UBLK_MAX_QUEUE_DEPTH: u16 = 4096;
 
@@ -32,11 +27,13 @@ pub struct DiskConfig {
     pub version: u32,
     pub disk_size: u64,
     pub zone_size: u64,
-    /// Obsolete: open zones are never limited (SPEC.md §2). Accepted in old
-    /// disk.json files, never written.
+    /// Obsolete: the device reports no zone limits (SPEC.md §2). Accepted in
+    /// old disk.json files, never written.
     #[serde(default, skip_serializing)]
     pub max_open_zones: Option<u32>,
-    pub max_active_zones: u32,
+    /// Obsolete, see `max_open_zones`.
+    #[serde(default, skip_serializing)]
+    pub max_active_zones: Option<u32>,
     pub dirty_limit_bytes: u64,
     pub retry_timeout_seconds: u64,
     pub retry_initial_delay_ms: u64,
@@ -55,7 +52,7 @@ impl DiskConfig {
             disk_size,
             zone_size,
             max_open_zones: None,
-            max_active_zones: 1024,
+            max_active_zones: None,
             dirty_limit_bytes: 256 << 20,
             retry_timeout_seconds: 60,
             retry_initial_delay_ms: 100,
@@ -97,11 +94,6 @@ impl DiskConfig {
             "too many zones: {}",
             self.nr_zones()
         );
-        let active = self.effective_limit(self.max_active_zones);
-        ensure!(
-            active == 0 || active >= MIN_ACTIVE_ZONES,
-            "max_active_zones {active} is below the btrfs minimum of {MIN_ACTIVE_ZONES}"
-        );
         ensure!(
             self.dirty_limit_bytes >= BLOCK_SIZE,
             "dirty_limit_bytes {} is less than one block",
@@ -123,15 +115,6 @@ impl DiskConfig {
 
     pub fn nr_zones(&self) -> u64 {
         self.disk_size / self.zone_size
-    }
-
-    /// Zone limit as reported to the kernel: 0 means "no limit".
-    pub fn effective_limit(&self, limit: u32) -> u32 {
-        if limit as u64 >= self.nr_zones() {
-            0
-        } else {
-            limit
-        }
     }
 
     pub fn from_json(data: &[u8]) -> anyhow::Result<Self> {
@@ -223,8 +206,6 @@ mod tests {
         let cfg = DiskConfig::new(10 << 30, DiskConfig::DEFAULT_ZONE_SIZE);
         cfg.validate().unwrap();
         assert_eq!(cfg.nr_zones(), 640);
-        assert_eq!(cfg.effective_limit(1024), 0);
-        assert_eq!(cfg.effective_limit(16), 16);
     }
 
     #[test]
@@ -239,22 +220,13 @@ mod tests {
     }
 
     #[test]
-    fn zone_limits() {
-        let mut cfg = DiskConfig::new(1 << 30, 16 << 20); // 64 zones
-        cfg.max_active_zones = 16;
-        cfg.validate().unwrap();
-        cfg.max_active_zones = 8;
-        assert!(cfg.validate().is_err()); // btrfs deadlocks this low
-        cfg.max_active_zones = 1024; // >= zone count: no limit
-        cfg.validate().unwrap();
-    }
-
-    #[test]
-    fn old_config_with_open_limit() {
+    fn old_config_with_zone_limits() {
         let mut json: serde_json::Value =
             serde_json::from_slice(&DiskConfig::new(1 << 30, 16 << 20).to_json()).unwrap();
         assert!(json.get("max_open_zones").is_none()); // not written any more
+        assert!(json.get("max_active_zones").is_none());
         json["max_open_zones"] = 1024.into();
+        json["max_active_zones"] = 1024.into();
         DiskConfig::from_json(json.to_string().as_bytes()).unwrap(); // still accepted
     }
 

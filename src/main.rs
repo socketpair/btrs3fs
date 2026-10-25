@@ -81,8 +81,6 @@ struct CreateArgs {
     /// Zone size, a power of two up to 32M [default: 16M].
     #[arg(long, value_parser = parse_size)]
     zone_size: Option<u64>,
-    #[arg(long)]
-    max_active_zones: Option<u32>,
     #[arg(long, value_parser = parse_size)]
     dirty_limit: Option<u64>,
     #[arg(long)]
@@ -715,9 +713,6 @@ fn wait_for_exit(pid: i32) {
 fn cmd_create(a: CreateArgs) -> anyhow::Result<i32> {
     ensure_root("create (it formats the disk)")?;
     let mut cfg = DiskConfig::new(a.size, a.zone_size.unwrap_or(DiskConfig::DEFAULT_ZONE_SIZE));
-    if let Some(v) = a.max_active_zones {
-        cfg.max_active_zones = v;
-    }
     if let Some(v) = a.dirty_limit {
         cfg.dirty_limit_bytes = v;
     }
