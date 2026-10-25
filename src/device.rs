@@ -42,6 +42,22 @@ const STOP_POLL: Duration = Duration::from_millis(100);
 /// latency; stopping is driven by `kill_dev()` aborting the queue's commands.
 const QUEUE_IDLE_SECS: u64 = 20;
 
+/// ublk features the device cannot work without; there is no fallback
+/// (SPEC.md §10). USER_COPY (6.5): zones require it; ZONED: 6.6;
+/// FAIL_IO: if we die, the kernel keeps the disk and fails its I/O instead of
+/// removing it with del_gendisk() under a mounted filesystem (SPEC.md §9.4),
+/// 6.13; USER_RECOVERY only enables FAIL_IO, we never recover.
+const REQUIRED_FEATURES: [(u32, &str); 4] = [
+    (sys::UBLK_F_USER_COPY, "UBLK_F_USER_COPY"),
+    (sys::UBLK_F_ZONED, "UBLK_F_ZONED"),
+    (sys::UBLK_F_USER_RECOVERY, "UBLK_F_USER_RECOVERY"),
+    (sys::UBLK_F_USER_RECOVERY_FAIL_IO, "UBLK_F_USER_RECOVERY_FAIL_IO"),
+];
+
+/// Oldest kernel with every feature in `REQUIRED_FEATURES` (checked in the
+/// kernel's `include/uapi/linux/ublk_cmd.h` history).
+const MIN_KERNEL: &str = "6.13";
+
 pub struct DeviceOptions {
     pub dev_id: i32,
     pub nr_queues: u16,
@@ -70,19 +86,23 @@ pub fn serve(
     opts: &DeviceOptions,
     on_ready: OnReady,
 ) -> anyhow::Result<UblkCtrl> {
-    let features = UblkCtrl::get_features().context("ublk driver is not available")?;
-    // FAIL_IO: if we die, the kernel keeps the disk and fails its I/O instead
-    // of removing it with del_gendisk() under a mounted filesystem (SPEC.md
-    // §9.4). We never recover, USER_RECOVERY only enables it.
-    let needed = (sys::UBLK_F_USER_COPY
-        | sys::UBLK_F_ZONED
-        | sys::UBLK_F_USER_RECOVERY
-        | sys::UBLK_F_USER_RECOVERY_FAIL_IO) as u64;
-    if features & needed != needed {
+    let features = UblkCtrl::get_features().with_context(|| {
+        format!("ublk driver is not available (needs Linux >= {MIN_KERNEL} with ublk_drv loaded)")
+    })?;
+    let missing: Vec<&str> = REQUIRED_FEATURES
+        .iter()
+        .filter(|(flag, _)| features & *flag as u64 == 0)
+        .map(|(_, name)| *name)
+        .collect();
+    if !missing.is_empty() {
         bail!(
-            "ublk driver lacks zoned/user-copy/recovery-fail-io support (features {features:#x})"
+            "ublk driver lacks {} (features {features:#x}); btrs3fs needs Linux >= {MIN_KERNEL}",
+            missing.join(", ")
         );
     }
+    let needed = REQUIRED_FEATURES
+        .iter()
+        .fold(0u64, |acc, (flag, _)| acc | *flag as u64);
 
     // Register before the device appears so a signal never kills us mid-setup.
     let mut signals = signal_hook::iterator::Signals::new([

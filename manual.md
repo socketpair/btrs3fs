@@ -14,7 +14,8 @@ btrfs работает с ним в zoned-режиме. Устройство и 
 
 ## 1. Требования
 
-- Linux ≥ 6.10 с `ublk_drv` (`CONFIG_BLK_DEV_UBLK`) и `CONFIG_BLK_DEV_ZONED`; проверено на 7.2.
+- **Linux ≥ 6.13** с `ublk_drv` (`CONFIG_BLK_DEV_UBLK`) и `CONFIG_BLK_DEV_ZONED`; проверено на 7.2.
+  На более старом ядре btrs3fs не запускается и называет недостающие возможности ublk.
 - root для `create`, `mount`, `umount`, `run`, `detach`: зонированное ublk-устройство ядро
   разрешает только привилегированному процессу.
 - Yandex Object Storage (нужен его `PATCH` для дозаписи) с **выключенным версионированием**.
