@@ -114,10 +114,22 @@ Analysis (based on 7.2.11 sources)
    (btrfs_can_activate_zone()).
    With max_active_zones=8, the superblock log zone, the active
    metadata/system block groups and the reserved slots use up the whole
-   budget, so no data zone can ever be activated. We have not yet captured
-   the exact values of active_zones_left and reserved_active_zones from the
-   hung kernel, but the observed behaviour (no data allocation at all)
-   matches this.
+   budget, so no data zone can ever be activated.
+
+   State read from the hung kernel with drgn:
+     fs_info->flags: BTRFS_FS_NEED_ZONE_FINISH set
+     zone_info: nr_zones=64 max_active_zones=8 reserved_active_zones=2
+                active_zones_left=2           (2 <= 2: data cannot activate)
+     zone_active_bgs: only SYSTEM|DUP   (start 100663296, alloc_offset 48K)
+                      and  METADATA|DUP (start 117440512, alloc_offset 528K)
+                      -- no active data block group at all
+     space_info DATA:     total=32M used=0 may_use=30M
+     space_info METADATA: total=16M used=144K may_use=11.9M
+     cow_file_range() of the reclaim worker: start=0 end=3145727,
+                      ret=-EAGAIN, cur_alloc_size=0
+   So 6 zones were active at mount (both superblock log zones, two for
+   SYSTEM DUP and two for METADATA DUP), leaving 2, and the 2 remaining
+   reserved slots consume exactly those.
 
 4. find_free_extent() -> can_allocate_chunk_zoned():
      - btrfs_can_activate_zone() returns false and sets
@@ -182,9 +194,7 @@ Questions
   - Is it intended that btrfs_zone_finish_one_bg() never finishes an
     active metadata block group to make room for data?
 
-We can test patches on this setup, and we can also provide a drgn dump of
-fs_info, zone_info, the active block group list and space_info from the
-live hung kernel.
+We can test patches on this setup.
 
 Thanks,
 Mark Korenberg
