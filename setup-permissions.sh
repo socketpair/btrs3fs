@@ -48,6 +48,7 @@ RUNTIME_PACKAGES=(
     util-linux            # mount/umount with fstab "user" option
     btrfs-progs           # mkfs.btrfs
     ca-certificates       # TLS to the S3 endpoint
+    coreutils             # basenc: the udev rule decodes the device identity
 )
 
 # Required to build btrs3fs from source.
@@ -112,8 +113,23 @@ install() {
 
     echo ublk_drv > "$MODULES_LOAD"
 
-    cat > "$UDEV_RULES" <<EOF
-KERNEL=="ublkb[0-9]*", GROUP="$GROUP", MODE="0660"
+    echo "KERNEL==\"ublkb[0-9]*\", GROUP=\"$GROUP\", MODE=\"0660\"" > "$UDEV_RULES"
+    # Identity for lsblk and /dev/disk/by-id: the daemon sends udev properties
+    # hex-encoded in a synthetic uevent; kept on later events (SPEC.md §2).
+    cat >> "$UDEV_RULES" <<'EOF'
+ACTION=="remove", GOTO="btrs3fs_end"
+KERNEL!="ublkb[0-9]*", GOTO="btrs3fs_end"
+ENV{SYNTH_ARG_BTRS3FS}!="?*", GOTO="btrs3fs_db"
+IMPORT{program}="/bin/sh -c 'echo $$1 | basenc --base16 -d' sh $env{SYNTH_ARG_BTRS3FS}"
+GOTO="btrs3fs_link"
+LABEL="btrs3fs_db"
+IMPORT{db}="ID_MODEL"
+IMPORT{db}="ID_REVISION"
+IMPORT{db}="ID_SERIAL_SHORT"
+IMPORT{db}="BTRS3FS_LINK"
+LABEL="btrs3fs_link"
+ENV{BTRS3FS_LINK}=="?*", SYMLINK+="disk/by-id/btrs3fs-$env{BTRS3FS_LINK}"
+LABEL="btrs3fs_end"
 EOF
     udevadm control --reload
     modprobe ublk_drv

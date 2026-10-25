@@ -34,6 +34,11 @@ echo ublk_drv | sudo tee /etc/modules-load.d/btrs3fs-ublk.conf   # загруз�
 Для сборки нужны Rust и `BUILD_PACKAGES` из `setup-permissions.sh` (`sudo
 ./setup-permissions.sh build-deps` на Fedora).
 
+С правилом udev из `sudo ./setup-permissions.sh install` диск виден в `lsblk` с
+`MODEL` = `btrs3fs`, `SERIAL` = `<бакет>/<префикс>`, `REV` = версия btrs3fs и ссылкой
+`/dev/disk/by-id/btrs3fs-<бакет>-<префикс>` (`/` и прочие символы, недопустимые в имени, —
+`-`). Без правила эти поля пусты, работе диска это не мешает.
+
 ## 3. Файл реквизитов
 
 JSON, путь — флаг `--creds`; реквизиты нигде не печатаются. Права `0600`, владелец root.

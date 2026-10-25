@@ -293,6 +293,11 @@ impl Layout {
         })
     }
 
+    /// The prefix without a trailing `/`.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
     /// `<prefix>/` — every object of the disk starts with it.
     pub fn dir(&self) -> String {
         format!("{}/", self.prefix)

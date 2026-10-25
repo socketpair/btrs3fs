@@ -42,6 +42,7 @@
 | wbt (регулятор фоновой записи) | **Выключен**: демон пишет `0` в `queue/wbt_lat_usec`. Он урезает `WRITE`, когда чтения медленнее 2 мс, — у нас чтения медленные из-за S3, а запись идёт в RAM. `ZONE_APPEND` он не трогает. Ручное выключение переживает смену планировщика udev. |
 | Кеш записи, FUA | write back, FUA — иначе ядро не шлёт FLUSH/FUA |
 | Планировщик | `mq-deadline` (udev-правило btrfs для host-managed) |
+| Идентификация | `lsblk`: `MODEL` = `btrs3fs`, `SERIAL` = `<бакет>/<префикс>`, `REV` = версия сборки; ссылка `/dev/disk/by-id/btrs3fs-<бакет>-<префикс>` (в имени всё, кроме `A-Z a-z 0-9 . _ -`, — `-`). ublk таких полей не передаёт (§11), поэтому демон сразу после старта устройства шлёт синтетическое событие `change <uuid> BTRS3FS=<hex>` в `/sys/block/ublkbN/uevent`: ядро пропускает в значениях только буквы и цифры, а в hex лежат готовые строки `KEY=VALUE`. Правило udev из `setup-permissions.sh` раскодирует их `basenc --base16 -d` (coreutils; сам udev hex не умеет) и сохраняет при следующих событиях (`IMPORT{db}`). Строки длиннее 768 байт (до hex) не передаются — предупреждение в журнал. Файлов не создаёт (решение пользователя). Без правила событие ни на что не влияет. |
 | Версия сборки | `<версия пакета>-g<коммит>[-dirty]` из `git describe` (`build.rs`); без git — версия пакета. Её печатает `--version`. |
 
 Проверки `disk.json`: `zone_size` — степень двойки, не больше 32 МиБ и `zone_size / 4096 ≤
@@ -327,7 +328,7 @@ crates.io её ещё нет. Поэтому зависимость — git с �
   `kernel-headers`, `glibc-devel`, `git`); `diag-tools` — `fio`, `blktrace`, `sysstat`,
   `strace`, `gdb`, `perf`, `jq`, `awscli2`, `bpftrace`, `drgn`. Пакеты для работы:
   `kernel-modules-core`, `systemd-udev`, `shadow-utils`, `sudo`, `util-linux`, `btrfs-progs`,
-  `ca-certificates`.
+  `ca-certificates`, `coreutils` (`basenc` для правила udev).
 - Окружение разработки: Fedora 44, ядро 7.2, Rust 1.99, btrfs-progs 7.1.
 
 ---
@@ -377,6 +378,11 @@ crates.io её ещё нет. Поэтому зависимость — git с �
   255 байт (`mkfs.btrfs`); имя ссылки udev — 255 байт (`NAME_MAX`), то есть серийный номер в
   `btrs3fs-<serial>` — до 247 символов, длиннее udev ссылку не создаёт. У настоящих дисков
   серийный номер — 20 символов (ATA, NVMe, virtio-blk).
+- Синтетическое событие (`/sys/…/uevent`): `<действие> <uuid> KEY=VALUE …`; в ключах и
+  значениях ядро принимает только латинские буквы и цифры (`- _ . / :` и прочие — `EINVAL`);
+  все переменные события — до 2 КиБ, при переполнении ядро печатает WARNING с трассировкой.
+  udev видит их как `SYNTH_ARG_KEY`; правило может склеить их (`ENV{X}="$env{X}-…"`) и
+  сохранить на следующие события через `IMPORT{db}` — проверено на ВМ.
 - Два диска btrs3fs (разные префиксы) в одной ФС: `btrfs device add` работает, `balance
   -mconvert=raid1 -sconvert=raid1` проходит, scrub чист. Данные в RAID1 — отказ «zoned: data
   raid1 needs raid-stripe-tree»: в zoned нужен `raid-stripe-tree` (mkfs), а он только при

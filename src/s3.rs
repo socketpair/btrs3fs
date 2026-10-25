@@ -68,6 +68,7 @@ pub struct S3Store {
     http: reqwest::Client,
     /// `<endpoint>/<bucket>` (path-style addressing).
     base: String,
+    bucket: String,
     region: String,
     credentials: Credentials,
     retry: RetryPolicy,
@@ -92,6 +93,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl S3Store {
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
     pub fn new(creds: &Creds, transport: &Transport, retry: RetryPolicy) -> anyhow::Result<Self> {
         let mut builder = reqwest::Client::builder()
             .tcp_nodelay(true)
@@ -111,6 +116,7 @@ impl S3Store {
                 creds.endpoint.trim_end_matches('/'),
                 encode_path(&creds.bucket)
             ),
+            bucket: creds.bucket.clone(),
             region: creds.region.clone(),
             credentials: Credentials::new(
                 &creds.access_key,

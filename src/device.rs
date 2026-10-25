@@ -61,6 +61,9 @@ pub struct DeviceOptions {
     /// btrfs readahead window to set once the filesystem on the device is
     /// mounted (`bdi/read_ahead_kb`), bytes; `None` leaves btrfs's own.
     pub fs_readahead: Option<u64>,
+    /// `<bucket>/<prefix>`, the serial number lsblk shows (SPEC.md §2);
+    /// `None` for a RAM disk.
+    pub serial: Option<String>,
 }
 
 struct Ctx {
@@ -160,6 +163,7 @@ pub fn serve(
 
     let zone_size = cfg.zone_size;
     let fs_readahead = opts.fs_readahead;
+    let serial = opts.serial.clone();
     let device_fn = move |ctrl: &UblkCtrl| {
         let bdev = ctrl.get_bdev_path();
         info!(
@@ -167,6 +171,7 @@ pub fn serve(
             ctrl.dev_info().nr_hw_queues,
             ctrl.dev_info().queue_depth
         );
+        crate::ident::announce(&bdev, serial.as_deref());
         disable_wbt(&bdev);
         set_max_request(&bdev, zone_size);
         if let (Some(bytes), Some(name)) = (fs_readahead, bdev.strip_prefix("/dev/")) {

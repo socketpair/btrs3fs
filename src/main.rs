@@ -1,5 +1,6 @@
 mod config;
 mod device;
+mod ident;
 mod logging;
 mod measure;
 mod readahead;
@@ -349,6 +350,10 @@ fn serve_disk(
         cfg.nr_queues = q;
     }
     cfg.validate()?;
+    let serial = match &store {
+        Store::S3(s) => Some(format!("{}/{}", s.bucket(), layout.prefix())),
+        Store::Mem(_) => None,
+    };
     let tuning = match link {
         Some(l) => {
             l.validate()?;
@@ -382,6 +387,7 @@ fn serve_disk(
         nr_queues: cfg.nr_queues,
         queue_depth: cfg.queue_depth,
         fs_readahead: tuning.map(|t| t.fs_readahead),
+        serial,
     };
 
     // The statistics page starts once the device number is known.
