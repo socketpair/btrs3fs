@@ -8,6 +8,7 @@
 //! reads with an io_uring READ (SPEC.md §9).
 
 use crate::config::{BLOCK_SIZE, DiskConfig};
+use crate::logging::REQUESTS_TARGET;
 use crate::stats::{Reason, STATS};
 use crate::zones::{Cond, Engine, Piece, ZResult, ZoneError};
 use anyhow::{Context, bail};
@@ -16,7 +17,7 @@ use io_uring::{opcode, types};
 use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
 use libublk::io::{BufDesc, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{UblkError, UblkFlags, sys, wait_and_handle_io_events};
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use std::future::Future;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::rc::Rc;
@@ -270,6 +271,12 @@ async fn handle_io(
     let copy_pos = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
     let engine = &ctx.engine;
     let _in_flight = STATS.requests.enter();
+    trace!(
+        target: REQUESTS_TARGET,
+        "op={op} zone={} offset={offset} len={len} flags={:#x}",
+        engine.locate(offset).map_or(-1, |(zi, _)| zi as i64),
+        iod.op_flags & !0xff
+    );
 
     match op {
         sys::UBLK_IO_OP_READ => {

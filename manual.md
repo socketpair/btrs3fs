@@ -171,6 +171,10 @@ sudo btrs3fs umount /mnt/data
   stderr запустившей его команды, пока работает: не передавайте этот вывод в конвейер
   (`| grep` будет ждать вечно) и не используйте флаг в скриптах.
 - Ошибка, из-за которой команда не выполнилась, печатается в stderr всегда.
+- Трассировка запросов ядра к устройству (операция, зона, смещение, длина, флаги) —
+  `--log-level info,requests=trace --log-to-stderr`, только в stderr (в journald не идёт:
+  тысячи строк в секунду). Пример: `sudo btrs3fs --log-level info,requests=trace
+  --log-to-stderr mount … 2> /tmp/requests.log`.
 
 ## 9. Запуск через systemd
 

@@ -5,6 +5,11 @@
 use log::{Log, Metadata, Record};
 use std::path::Path;
 
+/// Log target of the per-request trace (`--log-level info,requests=trace`).
+/// Its records go to stderr only: thousands of lines per second would hit the
+/// journald rate limit and drown everything else.
+pub const REQUESTS_TARGET: &str = "requests";
+
 /// SYSLOG_IDENTIFIER of our journal records: `journalctl -t btrs3fs`.
 const IDENTIFIER: &str = "btrs3fs";
 /// Native journald protocol socket (systemd's fixed path); if absent, there is
@@ -27,7 +32,11 @@ impl Log for Tee {
         if !self.filter.matches(record) {
             return;
         }
-        if let Some(l) = &self.system {
+        if let Some(l) = self
+            .system
+            .as_ref()
+            .filter(|_| record.target() != REQUESTS_TARGET)
+        {
             l.log(record);
         }
         if let Some(l) = &self.stderr {
