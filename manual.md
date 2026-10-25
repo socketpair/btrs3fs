@@ -136,8 +136,6 @@ derived: read window and GET part 2048 KiB, btrfs readahead 64 MiB, 30 parallel 
 | `--retry-backoff-factor` | `retry_backoff_factor` | 2.0 | Рост паузы. |
 | `--queues` | `nr_queues` | 4 | Очереди (потоки) устройства. |
 | `--queue-depth` | `queue_depth` | 128 | Глубина очереди. |
-| `--serial` | `serial` | 16 случайных hex-цифр | Серийный номер диска; метка ФС — `on-<serial>` (`LABEL` в `lsblk`). Буквы, цифры, `.`, `_`, `-`, до 64 символов. |
-| — | `wwn` | случайный | World Wide Name: `0x3` и 15 hex-цифр. |
 
 ## 7. Сохранность данных
 
