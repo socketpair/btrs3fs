@@ -22,20 +22,11 @@ use serde::Deserialize;
 use std::future::Future;
 use std::time::{Duration, Instant, SystemTime};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum HttpVersion {
-    /// Negotiate with ALPN (HTTP/2 if the server offers it).
-    Auto,
-    Http1,
-    Http2,
-}
-
-/// Network options of the S3 client.
+/// Network options of the S3 client. HTTP/1.1 only, a TCP connection per
+/// request in flight: over HTTP/2 every request shared one connection and
+/// parallel GETs topped out 3.5 times lower (SPEC.md §8).
 #[derive(Clone, Debug, clap::Args)]
 pub struct Transport {
-    /// HTTP protocol version for S3.
-    #[arg(long, value_enum, default_value = "auto")]
-    pub http: HttpVersion,
     /// Proxy for S3 requests, e.g. http://proxy:3128 (HTTPS goes through CONNECT).
     #[arg(long)]
     pub proxy: Option<String>,
@@ -108,16 +99,11 @@ impl S3Store {
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(READ_TIMEOUT)
-            .http2_adaptive_window(true)
+            .http1_only()
             .user_agent(concat!("btrs3fs/", env!("CARGO_PKG_VERSION")));
         if let Some(proxy) = &transport.proxy {
             builder = builder.proxy(reqwest::Proxy::all(proxy).context("invalid proxy URL")?);
         }
-        builder = match transport.http {
-            HttpVersion::Auto => builder,
-            HttpVersion::Http1 => builder.http1_only(),
-            HttpVersion::Http2 => builder.http2_prior_knowledge(),
-        };
         Ok(Self {
             http: builder.build().context("cannot create HTTP client")?,
             base: format!(
@@ -730,10 +716,7 @@ mod bucket_tests {
             initial_delay: Duration::from_millis(100),
             backoff_factor: 2.0,
         };
-        let transport = Transport {
-            http: HttpVersion::Auto,
-            proxy: None,
-        };
+        let transport = Transport { proxy: None };
         S3Store::new(&creds, &transport, retry).unwrap()
     }
 

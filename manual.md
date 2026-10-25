@@ -107,7 +107,6 @@ sudo btrs3fs umount /mnt/data
 |---|---|
 | `--log-level L` | Уровень логов: `error`, `warn`, `info` (по умолчанию), `debug`, `trace`; синтаксис env_logger, например `debug,libublk=info`. |
 | `--log-to-stderr` | Дублировать логи в stderr (цветные на терминале). |
-| `--http auto\|http1\|http2` | Версия HTTP к S3; `auto` — HTTP/2, если сервер предлагает. |
 | `--proxy URL` | HTTP(S)-прокси для S3, например `http://proxy:3128`. |
 
 `--dev-id`: устройство появляется как `/dev/ublkb<N>`. У `mount` по умолчанию номер выбирает

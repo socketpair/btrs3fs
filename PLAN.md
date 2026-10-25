@@ -50,7 +50,7 @@ src/
 
 - [x] 2.1 `s3.rs`: подпись SigV4 (`UNSIGNED-PAYLOAD`), PUT / PATCH / GET Range / DELETE /
       ListObjectsV2 (пагинация) / GET целиком; транспорт (keep-alive, `TCP_NODELAY`,
-      TCP keepalive, `--http`); повторы (5xx/429/сеть, бюджет из `disk.json`).
+      TCP keepalive; `--http` убран 2026-10-25 — только HTTP/1.1); повторы (5xx/429/сеть, бюджет из `disk.json`).
 - [x] 2.2 Интеграционные тесты против бакета (`#[ignore]`, запускаются явно, свой префикс).
 - [x] 2.3 `create` / `destroy` через S3.
 
