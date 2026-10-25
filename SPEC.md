@@ -303,6 +303,22 @@ io_uring (`UblkQueue::ublk_submit_sqe`). Состояние зон — общи�
   суперблок без флага (отчёт в `bugreports/`). Надёжное правило: `ZONE_APPEND` → данные,
   запрос с флагом → метаданные, запрос без флага тип не задаёт.
 
+- Версии ядра (по исходникам на git.kernel.org): `queue/wbt_lat_usec`, `queue/max_sectors_kb` —
+  с 4.10 и раньше; параметры ublk `io_opt_shift`, `UBLK_IO_F_META` — 6.0; `GET_FEATURES`,
+  `USER_COPY` — 6.5; `ZONED` — 6.6; zone write plugging — 6.10; `USER_RECOVERY_FAIL_IO` и
+  `max_hw_zone_append_sectors` — 6.13; btrfs `bg_reclaim_threshold` общий — 5.13, по группам —
+  5.19, `dynamic_reclaim`, `periodic_reclaim`, `reclaim_count` — 6.12; `queue/zoned_qd1_writes` —
+  7.1 (мы его не используем).
+- Важные для нас исправления после 6.13 (ublk, зонированный блочный уровень, btrfs zoned):
+  отмена и восстановление ublk (6.15–6.16, `reset per-IO canceled flag` — 7.1);
+  `blk_zone_reset_all_bio_endio` NULL (6.19); удаление плагов записи зоны (7.1); btrfs zoned —
+  активация зон и резерв под перенос данных (6.17), указатель записи DUP после удаления
+  экстентов (7.0), потеря ошибки ввода-вывода при разбиении записи (7.1), взаимоблокировка
+  writeback метаданных и фиксации транзакции (7.2). Почти всё портировано в 6.18.y (проверено
+  на 6.18.58); не портированы: потеря ошибки ввода-вывода (btrfs, 7.1), use-after-free в
+  `ublk_cancel_cmd` (7.1), флаг отмены без диска (ublk, 7.2), взаимоблокировка при ошибке
+  перепроверки зон (7.2). Ветки 6.13–6.17 закрыты и этих исправлений не получат.
+
 **btrfs**
 - Предел активных зон: `min_not_zero(max_active, max_open)`, если 0 — `min(зон/4, 128)`, не
   меньше 8; лишние зоны btrfs закрывает FINISH. При DUP-метаданных 6 активных зон в резерве
