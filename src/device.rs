@@ -146,6 +146,7 @@ pub fn serve(
             ctrl.dev_info().nr_hw_queues,
             ctrl.dev_info().queue_depth
         );
+        disable_wbt(&bdev);
         if on_ready(&bdev) {
             loop {
                 if let Some(sig) = signals.pending().next() {
@@ -167,6 +168,24 @@ pub fn serve(
     ctrl.run_target(tgt_init, q_handler, device_fn)
         .context("ublk device failed")?;
     Ok(ctrl)
+}
+
+/// Turns off the kernel's writeback throttling (wbt) for the device
+/// (SPEC.md §2). It slows buffered writes down when reads are slower than
+/// 2 ms, to keep writes from queueing ahead of reads; here writes complete in
+/// RAM and reads are slow because of S3, so it only gets in the way. Set
+/// manually, it stays off when udev switches the I/O scheduler.
+fn disable_wbt(bdev: &str) {
+    let Some(name) = bdev.strip_prefix("/dev/") else {
+        return;
+    };
+    let path = format!("/sys/block/{name}/queue/wbt_lat_usec");
+    match std::fs::write(&path, "0") {
+        Ok(()) => debug!("{path}: writeback throttling disabled"),
+        // Kernel built without wbt: nothing to disable.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("cannot disable writeback throttling in {path}: {e}"),
+    }
 }
 
 /// Tells systemd (Type=notify) about state changes; no-op outside systemd.
