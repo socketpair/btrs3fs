@@ -38,7 +38,7 @@ const SIZE_BOUNDS: &[u64] = &[
 const LATENCY_BOUNDS_MS: &[u64] = &[10, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000];
 
 /// Buckets of zones uploaded per FLUSH: 0 (nothing to do), then powers of two;
-/// at most zones::S3_PARALLELISM (16) upload at once, the rest queue up.
+/// up to 64 upload at once (tuning::UPLOADS_MAX), the rest queue up.
 const ZONES_BOUNDS: &[u64] = &[0, 1, 2, 4, 8, 16, 32, 64];
 
 /// Room for the longest bounds list plus its open-ended last bucket.

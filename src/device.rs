@@ -51,7 +51,10 @@ const REQUIRED_FEATURES: [(u32, &str); 4] = [
     (sys::UBLK_F_USER_COPY, "UBLK_F_USER_COPY"),
     (sys::UBLK_F_ZONED, "UBLK_F_ZONED"),
     (sys::UBLK_F_USER_RECOVERY, "UBLK_F_USER_RECOVERY"),
-    (sys::UBLK_F_USER_RECOVERY_FAIL_IO, "UBLK_F_USER_RECOVERY_FAIL_IO"),
+    (
+        sys::UBLK_F_USER_RECOVERY_FAIL_IO,
+        "UBLK_F_USER_RECOVERY_FAIL_IO",
+    ),
 ];
 
 /// Oldest kernel with every feature in `REQUIRED_FEATURES` (checked in the
@@ -65,6 +68,9 @@ pub struct DeviceOptions {
     /// Largest request the kernel sends (`queue/max_sectors_kb`), bytes;
     /// `None` keeps the zone size.
     pub max_request: Option<u64>,
+    /// btrfs readahead window to set once the filesystem on the device is
+    /// mounted (`bdi/read_ahead_kb`), bytes; `None` leaves btrfs's own.
+    pub fs_readahead: Option<u64>,
 }
 
 struct Ctx {
@@ -163,6 +169,7 @@ pub fn serve(
     };
 
     let max_request = opts.max_request;
+    let fs_readahead = opts.fs_readahead;
     let device_fn = move |ctrl: &UblkCtrl| {
         let bdev = ctrl.get_bdev_path();
         info!(
@@ -173,6 +180,13 @@ pub fn serve(
         disable_wbt(&bdev);
         if let Some(bytes) = max_request {
             set_max_request(&bdev, bytes);
+        }
+        if let (Some(bytes), Some(name)) = (fs_readahead, bdev.strip_prefix("/dev/")) {
+            let name = name.to_string();
+            // Lives until the process exits, like the device.
+            let _ = std::thread::Builder::new()
+                .name("btrs3fs-fs-tune".into())
+                .spawn(move || keep_fs_readahead(&name, bytes));
         }
         if on_ready(&bdev) {
             loop {
@@ -227,6 +241,42 @@ fn set_max_request(bdev: &str, bytes: u64) {
     match std::fs::write(&path, (bytes >> 10).to_string()) {
         Ok(()) => info!("{path}: requests limited to {bytes} bytes"),
         Err(e) => warn!("cannot limit request size in {path}: {e}"),
+    }
+}
+
+/// How often the daemon looks for its filesystem being mounted. Judgement
+/// call: until then btrfs reads ahead its own 4 MiB, which a second costs
+/// next to nothing; the check is a directory listing.
+const FS_TUNE_POLL: Duration = Duration::from_secs(1);
+
+/// Sets the btrfs readahead window (`/sys/fs/btrfs/<fsid>/bdi/read_ahead_kb`)
+/// whenever a btrfs filesystem on the device `name` gets mounted — by
+/// `mount` or by fstab alike (SPEC.md §6.1). The window belongs to the mounted
+/// filesystem, not to the device, so it cannot be set before. Each mount is
+/// set once: a value the admin changes afterwards stays.
+fn keep_fs_readahead(name: &str, bytes: u64) {
+    let want = (bytes >> 10).to_string();
+    let mut done: std::collections::HashSet<std::path::PathBuf> = Default::default();
+    loop {
+        let mounted: Vec<std::path::PathBuf> = std::fs::read_dir("/sys/fs/btrfs")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|fs| fs.join("devices").join(name).exists())
+            .collect();
+        done.retain(|fs| mounted.contains(fs));
+        for fs in mounted {
+            if !done.insert(fs.clone()) {
+                continue;
+            }
+            let path = fs.join("bdi/read_ahead_kb");
+            match std::fs::write(&path, &want) {
+                Ok(()) => info!("{}: btrfs readahead set to {bytes} bytes", path.display()),
+                Err(e) => warn!("cannot set btrfs readahead in {}: {e}", path.display()),
+            }
+        }
+        std::thread::sleep(FS_TUNE_POLL);
     }
 }
 

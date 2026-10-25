@@ -24,11 +24,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-/// S3 requests one bulk operation runs at once: zones uploaded by a FLUSH or
-/// the background flusher, tag lookups at start. Judgement call, not
-/// measured: enough to keep a link busy with zone-sized bodies, few enough not
-/// to hit S3 request rate limits; one FLUSH touches 2–4 zones in practice
-/// (`stats`, SPEC.md §9.3).
+/// S3 requests run at once without a link to tune for: tag lookups at start,
+/// and uploads of the temporary `create` device and tests. Judgement call:
+/// enough to keep a link busy with zone-sized bodies, few enough not to hit
+/// S3 request rate limits. With a link, uploads follow it (SPEC.md §6.1).
 const S3_PARALLELISM: usize = 16;
 
 /// Shared zero-filled buffer for reads past the write pointer; a larger read
@@ -140,6 +139,8 @@ pub struct Engine {
     kick: Notify,
     /// `None`: read-ahead disabled.
     read_cache: Option<ReadCache>,
+    /// Zones uploaded at once by FLUSH and the background flusher.
+    uploads: usize,
 }
 
 impl Engine {
@@ -233,6 +234,7 @@ impl Engine {
             room: Notify::new(),
             kick: Notify::new(),
             read_cache: None,
+            uploads: S3_PARALLELISM,
         };
         info!("restored {nr_zones} zones: {closed} closed, {full} full, {empty} empty");
         Ok(engine)
@@ -250,6 +252,12 @@ impl Engine {
             );
         }
         Ok(self)
+    }
+
+    /// Uploads at once for FLUSH and the background flusher (SPEC.md §6.1).
+    pub fn with_uploads(mut self, uploads: usize) -> Self {
+        self.uploads = uploads.max(1);
+        self
     }
 
     /// Zone index and offset inside the zone.
@@ -515,7 +523,7 @@ impl Engine {
         }
         let results: Vec<ZResult<()>> = futures_util::stream::iter(dirty)
             .map(|zi| self.flush_zone(zi, reason))
-            .buffer_unordered(S3_PARALLELISM)
+            .buffer_unordered(self.uploads)
             .collect()
             .await;
         results.into_iter().collect()
@@ -696,7 +704,7 @@ impl Engine {
     }
 
     /// Uploads zones whenever buffered data exceeds the soft limit, up to
-    /// `S3_PARALLELISM` at once (SPEC.md §5). A new upload starts as soon as
+    /// `uploads` at once (SPEC.md §5). A new upload starts as soon as
     /// one ends, while the data not yet being uploaded is above the limit.
     pub async fn background_flusher(self: Arc<Self>) {
         let mut running = futures_util::stream::FuturesUnordered::new();
@@ -704,7 +712,7 @@ impl Engine {
         // Bytes the running uploads were picked for (buffered at pick time).
         let mut in_flight = 0u64;
         loop {
-            while running.len() < S3_PARALLELISM
+            while running.len() < self.uploads
                 && self.dirty_bytes().saturating_sub(in_flight) > self.dirty_limit
             {
                 let Some((zi, bytes)) = self.background_pick(&busy) else {

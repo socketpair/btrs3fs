@@ -5,6 +5,7 @@ mod readahead;
 mod s3;
 mod stats;
 mod store;
+mod tuning;
 mod zones;
 
 use anyhow::{Context, bail, ensure};
@@ -23,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use store::{Body, Layout, MemStore, Store};
 use tokio::runtime::Runtime;
+use tuning::Link;
 use zones::Engine;
 
 /// btrfs mount options always used by `mount`: user decision (SPEC.md §9.2);
@@ -128,32 +130,62 @@ struct MountArgs {
     #[command(flatten)]
     stats: StatsArgs,
     #[command(flatten)]
-    read_ahead: ReadAheadArgs,
+    link: LinkArgs,
 }
 
-/// Read-ahead of the device server (SPEC.md §6); per run, not in disk.json.
+/// The link to S3 as `btrs3fs measure` reports it (SPEC.md §6.1): the daemon
+/// derives its read and upload settings from it. Per run, not in disk.json;
+/// values not given are those measured in Yandex Cloud next to the bucket.
 #[derive(Args, Clone, Copy)]
-struct ReadAheadArgs {
-    /// A read of stored data smaller than this fetches the whole aligned
-    /// window around it; must divide the zone size; 0 disables read-ahead
-    /// [default: 256K].
-    #[arg(long, value_parser = parse_size, default_value_t = config::DEFAULT_READ_WINDOW, hide_default_value = true)]
-    read_window: u64,
-    /// Largest request the kernel sends to the device (multiple of 4K, up to
-    /// the zone size) [default: 512K]. Smaller requests split a kernel
-    /// readahead window into parallel GETs; writes are split too.
-    #[arg(long, value_parser = parse_size, default_value_t = config::DEFAULT_MAX_REQUEST, hide_default_value = true)]
-    max_request: u64,
+struct LinkArgs {
+    /// Time to the first byte of a small GET, e.g. 36ms.
+    #[arg(long, value_parser = tuning::parse_duration)]
+    s3_latency: Option<Duration>,
+    /// Rate of one GET after its first byte, per second, e.g. 55M.
+    #[arg(long, value_parser = parse_size)]
+    s3_read_stream: Option<u64>,
+    /// Rate of all GETs together, per second.
+    #[arg(long, value_parser = parse_size)]
+    s3_read_total: Option<u64>,
+    /// Rate of one PUT after its first byte, per second.
+    #[arg(long, value_parser = parse_size)]
+    s3_write_stream: Option<u64>,
+    /// Rate of all PUTs together, per second.
+    #[arg(long, value_parser = parse_size)]
+    s3_write_total: Option<u64>,
     /// RAM for read-ahead windows; 0 disables read-ahead [default: 64M].
     #[arg(long, value_parser = parse_size, default_value_t = config::DEFAULT_READ_CACHE, hide_default_value = true)]
     read_cache: u64,
 }
 
-impl ReadAheadArgs {
-    fn settings(self) -> ReadAhead {
-        ReadAhead {
-            window: self.read_window,
-            cache: self.read_cache,
+impl LinkArgs {
+    /// The link given on the command line, Yandex Cloud values for the rest;
+    /// says in the log what was not given.
+    fn link(&self) -> Link {
+        let d = Link::YANDEX_CLOUD;
+        let missing: Vec<&str> = [
+            ("--s3-latency", self.s3_latency.is_none()),
+            ("--s3-read-stream", self.s3_read_stream.is_none()),
+            ("--s3-read-total", self.s3_read_total.is_none()),
+            ("--s3-write-stream", self.s3_write_stream.is_none()),
+            ("--s3-write-total", self.s3_write_total.is_none()),
+        ]
+        .into_iter()
+        .filter_map(|(flag, none)| none.then_some(flag))
+        .collect();
+        if !missing.is_empty() {
+            warn!(
+                "S3 link not given ({}): assuming values measured in Yandex Cloud; \
+                 measure yours with `btrs3fs measure`",
+                missing.join(", ")
+            );
+        }
+        Link {
+            latency: self.s3_latency.unwrap_or(d.latency),
+            read_stream: self.s3_read_stream.unwrap_or(d.read_stream),
+            read_total: self.s3_read_total.unwrap_or(d.read_total),
+            write_stream: self.s3_write_stream.unwrap_or(d.write_stream),
+            write_total: self.s3_write_total.unwrap_or(d.write_total),
         }
     }
 }
@@ -198,7 +230,7 @@ struct RunArgs {
     #[command(flatten)]
     stats: StatsArgs,
     #[command(flatten)]
-    read_ahead: ReadAheadArgs,
+    link: LinkArgs,
     #[command(flatten)]
     transport: Transport,
 }
@@ -306,21 +338,22 @@ fn serve_disk(
         dev_id,
         queues,
         stats: stats_opt,
-        read_ahead,
-        max_request,
+        link,
+        read_cache,
     } = serve;
     if let Some(q) = queues {
         cfg.nr_queues = q;
     }
     cfg.validate()?;
-    if let Some(r) = max_request {
-        ensure!(
-            r >= config::BLOCK_SIZE && r % config::BLOCK_SIZE == 0 && r <= cfg.zone_size,
-            "max request {r} must be a multiple of {} up to the zone size {}",
-            config::BLOCK_SIZE,
-            cfg.zone_size
-        );
-    }
+    let tuning = match link {
+        Some(l) => {
+            l.validate()?;
+            let t = l.tuning(cfg.zone_size);
+            info!("S3 link: {l}; derived: {t}");
+            Some(t)
+        }
+        None => None,
+    };
     info!(
         "disk {}: {} bytes, {} zones of {} bytes",
         layout.dir(),
@@ -330,13 +363,22 @@ fn serve_disk(
     );
     let disk = layout.dir();
     let engine = rt.block_on(Engine::open(&cfg, layout, Arc::new(store)))?;
-    let engine = Arc::new(engine.with_read_ahead(read_ahead)?);
+    let read_ahead = tuning.map_or(ReadAhead::DISABLED, |t| ReadAhead {
+        window: t.unit,
+        cache: read_cache,
+    });
+    let mut engine = engine.with_read_ahead(read_ahead)?;
+    if let Some(t) = tuning {
+        engine = engine.with_uploads(t.uploads);
+    }
+    let engine = Arc::new(engine);
     rt.spawn(engine.clone().background_flusher());
     let opts = device::DeviceOptions {
         dev_id,
         nr_queues: cfg.nr_queues,
         queue_depth: cfg.queue_depth,
-        max_request,
+        max_request: tuning.map(|t| t.unit),
+        fs_readahead: tuning.map(|t| t.fs_readahead),
     };
 
     // The statistics page starts once the device number is known.
@@ -383,9 +425,10 @@ struct ServeOptions {
     queues: Option<u16>,
     /// `None` — no statistics page (temporary device of `create`).
     stats: Option<StatsArgs>,
-    read_ahead: ReadAhead,
-    /// Largest kernel request, bytes; `None` — the zone size.
-    max_request: Option<u64>,
+    /// `None` — no tuning (temporary device of `create`): no read-ahead,
+    /// default uploads, kernel limits untouched.
+    link: Option<Link>,
+    read_cache: u64,
 }
 
 /// Port the statistics page actually listens on, once started.
@@ -439,8 +482,8 @@ fn cmd_run(a: RunArgs) -> anyhow::Result<i32> {
             dev_id: a.dev_id,
             queues: a.queues,
             stats: Some(a.stats),
-            read_ahead: a.read_ahead.settings(),
-            max_request: Some(a.read_ahead.max_request),
+            link: Some(a.link.link()),
+            read_cache: a.link.read_cache,
         },
         on_ready,
     )?;
@@ -558,8 +601,8 @@ fn mount_daemon(a: &MountArgs, creds: &Path, status: File, keep_stderr: bool) ->
                 dev_id: a.dev_id,
                 queues: a.queues,
                 stats: Some(a.stats),
-                read_ahead: a.read_ahead.settings(),
-                max_request: Some(a.read_ahead.max_request),
+                link: Some(a.link.link()),
+                read_cache: a.link.read_cache,
             },
             on_ready,
         )?;
@@ -871,8 +914,8 @@ fn format_disk(
             queues: None,
             stats: None,
             // mkfs reads next to nothing.
-            read_ahead: ReadAhead::DISABLED,
-            max_request: None,
+            link: None,
+            read_cache: 0,
         },
         on_ready,
     )?;

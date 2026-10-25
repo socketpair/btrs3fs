@@ -47,25 +47,10 @@ pub const DEFAULT_ZONE_SIZE: u64 = 16 << 20;
 /// daemon's RAM; not measured. Per disk, `create --dirty-limit`.
 pub const DEFAULT_DIRTY_LIMIT: u64 = 256 << 20;
 
-/// Read-ahead window: a small read of stored data fetches the aligned window
-/// around it (SPEC.md §6). Modelled on a real layout (SPEC.md §12): 256 KiB
-/// cuts cold reads of small files from 5354 GETs to 588 for 3 % more bytes,
-/// while a random 4 KiB read costs ~0.2 s instead of ~0.05 s; 1 MiB saves
-/// little more time (161 GETs) but makes that random read ~0.5 s. User
-/// decision 2026-10-25. Per mount, `--read-window`.
-pub const DEFAULT_READ_WINDOW: u64 = 256 << 10;
-
-/// RAM for read-ahead windows. Same model: 64 MiB keeps neighbouring windows
-/// long enough (16 MiB needed 655 GETs instead of 588 at 256 KiB). User
-/// decision 2026-10-25. Per mount, `--read-cache`.
+/// RAM for read-ahead windows (SPEC.md §6): a memory budget, not a property
+/// of the link. 64 MiB keeps neighbouring windows long enough in the model on
+/// a real file layout (SPEC.md §12). Per mount, `--read-cache`.
 pub const DEFAULT_READ_CACHE: u64 = 64 << 20;
-
-/// Largest request the kernel sends to the device (`queue/max_sectors_kb`).
-/// Measured (SPEC.md §12): btrfs's 4 MiB readahead window then goes out as
-/// 8 requests at once; cold sequential reads 9.4–9.5 MiB/s against 4.3–5.9
-/// at the zone size, about 2 GETs per MiB; 256 KiB was faster (10–13 MiB/s)
-/// for twice the GETs. User decision 2026-10-25. Per mount, `--max-request`.
-pub const DEFAULT_MAX_REQUEST: u64 = 512 << 10;
 
 /// Total time one S3 operation may retry before the request fails with EIO.
 /// Judgement call accepted by the user: long enough to ride out a short network
