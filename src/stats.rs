@@ -34,7 +34,7 @@ const SIZE_BOUNDS: &[u64] = &[
     32 * MIB, // largest zone
 ];
 /// Buckets of S3 request time, ms: from in-datacenter latency (10 ms) up to
-/// the slow PATCHes measured on large appended objects (~30 s, SPEC.md §13.3).
+/// the slow PATCHes measured on large appended objects (~30 s, SPEC.md §11).
 const LATENCY_BOUNDS_MS: &[u64] = &[10, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000];
 
 /// Buckets of zones uploaded per FLUSH: 0 (nothing to do), then powers of two;

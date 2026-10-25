@@ -16,7 +16,7 @@ pub const BLOCK_SIZE: u64 = 4096;
 /// Most appends one S3 object may receive. Requirement of the task (taken
 /// from the Yandex Object Storage append limit as the user knows it; 5228
 /// appends in a row were verified, the real limit was not reached, SPEC.md
-/// §13.3). Every append carries at least one block, so a zone holds at most
+/// §11). Every append carries at least one block, so a zone holds at most
 /// this many blocks: 10 000 × 4 KiB = 40 960 000 bytes, i.e. at most 32 MiB
 /// for a power-of-two zone size.
 pub const MAX_APPENDS_PER_OBJECT: u64 = 10_000;
@@ -34,7 +34,7 @@ const UBLK_MAX_QUEUE_DEPTH: u16 = libublk::sys::UBLK_MAX_QUEUE_DEPTH as u16;
 /// Version of the disk.json format; bump on incompatible changes.
 pub const CONFIG_VERSION: u32 = 1;
 
-/// Zone size of new disks. Measured (SPEC.md §13.3): Yandex PATCH to an object
+/// Zone size of new disks. Measured (SPEC.md §11): Yandex PATCH to an object
 /// grown by appends takes 9–30 s once it passes ~20 MB and 0.2–0.6 s below
 /// 16 MB, so the largest power of two under that threshold. User decision
 /// 2026-10-24 (instead of the originally chosen 32 MiB).
@@ -42,13 +42,13 @@ pub const DEFAULT_ZONE_SIZE: u64 = 16 << 20;
 
 /// Buffered (not yet uploaded) data above which zones are uploaded in the
 /// background without waiting for a FLUSH; writes wait at twice this amount
-/// (SPEC.md §5.3). Judgement call proposed at the start and accepted by the
+/// (SPEC.md §5). Judgement call proposed at the start and accepted by the
 /// user: room for one commit=300 interval of moderate writes while bounding the
 /// daemon's RAM; not measured. Per disk, `create --dirty-limit`.
 pub const DEFAULT_DIRTY_LIMIT: u64 = 256 << 20;
 
 /// Read-ahead window: a small read of stored data fetches the aligned window
-/// around it (SPEC.md §5.4). Modelled on a real layout (SPEC.md §13.3): 256 KiB
+/// around it (SPEC.md §6). Modelled on a real layout (SPEC.md §12): 256 KiB
 /// cuts cold reads of small files from 5354 GETs to 588 for 3 % more bytes,
 /// while a random 4 KiB read costs ~0.2 s instead of ~0.05 s; 1 MiB saves
 /// little more time (161 GETs) but makes that random read ~0.5 s. User
@@ -61,7 +61,7 @@ pub const DEFAULT_READ_WINDOW: u64 = 256 << 10;
 pub const DEFAULT_READ_CACHE: u64 = 64 << 20;
 
 /// Largest request the kernel sends to the device (`queue/max_sectors_kb`).
-/// Measured (SPEC.md §13.3): btrfs's 4 MiB readahead window then goes out as
+/// Measured (SPEC.md §12): btrfs's 4 MiB readahead window then goes out as
 /// 8 requests at once; cold sequential reads 9.4–9.5 MiB/s against 4.3–5.9
 /// at the zone size, about 2 GETs per MiB; 256 KiB was faster (10–13 MiB/s)
 /// for twice the GETs. User decision 2026-10-25. Per mount, `--max-request`.

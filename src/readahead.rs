@@ -1,4 +1,4 @@
-//! Read-ahead for stored zone data (SPEC.md §5.4): a read smaller than the
+//! Read-ahead for stored zone data (SPEC.md §6): a read smaller than the
 //! window fetches the whole aligned window around it with one GET and keeps it
 //! in a small LRU cache, so neighbouring small reads (files written together
 //! lie together in a zone) need no GET of their own.

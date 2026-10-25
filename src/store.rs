@@ -1,7 +1,7 @@
 //! Object storage abstraction: one object per zone plus `disk.json`.
 //!
 //! `MemStore` mirrors the semantics observed on Yandex Object Storage
-//! (see SPEC.md §13.3): PATCH of a missing object fails with "not found",
+//! (see SPEC.md §11): PATCH of a missing object fails with "not found",
 //! PATCH starting past the end of the object fails with "invalid range",
 //! PATCH may overlap the tail and extend the object.
 
@@ -46,7 +46,7 @@ impl Body {
     }
 }
 
-/// Object tag marking a zone closed by FINISH (SPEC.md §4.4). The key carries
+/// Object tag marking a zone closed by FINISH (SPEC.md §3.3). The key carries
 /// the project name so it cannot clash with labels people set by hand.
 pub const FINISHED_TAG: (&str, &str) = ("btrs3fs-zone", "finished");
 

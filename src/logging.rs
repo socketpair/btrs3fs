@@ -1,6 +1,6 @@
 //! Logging: journald, or syslog through /dev/log when journald is absent;
 //! optionally mirrored to stderr (colored when stderr is a terminal).
-//! Never to files (SPEC.md §10).
+//! Never to files (SPEC.md §9.3).
 
 use log::{Log, Metadata, Record};
 use std::path::Path;

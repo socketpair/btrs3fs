@@ -25,7 +25,7 @@ use store::{Body, Layout, MemStore, Store};
 use tokio::runtime::Runtime;
 use zones::Engine;
 
-/// btrfs mount options always used by `mount`: user decision (SPEC.md §10);
+/// btrfs mount options always used by `mount`: user decision (SPEC.md §9.2);
 /// commit=300 makes btrfs commit (and FLUSH) every 5 minutes, so writes merge
 /// into fewer, larger S3 appends.
 const MOUNT_OPTIONS: &str = "noatime,lazytime,commit=300";
@@ -76,7 +76,7 @@ enum Command {
 
 #[derive(Args)]
 struct DiskArgs {
-    /// Credentials file (JSON, see SPEC.md §3.3).
+    /// Credentials file (JSON, see SPEC.md §3.2).
     #[arg(long)]
     creds: PathBuf,
     /// Object key prefix of the disk inside the bucket.
@@ -131,7 +131,7 @@ struct MountArgs {
     read_ahead: ReadAheadArgs,
 }
 
-/// Read-ahead of the device server (SPEC.md §5.4); per run, not in disk.json.
+/// Read-ahead of the device server (SPEC.md §6); per run, not in disk.json.
 #[derive(Args, Clone, Copy)]
 struct ReadAheadArgs {
     /// A read of stored data smaller than this fetches the whole aligned
@@ -396,7 +396,7 @@ fn ublk_dev_id(bdev: &str) -> Option<u32> {
     bdev.strip_prefix("/dev/ublkb")?.parse().ok()
 }
 
-/// Data not covered by a FLUSH is not stored on shutdown (SPEC.md §10).
+/// Data not covered by a FLUSH is not stored on shutdown (SPEC.md §5).
 fn report_discarded(engine: &Engine) {
     let pending = engine.unflushed();
     if pending.is_empty() {

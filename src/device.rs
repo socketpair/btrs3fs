@@ -5,7 +5,7 @@
 //! that need the store (FLUSH, FUA, reads of flushed data, resets, waiting for
 //! buffer room) run on the tokio runtime. The queue thread sleeps in io_uring,
 //! so a tokio completion wakes it through a per-tag eventfd that the IO task
-//! reads with an io_uring READ (SPEC.md §9).
+//! reads with an io_uring READ (SPEC.md §9.1).
 
 use crate::config::{BLOCK_SIZE, DiskConfig};
 use crate::logging::REQUESTS_TARGET;
@@ -73,7 +73,7 @@ pub fn serve(
     let features = UblkCtrl::get_features().context("ublk driver is not available")?;
     // FAIL_IO: if we die, the kernel keeps the disk and fails its I/O instead
     // of removing it with del_gendisk() under a mounted filesystem (SPEC.md
-    // §10, "Смерть демона"). We never recover, USER_RECOVERY only enables it.
+    // §9.4). We never recover, USER_RECOVERY only enables it.
     let needed = (sys::UBLK_F_USER_COPY
         | sys::UBLK_F_ZONED
         | sys::UBLK_F_USER_RECOVERY
@@ -116,7 +116,7 @@ pub fn serve(
         p.basic.physical_bs_shift = BLOCK_SHIFT;
         p.basic.io_min_shift = BLOCK_SHIFT;
         // The kernel sizes writeback I/O by io_opt: with io_opt = 4 KiB btrfs
-        // sent its data as 4 KiB zone appends (SPEC.md §13.3). Zone size is a
+        // sent its data as 4 KiB zone appends (SPEC.md §2). Zone size is a
         // power of two, so the shift is exact.
         p.basic.io_opt_shift = zone_sectors.trailing_zeros() as u8 + SECTOR_SHIFT as u8;
         p.basic.chunk_sectors = zone_sectors;
@@ -128,7 +128,7 @@ pub fn serve(
             ..Default::default()
         };
         // Each tag may have two operations in flight at once: its ublk command
-        // and the eventfd read that waits for tokio (SPEC.md §9).
+        // and the eventfd read that waits for tokio (SPEC.md §9.1).
         dev.tgt.sq_depth = 2 * depth;
         dev.tgt.cq_depth = 2 * depth;
         Ok(())

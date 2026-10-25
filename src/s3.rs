@@ -88,7 +88,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longest silence while waiting for response bytes before the attempt is
 /// retried (an idle timeout, not a limit on the whole transfer). Must exceed
 /// the server's own think time: the slowest PATCH measured was ~30 s, on
-/// objects grown past 20 MB, which 16 MiB zones avoid (SPEC.md §13.3).
+/// objects grown past 20 MB, which 16 MiB zones avoid (SPEC.md §11).
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl S3Store {
@@ -295,7 +295,7 @@ impl S3Store {
 
     /// DeleteObjects: deletes `keys` in batches of `DELETE_BATCH`, up to
     /// `DELETE_PARALLELISM` batches at once; missing keys are not an error.
-    /// Yandex does not require `Content-MD5` here (checked 2026-10-25, SPEC.md §8).
+    /// Yandex does not require `Content-MD5` here (SPEC.md §11).
     pub async fn delete_many(&self, keys: &[String]) -> StoreResult<()> {
         // Futures built up front: a borrowing closure inside the stream would
         // make the future not provably `Send` (a known rustc limitation).
@@ -345,7 +345,7 @@ impl S3Store {
 
     /// PutObjectTagging with `FINISHED_TAG` as the only tag; the data is not
     /// rewritten. It replaces the whole tag set: labels set on a zone object
-    /// by hand are dropped on purpose (user decision, SPEC.md §4.4).
+    /// by hand are dropped on purpose (user decision, SPEC.md §3.3).
     pub async fn mark_finished(&self, key: &str) -> StoreResult<()> {
         let xml = tagging_xml(&[(FINISHED_TAG.0.into(), FINISHED_TAG.1.into())]);
 

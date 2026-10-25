@@ -1,7 +1,7 @@
 //! Zone engine: zone state machine, write buffers and flushing to the store.
 //!
 //! Independent of ublk; offsets and lengths are in bytes. Invariant per zone
-//! (SPEC.md §6): the store holds `[0, flushed)`, RAM chunks hold
+//! (SPEC.md §7): the store holds `[0, flushed)`, RAM chunks hold
 //! `[flushed, data_end)`, everything after `data_end` reads as zeros.
 //! Chunks leave RAM only after the store confirmed them.
 //!
@@ -28,7 +28,7 @@ use tokio::sync::Notify;
 /// the background flusher, tag lookups at start. Judgement call, not
 /// measured: enough to keep a link busy with zone-sized bodies, few enough not
 /// to hit S3 request rate limits; one FLUSH touches 2–4 zones in practice
-/// (`stats`, SPEC.md §10).
+/// (`stats`, SPEC.md §9.3).
 const S3_PARALLELISM: usize = 16;
 
 /// Shared zero-filled buffer for reads past the write pointer; a larger read
@@ -238,7 +238,7 @@ impl Engine {
         Ok(engine)
     }
 
-    /// Enables read-ahead (SPEC.md §5.4); without this call it is off.
+    /// Enables read-ahead (SPEC.md §6); without this call it is off.
     pub fn with_read_ahead(mut self, ra: ReadAhead) -> anyhow::Result<Self> {
         ra.validate(self.zone_size)?;
         self.read_cache = ReadCache::new(ra);
@@ -553,7 +553,7 @@ impl Engine {
 
     /// FINISH: stores the zone data, tags the zone object as finished
     /// (creating an empty object if there is none) and makes the zone FULL.
-    /// Persisting it keeps finished zones FULL after a restart (SPEC.md §4.4).
+    /// Persisting it keeps finished zones FULL after a restart (SPEC.md §3.3).
     pub async fn finish_zone(&self, offset: u64) -> ZResult<()> {
         let (zi, _) = self.locate(offset)?;
         let zone = &self.zones[zi];
@@ -630,7 +630,7 @@ impl Engine {
     }
 
     /// RESET_ALL: all zone objects go in DeleteObjects batches of up to 1000
-    /// keys instead of one DELETE per zone (SPEC.md §4.2).
+    /// keys instead of one DELETE per zone (SPEC.md §4).
     pub async fn reset_all(&self) -> ZResult<()> {
         // Every `upload` lock, so no flush re-creates an object between the
         // delete and the state change. Taken in zone order; nothing else holds
@@ -696,7 +696,7 @@ impl Engine {
     }
 
     /// Uploads zones whenever buffered data exceeds the soft limit, up to
-    /// `S3_PARALLELISM` at once (SPEC.md §5.3). A new upload starts as soon as
+    /// `S3_PARALLELISM` at once (SPEC.md §5). A new upload starts as soon as
     /// one ends, while the data not yet being uploaded is above the limit.
     pub async fn background_flusher(self: Arc<Self>) {
         let mut running = futures_util::stream::FuturesUnordered::new();

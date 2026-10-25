@@ -35,7 +35,7 @@ systemd-journal-logger = "2.2"
 syslog = "7"
 tiny_http = "0.12"
 
-# libublk 0.4.8 + UBLK_F_USER_RECOVERY_FAIL_IO (SPEC.md §10, third_party/libublk/BTRS3FS-PATCH.md)
+# libublk 0.4.8 + UBLK_F_USER_RECOVERY_FAIL_IO (SPEC.md §9.4, third_party/libublk/BTRS3FS-PATCH.md)
 [patch.crates-io]
 libublk = { path = "third_party/libublk" }
 
