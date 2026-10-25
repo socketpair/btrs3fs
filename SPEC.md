@@ -365,6 +365,10 @@ crates.io её ещё нет. Поэтому зависимость — git с �
   под метаданные/system: с лимитом устройства 8 btrfs навсегда виснет на первой записи данных
   (`bugreports/`). Если активных зон при монтировании больше лимита, а устройство лимит
   сообщает — отказ монтирования; без лимита btrfs учёт отключает.
+- Два диска btrs3fs (разные префиксы) в одной ФС: `btrfs device add` работает, `balance
+  -mconvert=raid1 -sconvert=raid1` проходит, scrub чист. Данные в RAID1 — отказ «zoned: data
+  raid1 needs raid-stripe-tree»: в zoned нужен `raid-stripe-tree` (mkfs), а он только при
+  `CONFIG_BTRFS_EXPERIMENTAL`, выключенном в ядре Fedora 7.2 и в btrfs-progs 7.1.
 - Reclaim (`fs/btrfs/{space-info,block-group,zoned}.c`): общий `bg_reclaim_threshold` (75) в
   zoned — «распределено ≥ N %», 0 выключает переработку; статический порог по группам — 75,
   `dynamic_reclaim` целит в 10 нераспределённых зон. Рекомендация — `manual.md` §13.
