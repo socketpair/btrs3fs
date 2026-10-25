@@ -16,11 +16,10 @@ use bytes::Bytes;
 use io_uring::{opcode, types};
 use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
 use libublk::io::{BufDesc, UblkDev, UblkIOCtx, UblkQueue};
-use libublk::{UblkError, UblkFlags, sys, wait_and_handle_io_events};
+use libublk::{UblkError, UblkFlags, UblkRuntime, ops, sys};
 use log::{debug, error, info, trace, warn};
 use std::future::Future;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,12 +34,6 @@ const BLOCK_SHIFT: u8 = BLOCK_SIZE.trailing_zeros() as u8;
 /// that stopped on their own. Judgement call: the reaction delay is invisible
 /// next to the S3 work of stopping, and polling costs nothing.
 const STOP_POLL: Duration = Duration::from_millis(100);
-
-/// io_uring wait timeout of a queue thread, in seconds, before it re-checks
-/// whether all its tasks finished. Value of the rublk zoned target. Requests
-/// and eventfd completions wake the thread at once, so it does not affect
-/// latency; stopping is driven by `kill_dev()` aborting the queue's commands.
-const QUEUE_IDLE_SECS: u64 = 20;
 
 /// ublk features the device cannot work without; there is no fallback
 /// (SPEC.md §10). USER_COPY (6.5): zones require it; ZONED: 6.6;
@@ -163,7 +156,7 @@ pub fn serve(
     let live_queues = Arc::new(AtomicUsize::new(opts.nr_queues as usize));
     let ctx = Arc::new(Ctx { engine, rt });
     let q_live = live_queues.clone();
-    let q_handler = move |qid: u16, dev: &UblkDev| {
+    let q_handler = move |qid: u16, dev: &Arc<UblkDev>| {
         run_queue(qid, dev, &ctx);
         q_live.fetch_sub(1, Ordering::SeqCst);
     };
@@ -306,39 +299,21 @@ pub fn delete(ctrl: &UblkCtrl) {
     }
 }
 
-fn run_queue(qid: u16, dev: &UblkDev, ctx: &Arc<Ctx>) {
-    let q = match UblkQueue::new(qid, dev) {
-        Ok(q) => Rc::new(q),
-        Err(e) => {
-            error!("queue {qid}: setup failed: {e:?}");
-            return;
-        }
-    };
-    let exe = Rc::new(smol::LocalExecutor::new());
-    let tasks: Vec<_> = (0..dev.dev_info.queue_depth)
-        .map(|tag| {
-            let (q, ctx) = (q.clone(), ctx.clone());
-            exe.spawn(async move {
-                match io_task(&q, tag, &ctx).await {
-                    Ok(()) | Err(UblkError::QueueIsDown) => {}
-                    Err(e) => error!("queue {qid} tag {tag}: {e:?}"),
-                }
-            })
-        })
-        .collect();
-
-    let exe2 = exe.clone();
-    smol::block_on(exe.run(async {
-        let run_ops = || while exe2.try_tick() {};
-        let done = || tasks.iter().all(|t| t.is_finished());
-        if let Err(e) = wait_and_handle_io_events(&q, Some(QUEUE_IDLE_SECS), run_ops, done).await {
-            error!("queue {qid}: event loop failed: {e:?}");
-        }
-    }));
+/// Serves one queue: a task per tag on libublk's per-thread runtime, which
+/// logs task errors and ignores the normal stop (`QueueIsDown`).
+fn run_queue(qid: u16, dev: &Arc<UblkDev>, ctx: &Arc<Ctx>) {
+    let ctx = ctx.clone();
+    let res = UblkRuntime::run_io_tasks(dev, qid, move |q, tag| {
+        let ctx = ctx.clone();
+        async move { io_task(&q, tag, &ctx).await }
+    });
+    if let Err(e) = res {
+        error!("queue {qid} failed: {e:?}");
+    }
     debug!("queue {qid} stopped");
 }
 
-async fn io_task(q: &UblkQueue<'_>, tag: u16, ctx: &Ctx) -> Result<(), UblkError> {
+async fn io_task(q: &UblkQueue, tag: u16, ctx: &Ctx) -> Result<(), UblkError> {
     let efd = Arc::new(
         new_eventfd().map_err(|e| UblkError::OtherError(-e.raw_os_error().unwrap_or(libc::EIO)))?,
     );
@@ -368,17 +343,12 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, ctx: &Ctx) -> Result<(), UblkError
 }
 
 /// Returns (result, zone append LBA in sectors).
-async fn handle_io(
-    q: &UblkQueue<'_>,
-    tag: u16,
-    ctx: &Ctx,
-    efd: &Arc<OwnedFd>,
-) -> ZResult<(i32, u64)> {
+async fn handle_io(q: &UblkQueue, tag: u16, ctx: &Ctx, efd: &Arc<OwnedFd>) -> ZResult<(i32, u64)> {
     let iod = *q.get_iod(tag);
     let op = iod.op_flags & 0xff;
     let offset = iod.start_sector << SECTOR_SHIFT;
     let len = (iod.nr_sectors as u64) << SECTOR_SHIFT;
-    let cdev = q.dev.tgt.fds[0];
+    let cdev = q.dev().tgt.fds[0];
     let copy_pos = UblkIOCtx::ublk_user_copy_pos(q.get_qid(), tag, 0);
     let engine = &ctx.engine;
     let _in_flight = STATS.requests.enter();
@@ -396,7 +366,7 @@ async fn handle_io(
             let pieces = engine.read_plan(offset, len)?;
             let bufs = if pieces.iter().any(|p| matches!(p, Piece::Store { .. })) {
                 let e = engine.clone();
-                on_tokio(q, ctx, efd, async move { e.fetch(pieces).await }).await??
+                on_tokio(ctx, efd, async move { e.fetch(pieces).await }).await??
             } else {
                 // RAM and zeros only: completes without awaiting anything.
                 engine.fetch(pieces).await?
@@ -415,7 +385,7 @@ async fn handle_io(
             let data = copy_from_request(cdev, copy_pos, len)?;
             if engine.over_hard_limit() {
                 let e = engine.clone();
-                on_tokio(q, ctx, efd, async move { e.wait_for_room().await }).await?;
+                on_tokio(ctx, efd, async move { e.wait_for_room().await }).await?;
             }
             let append = op == sys::UBLK_IO_OP_ZONE_APPEND;
             let at = engine.write(offset, data, append)?;
@@ -423,20 +393,14 @@ async fn handle_io(
                 STATS.req_fua.inc();
                 let (zi, _) = engine.locate(at)?;
                 let e = engine.clone();
-                on_tokio(
-                    q,
-                    ctx,
-                    efd,
-                    async move { e.flush_zone(zi, Reason::Fua).await },
-                )
-                .await??;
+                on_tokio(ctx, efd, async move { e.flush_zone(zi, Reason::Fua).await }).await??;
             }
             Ok((len as i32, if append { at >> SECTOR_SHIFT } else { 0 }))
         }
         sys::UBLK_IO_OP_FLUSH => {
             STATS.req_flush.inc();
             let e = engine.clone();
-            on_tokio(q, ctx, efd, async move { e.flush_all(Reason::Flush).await }).await??;
+            on_tokio(ctx, efd, async move { e.flush_all(Reason::Flush).await }).await??;
             Ok((0, 0))
         }
         sys::UBLK_IO_OP_REPORT_ZONES => {
@@ -455,19 +419,19 @@ async fn handle_io(
         sys::UBLK_IO_OP_ZONE_FINISH => {
             STATS.req_zone_mgmt.inc();
             let e = engine.clone();
-            on_tokio(q, ctx, efd, async move { e.finish_zone(offset).await }).await??;
+            on_tokio(ctx, efd, async move { e.finish_zone(offset).await }).await??;
             Ok((0, 0))
         }
         sys::UBLK_IO_OP_ZONE_RESET => {
             STATS.req_zone_reset.inc();
             let e = engine.clone();
-            on_tokio(q, ctx, efd, async move { e.reset_zone(offset).await }).await??;
+            on_tokio(ctx, efd, async move { e.reset_zone(offset).await }).await??;
             Ok((0, 0))
         }
         sys::UBLK_IO_OP_ZONE_RESET_ALL => {
             STATS.req_zone_reset.inc();
             let e = engine.clone();
-            on_tokio(q, ctx, efd, async move { e.reset_all().await }).await??;
+            on_tokio(ctx, efd, async move { e.reset_all().await }).await??;
             Ok((0, 0))
         }
         _ => Ok((-libc::EOPNOTSUPP, 0)),
@@ -475,7 +439,7 @@ async fn handle_io(
 }
 
 /// Runs `fut` on the tokio runtime and waits for it from the queue thread.
-async fn on_tokio<T, F>(q: &UblkQueue<'_>, ctx: &Ctx, efd: &Arc<OwnedFd>, fut: F) -> ZResult<T>
+async fn on_tokio<T, F>(ctx: &Ctx, efd: &Arc<OwnedFd>, fut: F) -> ZResult<T>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
@@ -501,7 +465,12 @@ where
     let mut counter = [0u8; 8];
     loop {
         let sqe = opcode::Read::new(types::Fd(efd.as_raw_fd()), counter.as_mut_ptr(), 8).build();
-        let res = q.ublk_submit_sqe(sqe).await;
+        // SAFETY: `counter` lives until the read completes: the op is awaited
+        // right here.
+        let res = match unsafe { ops::submit_sqe(sqe) } {
+            Ok(op) => op.await,
+            Err(e) => return Err(ZoneError::Invalid(format!("eventfd read failed: {e:?}"))),
+        };
         if res == -libc::EINTR {
             continue;
         }

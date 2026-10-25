@@ -7,9 +7,9 @@ license = "MIT"
 
 [dependencies]
 # ublk
-libublk = "0.4.8"
+# main after the merge of UBLK_F_USER_RECOVERY_FAIL_IO (SPEC.md §9.4); 0.5.0 is not on crates.io yet
+libublk = { git = "https://github.com/ublk-org/libublk-rs", rev = "5dff30dff04f7e9b5aae226cad263d62898f315f" }
 io-uring = "0.7.12"
-smol = "2.0.2"
 libc = "0.2"
 
 # async runtime and HTTP/S3
@@ -34,10 +34,6 @@ signal-hook = "0.4"
 systemd-journal-logger = "2.2"
 syslog = "7"
 tiny_http = "0.12"
-
-# libublk 0.4.8 + UBLK_F_USER_RECOVERY_FAIL_IO (SPEC.md §9.4, third_party/libublk/BTRS3FS-PATCH.md)
-[patch.crates-io]
-libublk = { path = "third_party/libublk" }
 
 [profile.release]
 debug = 1

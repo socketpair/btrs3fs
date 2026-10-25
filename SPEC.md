@@ -12,7 +12,7 @@
 
 | Вопрос | Решение | Почему |
 |---|---|---|
-| Язык и ublk | Rust + `libublk` 0.4.8 (копия с правкой в `third_party/libublk`, §9.4) | В `libublk` есть `UBLK_F_ZONED`; эталон — zoned target `rublk`. Go — нет библиотеки ublk с зонами; C (`ublksrv`) — неудобный S3-клиент. |
+| Язык и ublk | Rust + `libublk` из git (`main`, 0.5 до релиза; §9.4) | В `libublk` есть `UBLK_F_ZONED`; эталон — zoned target `rublk`. Go — нет библиотеки ublk с зонами; C (`ublksrv`) — неудобный S3-клиент. |
 | Дозапись в объект | **Yandex PATCH** с `Content-Range` | Стандартный S3 дописывать не умеет; переносимая эмуляция отложена (§13). |
 | S3-клиент | `reqwest` (только HTTP/1.1) + `aws-sigv4` + `quick-xml` | `aws-sdk-s3`, `rust-s3`, `object_store` не умеют PATCH. HTTP/2 гонит всё через одно TCP-соединение: параллельные GET в 3,5 раза медленнее (§12). |
 | Размер зоны | **16 МиБ**, capacity = size, без уплотнения | Степень двойки (ядро, btrfs). PATCH к объекту, выросшему из дозаписей, за ~20 МБ занимает 9–30 с (§12); уплотнение копированием помогает ненадолго — отвергнуто. |
@@ -244,7 +244,7 @@ struct Zone { state: Mutex<ZoneState>, upload: tokio::sync::Mutex<()> }
 ### 9.1. Устройство процесса
 
 ```
- ядро ─ublk─► nr_queues потоков (libublk: свой io_uring + локальный executor)
+ ядро ─ublk─► nr_queues потоков (libublk: свой io_uring + `UblkRuntime`)
                 │ WRITE/APPEND → RAM, ответ сразу; READ из RAM/нулей → ответ сразу
                 │ READ из S3, FLUSH, FUA ──► пул tokio (reqwest → S3)
                 ◄── eventfd «готово» ───────┘
@@ -293,9 +293,9 @@ io_uring (`UblkQueue::ublk_submit_sqe`). Состояние зон — общи�
 сервер поднял бы указатели зон по S3 — позади того, что видит ФС. Штатная остановка не
 меняется.
 
-`libublk` 0.4.8 этот флаг не пропускает: копия в `third_party/libublk` с правкой в одну
-строку через `[patch.crates-io]`, правка отправлена в апстрим. После выхода версии с ней —
-убрать `third_party/` и `[patch]`.
+`libublk` 0.4.8 этот флаг не пропускает; правка принята в апстрим (`main`, будущая 0.5), на
+crates.io её ещё нет. Поэтому зависимость — git с закреплённым `rev` в `Cargo.toml`; после
+выхода 0.5 на crates.io — перейти на версию оттуда.
 
 ---
 
