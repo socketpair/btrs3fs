@@ -5,6 +5,7 @@
 #   bash tools/bench-read.sh [--remount PREFIX]
 # Results go to target/bench-read.txt. Restores both settings at the end.
 set -u
+export LC_ALL=C   # printf and bc agree on the decimal point
 cd "$(dirname "$0")/.."
 M=/mnt/btrs3fs
 FILE=$M/big1g.bin
