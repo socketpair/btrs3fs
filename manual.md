@@ -93,7 +93,7 @@ sudo btrs3fs umount /mnt/data
 | Команда | Назначение |
 |---|---|
 | `create --creds F --prefix P --size S [параметры]` | Создать диск: записать `P/disk.json` и отформатировать в btrfs (zoned). Отказывается, если под префиксом уже есть объекты. Если форматирование не удалось — созданное удаляется. Параметры — §6. |
-| `mount --creds F --prefix P <точка> [-o опции] [--dev-id N] [--queues N] [--stats-port P \| --no-stats] [--read-window W] [--read-cache C]` | Запустить устройство в фоне и смонтировать btrfs с `noatime,lazytime,commit=300`; опции из `-o` добавляются к ним. Возвращается после успешного монтирования. `ssd`/`nossd` указывать незачем: в zoned-режиме btrfs они ни на что не влияют. |
+| `mount --creds F --prefix P <точка> [-o опции] [--dev-id N] [--queues N] [--stats-port P \| --no-stats] [--read-window W] [--read-cache C]` | Запустить устройство в фоне и смонтировать btrfs с `noatime,lazytime,commit=300`; опции из `-o` добавляются к ним. Возвращается после успешного монтирования. `ssd`/`nossd` на размещение данных в zoned-режиме не влияют; `nossd` лишь склеивает одновременные fsync в одну фиксацию журнала (может сократить число FLUSH, не измерено). |
 | `umount <точка>` | Размонтировать и остановить устройство. |
 | `destroy --creds F --prefix P --yes` | Удалить все объекты диска. Сначала размонтируйте диск: команда этого не проверяет. |
 | `run --creds F --prefix P [--dev-id 0] [--queues N] [--stats-port P \| --no-stats] [--read-window W] [--read-cache C]` | Устройство без монтирования, на переднем плане (для systemd, §9). |
