@@ -20,7 +20,7 @@ const PAGE: &str = include_str!("stats.html");
 const KIB: u64 = 1 << 10;
 const MIB: u64 = 1 << 20;
 
-/// Buckets of the upload size histogram: ×4 steps from one block (4 KiB) to
+/// Buckets of the upload and GET size histograms: ×4 steps from one block (4 KiB) to
 /// the largest zone (32 MiB, config::MAX_ZONE_SIZE) — an append is never
 /// smaller than a block nor larger than a zone.
 const SIZE_BOUNDS: &[u64] = &[
@@ -159,6 +159,7 @@ pub struct Stats {
     pub retries: Counter,
     pub zones_per_flush: Histogram,
     pub gets: Counter,
+    pub get_size: Histogram,
     pub get_latency_ms: Histogram,
     pub read_from_s3: Counter,
     pub read_from_ram: Counter,
@@ -189,6 +190,7 @@ pub static STATS: Stats = Stats {
     retries: Counter::new(),
     zones_per_flush: Histogram::new(ZONES_BOUNDS),
     gets: Counter::new(),
+    get_size: Histogram::new(SIZE_BOUNDS),
     get_latency_ms: Histogram::new(LATENCY_BOUNDS_MS),
     read_from_s3: Counter::new(),
     read_from_ram: Counter::new(),
@@ -255,6 +257,7 @@ pub struct Snapshot {
     pub retries: u64,
     pub zones_per_flush: Hist,
     pub gets: u64,
+    pub get_size: Hist,
     pub get_latency_ms: Hist,
     pub read_from_s3: u64,
     pub read_from_ram: u64,
@@ -311,6 +314,7 @@ impl Stats {
             retries: self.retries.get(),
             zones_per_flush: self.zones_per_flush.snapshot(),
             gets: self.gets.get(),
+            get_size: self.get_size.snapshot(),
             get_latency_ms: self.get_latency_ms.snapshot(),
             read_from_s3: self.read_from_s3.get(),
             read_from_ram: self.read_from_ram.get(),

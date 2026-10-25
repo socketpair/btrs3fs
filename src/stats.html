@@ -73,6 +73,7 @@
     <div class="card"><div class="label">Upload size (PUT/PATCH body)</div><table class="hist" id="h-size"></table></div>
     <div class="card"><div class="label">Upload time</div><table class="hist" id="h-uplat"></table></div>
     <div class="card"><div class="label">Zones uploaded per FLUSH</div><table class="hist" id="h-zones"></table></div>
+    <div class="card"><div class="label">GET size (Range)</div><table class="hist" id="h-getsize"></table></div>
     <div class="card"><div class="label">GET time</div><table class="hist" id="h-getlat"></table></div>
   </div>
 
@@ -203,6 +204,8 @@ function render(s, p, dt) {
   $("h-uplat").innerHTML = histRows(s.upload_latency_ms, leLabel(v => v + " ms")) +
     `<tr><td colspan="4">p50 ${quantile(s.upload_latency_ms, .5)} · p90 ${quantile(s.upload_latency_ms, .9)} · p99 ${quantile(s.upload_latency_ms, .99)}</td></tr>`;
   $("h-zones").innerHTML = histRows(s.zones_per_flush, rangeLabel);
+  $("h-getsize").innerHTML = histRows(s.get_size, leLabel(sizeLabel)) +
+    `<tr><td colspan="4">average ${s.gets ? bytes(s.get_size.sum / s.gets) : "–"}</td></tr>`;
   $("h-getlat").innerHTML = histRows(s.get_latency_ms, leLabel(v => v + " ms")) +
     `<tr><td colspan="4">p50 ${quantile(s.get_latency_ms, .5)} · p90 ${quantile(s.get_latency_ms, .9)} · p99 ${quantile(s.get_latency_ms, .99)}</td></tr>`;
 

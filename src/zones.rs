@@ -339,6 +339,7 @@ impl Engine {
                     let started = Instant::now();
                     out.push(self.store.get_range(&key, offset, len).await?);
                     STATS.gets.inc();
+                    STATS.get_size.record(len);
                     STATS.read_from_s3.add(len);
                     STATS
                         .get_latency_ms
