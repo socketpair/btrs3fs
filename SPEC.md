@@ -251,7 +251,7 @@ struct Zone { state: Mutex<ZoneState>, upload: tokio::sync::Mutex<()> }
 ```
 
 Поток очереди спит в io_uring, поэтому tokio будит его через eventfd, зарегистрированный в
-io_uring (`UblkQueue::ublk_submit_sqe`). Состояние зон — общий `Arc<Engine>`.
+io_uring (`libublk::ops::submit_sqe`). Состояние зон — общий `Arc<Engine>`.
 
 ### 9.2. Команды
 
@@ -338,6 +338,9 @@ crates.io её ещё нет. Поэтому зависимость — git с �
   при reclaim. Без флага метаданные пишет mkfs и читают пробы udev/blkid; btrfs читает
   суперблок без флага (отчёт в `bugreports/`). Надёжное правило: `ZONE_APPEND` → данные,
   запрос с флагом → метаданные, запрос без флага тип не задаёт.
+- `libublk` 0.5 (`main` 5dff30d) на ядре 7.2: create, mount, запись, umount, повторный mount —
+  данные целы; `detach --force` при смонтированной ФС — устройство остаётся, прямое чтение
+  получает `EIO`, `umount` убирает устройство, после повторного mount сброшенное цело.
 
 - Версии ядра (по исходникам на git.kernel.org): `queue/wbt_lat_usec`, `queue/max_sectors_kb` —
   с 4.10 и раньше; параметры ublk `io_opt_shift`, `UBLK_IO_F_META` — 6.0; `GET_FEATURES`,
