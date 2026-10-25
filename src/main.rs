@@ -321,8 +321,7 @@ fn open_s3_disk(
 ) -> anyhow::Result<(DiskConfig, Layout, Store)> {
     let creds = config::Creds::load(creds)?;
     let layout = Layout::new(prefix)?;
-    let defaults = DiskConfig::new(0, DiskConfig::DEFAULT_ZONE_SIZE);
-    let s3 = S3Store::new(&creds, transport, RetryPolicy::from_config(&defaults))?;
+    let s3 = S3Store::new(&creds, transport, RetryPolicy::default())?;
     let cfg = rt
         .block_on(load_config(&s3, &layout))?
         .with_context(|| format!("disk {} not found, create it first", layout.config_key()))?;
@@ -435,9 +434,39 @@ struct ServeOptions {
     /// `None` — no statistics page (temporary device of `create`).
     stats: Option<StatsArgs>,
     /// `None` — no tuning (temporary device of `create`): no read-ahead,
-    /// default uploads, kernel limits untouched.
+    /// default uploads, whole-object GETs, btrfs readahead untouched.
     link: Option<Link>,
     read_cache: u64,
+}
+
+impl ServeOptions {
+    /// A device of `run` or `mount`, tuned for the given link.
+    fn device(dev_id: i32, queues: Option<u16>, stats: StatsArgs, link: &LinkArgs) -> Self {
+        Self {
+            dev_id,
+            queues,
+            stats: Some(stats),
+            link: Some(link.link()),
+            read_cache: link.read_cache,
+        }
+    }
+}
+
+/// `serve_disk` for `run` and `mount`: serves until stopped, then removes
+/// the device.
+fn serve_until_stopped(
+    rt: &Runtime,
+    cfg: DiskConfig,
+    layout: Layout,
+    store: Store,
+    serve: ServeOptions,
+    on_ready: device::OnReady,
+) -> anyhow::Result<()> {
+    let (engine, ctrl) = serve_disk(rt, cfg, layout, store, serve, on_ready)?;
+    report_discarded(&engine);
+    device::delete(&ctrl);
+    info!("device removed");
+    Ok(())
 }
 
 /// Port the statistics page actually listens on, once started.
@@ -482,23 +511,8 @@ fn cmd_run(a: RunArgs) -> anyhow::Result<i32> {
         device::sd_notify("READY=1");
         true
     });
-    let (engine, ctrl) = serve_disk(
-        &rt,
-        cfg,
-        layout,
-        store,
-        ServeOptions {
-            dev_id: a.dev_id,
-            queues: a.queues,
-            stats: Some(a.stats),
-            link: Some(a.link.link()),
-            read_cache: a.link.read_cache,
-        },
-        on_ready,
-    )?;
-    report_discarded(&engine);
-    device::delete(&ctrl);
-    info!("device removed");
+    let serve = ServeOptions::device(a.dev_id, a.queues, a.stats, &a.link);
+    serve_until_stopped(&rt, cfg, layout, store, serve, on_ready)?;
     Ok(0)
 }
 
@@ -528,8 +542,8 @@ fn cmd_mount(a: MountArgs, keep_stderr: bool) -> anyhow::Result<i32> {
         "{} is not a directory",
         mountpoint.display()
     );
-    if let Some(m) = find_mount(&mountpoint)? {
-        bail!("{} is already mounted ({})", mountpoint.display(), m.source);
+    if let Some(source) = find_mount(&mountpoint)? {
+        bail!("{} is already mounted ({source})", mountpoint.display());
     }
     let creds = std::fs::canonicalize(&a.disk.creds)
         .with_context(|| format!("credentials file {}", a.disk.creds.display()))?;
@@ -601,24 +615,8 @@ fn mount_daemon(a: &MountArgs, creds: &Path, status: File, keep_stderr: bool) ->
             }
             true
         });
-        let (engine, ctrl) = serve_disk(
-            &rt,
-            cfg,
-            layout,
-            store,
-            ServeOptions {
-                dev_id: a.dev_id,
-                queues: a.queues,
-                stats: Some(a.stats),
-                link: Some(a.link.link()),
-                read_cache: a.link.read_cache,
-            },
-            on_ready,
-        )?;
-        report_discarded(&engine);
-        device::delete(&ctrl);
-        info!("device removed");
-        Ok(())
+        let serve = ServeOptions::device(a.dev_id, a.queues, a.stats, &a.link);
+        serve_until_stopped(&rt, cfg, layout, store, serve, on_ready)
     })();
     match res {
         Ok(()) => 0,
@@ -664,12 +662,8 @@ fn wait_for_path(path: &Path, timeout: Duration) -> anyhow::Result<()> {
     Ok(())
 }
 
-struct MountEntry {
-    source: String,
-}
-
-/// Top-most mount on `mountpoint` from /proc/self/mountinfo.
-fn find_mount(mountpoint: &Path) -> anyhow::Result<Option<MountEntry>> {
+/// Source of the top-most mount on `mountpoint`, from /proc/self/mountinfo.
+fn find_mount(mountpoint: &Path) -> anyhow::Result<Option<String>> {
     let info = std::fs::read_to_string("/proc/self/mountinfo")?;
     let target = mountpoint.to_string_lossy();
     let mut found = None;
@@ -682,9 +676,7 @@ fn find_mount(mountpoint: &Path) -> anyhow::Result<Option<MountEntry>> {
         if let (Some(point), Some(source)) = (point, source)
             && point == target
         {
-            found = Some(MountEntry {
-                source: unescape_mountinfo(source),
-            });
+            found = Some(unescape_mountinfo(source));
         }
     }
     Ok(found)
@@ -715,17 +707,15 @@ fn cmd_umount(a: UmountArgs) -> anyhow::Result<i32> {
     ensure_root("umount")?;
     let mountpoint = std::fs::canonicalize(&a.mountpoint)
         .with_context(|| format!("mount point {}", a.mountpoint.display()))?;
-    let entry = find_mount(&mountpoint)?
+    let source = find_mount(&mountpoint)?
         .with_context(|| format!("{} is not mounted", mountpoint.display()))?;
-    let dev_id = ublk_dev_id(&entry.source)
-        .map(|id| id as i32)
-        .with_context(|| {
-            format!(
-                "{} is mounted from {}, not from a btrs3fs device",
-                mountpoint.display(),
-                entry.source
-            )
-        })?;
+    let dev_id = ublk_dev_id(&source).map(|id| id as i32).with_context(|| {
+        format!(
+            "{} is mounted from {}, not from a btrs3fs device",
+            mountpoint.display(),
+            source
+        )
+    })?;
     let unmounted = Process::new("umount")
         .arg(&mountpoint)
         .status()
@@ -735,7 +725,7 @@ fn cmd_umount(a: UmountArgs) -> anyhow::Result<i32> {
         "umount of {} failed",
         mountpoint.display()
     );
-    info!("unmounted {} ({})", mountpoint.display(), entry.source);
+    info!("unmounted {} ({source})", mountpoint.display());
     detach(dev_id)
 }
 
@@ -943,8 +933,7 @@ fn format_disk(
 
 fn cmd_measure(a: DiskArgs) -> anyhow::Result<i32> {
     let creds = config::Creds::load(&a.creds)?;
-    let defaults = DiskConfig::new(0, DiskConfig::DEFAULT_ZONE_SIZE);
-    let s3 = S3Store::new(&creds, &a.transport, RetryPolicy::from_config(&defaults))?;
+    let s3 = S3Store::new(&creds, &a.transport, RetryPolicy::default())?;
     eprintln!("measuring the link to S3, about 20 s…");
     let measured = runtime()?.block_on(measure::measure(&s3, &a.prefix))?;
     println!("{}", measure::report(&measured));
@@ -957,12 +946,7 @@ fn cmd_destroy(a: DestroyArgs) -> anyhow::Result<i32> {
     }
     let creds = config::Creds::load(&a.disk.creds)?;
     let layout = Layout::new(&a.disk.prefix)?;
-    let defaults = DiskConfig::new(0, DiskConfig::DEFAULT_ZONE_SIZE);
-    let s3 = S3Store::new(
-        &creds,
-        &a.disk.transport,
-        RetryPolicy::from_config(&defaults),
-    )?;
+    let s3 = S3Store::new(&creds, &a.disk.transport, RetryPolicy::default())?;
     let deleted = destroy_prefix(&runtime()?, &s3, &layout)?;
     info!("destroyed {}: {deleted} zone objects deleted", layout.dir());
     Ok(0)

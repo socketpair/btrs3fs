@@ -5,7 +5,10 @@
 //! ListObjectsV2. Bodies are signed as `UNSIGNED-PAYLOAD` (TLS protects them),
 //! so they are streamed from the zone chunks without hashing or concatenation.
 
-use crate::config::{Creds, DiskConfig};
+use crate::config::{
+    Creds, DEFAULT_RETRY_BACKOFF, DEFAULT_RETRY_INITIAL_DELAY_MS, DEFAULT_RETRY_TIMEOUT_SECS,
+    DiskConfig,
+};
 use crate::store::{Body, FINISHED_TAG, ObjectInfo, StoreError, StoreResult};
 use anyhow::{Context, anyhow};
 use aws_credential_types::Credentials;
@@ -38,6 +41,17 @@ pub struct RetryPolicy {
     pub timeout: Duration,
     pub initial_delay: Duration,
     pub backoff_factor: f64,
+}
+
+impl Default for RetryPolicy {
+    /// For requests before disk.json is read, or without a disk at all.
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(DEFAULT_RETRY_TIMEOUT_SECS),
+            initial_delay: Duration::from_millis(DEFAULT_RETRY_INITIAL_DELAY_MS),
+            backoff_factor: DEFAULT_RETRY_BACKOFF,
+        }
+    }
 }
 
 impl RetryPolicy {
