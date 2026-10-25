@@ -1,0 +1,135 @@
+Subject: btrfs: superblock reads are issued without REQ_META, while superblock
+ writes and all other metadata I/O carry it
+
+Suggested recipients (please verify with scripts/get_maintainer.pl
+fs/btrfs/volumes.c fs/btrfs/zoned.c fs/btrfs/scrub.c):
+  To: linux-btrfs@vger.kernel.org
+  Cc: David Sterba <dsterba@suse.com>, Josef Bacik <josef@toxicpanda.com>,
+      Chris Mason <clm@fb.com>, Naohiro Aota <naohiro.aota@wdc.com>,
+      Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+Hi,
+
+Background
+----------
+
+We are building a zoned block device backed by object storage (S3): a ublk
+server (UBLK_F_ZONED | UBLK_F_USER_COPY) that exposes a host-managed zoned
+disk, with one zone mapped to one object. Zoned btrfs runs on top of it.
+
+ublk passes REQ_META to the server as UBLK_IO_F_META
+(ublk_req_build_flags(), drivers/block/ublk_drv.c:485). We wanted to use it
+to tell metadata block groups from data block groups and to cache them
+differently. Before relying on it, we logged every request the kernel sent
+to the device and checked whether the flag is consistent per zone.
+
+It almost is. Every btrfs read and write of tree blocks carries REQ_META,
+superblock writes carry it too, and no data request does. The one exception
+that comes from btrfs itself is the superblock read: btrfs writes the
+superblock with REQ_META, but reads it without the flag.
+
+This is low impact: superblock reads happen at mount and device scan. We are
+reporting it as an inconsistency in case it is not intended. It also matters
+to anything that uses REQ_META as a hint: blktrace ('M'), BFQ,
+bio_issue_as_root_blkg() (block/blk-cgroup.h:248) and wbt REQ_HIPRIO.
+
+Environment
+-----------
+
+  Kernel:      7.2.11-200.fc44.x86_64 (Fedora 44)
+  btrfs-progs: 7.1
+  Device:      ublk, host-managed zoned, 1 GiB, 64 zones x 16 MiB,
+               no open/active zone limits, zone append supported
+  mkfs:        mkfs.btrfs -O zoned /dev/ublkb0   (defaults: metadata DUP,
+               system DUP, data single)
+  mount:       noatime,lazytime,commit=300
+
+Observation
+-----------
+
+Workload: mkfs, mount, cp -a /usr/include, six rounds of writing and
+deleting 3 MiB files (block group reclaim ran: 20 data and 2 metadata block
+groups), umount, mount, cold find and cat of every file. We logged
+op/offset/length/op_flags of every request and grouped them per zone
+between zone resets:
+
+  data block groups (49 zone lifetimes):
+    5832 ZONE_APPEND, all without REQ_META (including relocated data)
+    5549 READ, all without REQ_META
+  metadata/system block groups (11 zone lifetimes):
+    1586 WRITE from btrfs, all with REQ_META (superblock: REQ_META|REQ_FUA)
+     570 READ of tree blocks, all with REQ_META
+
+Exceptions:
+  - mkfs.btrfs and udev/blkid probing read and write without REQ_META. They
+    are user space, so that is expected; not part of this report. (The
+    udev/blkid reads are page cache readahead, op_flags 0x700 =
+    REQ_FAILFAST_*.)
+  - The superblock read by the kernel at mount, op_flags 0 (no REQ_META):
+
+    [09:12:18] READ zone=0 offset=1503232 len=4096 op_flags=0x0
+    [09:12:18] READ zone=0 offset=0       len=65536 op_flags=0x700  (blkid)
+    [09:12:18] READ zone=0 offset=1503232 len=4096 op_flags=0x0
+    [09:12:18] READ zone=0 offset=1503232 len=4096 op_flags=0x0
+
+    Offset 1503232 is the latest superblock in the superblock log zone 0
+    (write pointer - 4 KiB). It is read three times: by the device scan of
+    mount (dmesg: "scanned by mount"), by open_ctree(), and by
+    btrfs_read_disk_super(..., drop_cache=true) from super.c:2354. The
+    superblock writes to the same zone came with REQ_META|REQ_FUA
+    (op_flags 0x2800).
+
+Analysis (based on 7.2.11 sources)
+----------------------------------
+
+Superblock writes build their own bio with metadata flags and bypass the
+page cache on purpose (fs/btrfs/disk-io.c:3933):
+
+    bio = bio_alloc(device->bdev, 1,
+                    REQ_OP_WRITE | REQ_SYNC | REQ_META | REQ_PRIO, GFP_NOFS);
+
+Superblock reads go through the page cache of the block device, which has
+no way to pass REQ_META:
+
+  1. btrfs_read_disk_super(), fs/btrfs/volumes.c:1378:
+         page = read_cache_page_gfp(mapping, bytenr >> PAGE_SHIFT, GFP_NOFS);
+     Used by device scan, open_ctree() (disk-io.c:3411), super.c:2354 and
+     volumes.c:503/1487/2258.
+
+  2. Zoned superblock log, sb_write_pointer() when both log zones are full,
+     fs/btrfs/zoned.c:135:
+         page[i] = read_cache_page_gfp(mapping, bytenr >> PAGE_SHIFT, GFP_NOFS);
+
+  3. Scrub reads the superblock with its own bio, but plain REQ_OP_READ,
+     fs/btrfs/scrub.c:2952:
+         ret = bdev_rw_virt(dev->bdev, physical >> SECTOR_SHIFT, sb,
+                            BTRFS_SUPER_INFO_SIZE, REQ_OP_READ);
+     (We could not run scrub in our setup; this one is from reading the
+     source only.)
+
+Tree block reads, in contrast, use REQ_OP_READ | REQ_META
+(extent_io.c:4226), and tree block writes REQ_OP_WRITE | REQ_META
+(extent_io.c:2437).
+
+Possible fix
+------------
+
+We have not written or tested a patch; these are only ideas.
+
+  - Case 3 is a one-liner, except for a type problem: bdev_rw_virt() takes
+    enum req_op, not blk_opf_t, so REQ_OP_READ | REQ_META cannot be passed
+    through it as is. Either bdev_rw_virt() takes blk_opf_t (it passes op
+    to bio_init(), which already takes blk_opf_t), or scrub open-codes the
+    bio.
+  - Cases 1 and 2 would need the superblock to be read with a bio into a
+    private buffer, the same way the write path already avoids the page
+    cache, e.g. with REQ_OP_READ | REQ_META | REQ_PRIO. That would also make
+    the drop_cache invalidation in btrfs_read_disk_super() unnecessary, but
+    btrfs_release_disk_super() and its callers assume a page cache page, so
+    this is a larger change.
+
+If reading the superblock through the page cache without REQ_META is
+intended, a short comment next to read_cache_page_gfp() would help people
+who rely on REQ_META.
+
+Thanks.
