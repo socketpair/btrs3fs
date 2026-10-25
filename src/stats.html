@@ -214,6 +214,8 @@ function render(s, p, dt) {
     ["PATCH (append)", num(s.uploads_patch), num(d("uploads_patch"))],
     ["reason: FLUSH", num(s.uploads_flush), num(d("uploads_flush"))],
     ["reason: FUA", num(s.uploads_fua), num(d("uploads_fua"))],
+    ["reason: zone full", num(s.uploads_zone_full), num(d("uploads_zone_full"))],
+    ["reason: zone closed", num(s.uploads_zone_closed), num(d("uploads_zone_closed"))],
     ["reason: buffer limit", num(s.uploads_background), num(d("uploads_background"))],
     ["reason: explicit", num(s.uploads_explicit), num(d("uploads_explicit"))],
     ["reason: zone FINISH", num(s.uploads_finish), num(d("uploads_finish"))],

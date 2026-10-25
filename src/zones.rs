@@ -22,7 +22,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 
 /// S3 requests run at once without a link to tune for: tag lookups at start,
 /// and uploads of the temporary `create` device and tests. Judgement call:
@@ -141,6 +141,9 @@ pub struct Engine {
     read_cache: Option<ReadCache>,
     /// Zones uploaded at once by FLUSH and the background flusher.
     uploads: usize,
+    /// `uploads` permits shared by every upload, whatever its reason
+    /// (SPEC.md §5).
+    upload_slots: Semaphore,
 }
 
 impl Engine {
@@ -235,6 +238,7 @@ impl Engine {
             kick: Notify::new(),
             read_cache: None,
             uploads: S3_PARALLELISM,
+            upload_slots: Semaphore::new(S3_PARALLELISM),
         };
         info!("restored {nr_zones} zones: {closed} closed, {full} full, {empty} empty");
         Ok(engine)
@@ -254,9 +258,10 @@ impl Engine {
         Ok(self)
     }
 
-    /// Uploads at once for FLUSH and the background flusher (SPEC.md §6.1).
+    /// Uploads at once, all reasons together (SPEC.md §6.1).
     pub fn with_uploads(mut self, uploads: usize) -> Self {
         self.uploads = uploads.max(1);
+        self.upload_slots = Semaphore::new(self.uploads);
         self
     }
 
@@ -312,13 +317,14 @@ impl Engine {
         st.chunks.push_back(data);
         st.wp += len;
         st.data_end += len;
-        if st.wp == self.zone_size {
+        let full = st.wp == self.zone_size;
+        if full {
             st.cond = Cond::Full;
         }
         drop(st);
 
         let dirty = self.dirty.fetch_add(len, Ordering::SeqCst) + len;
-        if dirty > self.dirty_limit {
+        if full || dirty > self.dirty_limit {
             self.kick.notify_one();
         }
         Ok(zone.start + pos)
@@ -478,6 +484,8 @@ impl Engine {
         let key = self.layout.zone_key(zone.start);
         let started = Instant::now();
         let uploaded = {
+            // Never closed, so acquiring cannot fail.
+            let _slot = self.upload_slots.acquire().await.unwrap();
             let _in_flight = STATS.uploads.enter();
             if from == 0 {
                 self.store.put(&key, body).await
@@ -553,6 +561,9 @@ impl Engine {
                     Cond::Closed
                 };
                 st.cond = to;
+                if st.buffered() > 0 {
+                    self.kick.notify_one();
+                }
                 Ok(())
             }
             Cond::Empty | Cond::Full => invalid(format!("close of {:?} zone {zi}", st.cond)),
@@ -703,27 +714,24 @@ impl Engine {
         }
     }
 
-    /// Uploads zones whenever buffered data exceeds the soft limit, up to
-    /// `uploads` at once (SPEC.md §5). A new upload starts as soon as
-    /// one ends, while the data not yet being uploaded is above the limit.
+    /// Uploads FULL and CLOSED zones at once, and any zones while buffered
+    /// data exceeds the soft limit, up to `uploads` at once (SPEC.md §5).
+    /// A new upload starts as soon as one ends.
     pub async fn background_flusher(self: Arc<Self>) {
         let mut running = futures_util::stream::FuturesUnordered::new();
         let mut busy = vec![false; self.zones.len()];
         // Bytes the running uploads were picked for (buffered at pick time).
         let mut in_flight = 0u64;
         loop {
-            while running.len() < self.uploads
-                && self.dirty_bytes().saturating_sub(in_flight) > self.dirty_limit
-            {
-                let Some((zi, bytes)) = self.background_pick(&busy) else {
+            while running.len() < self.uploads {
+                let over = self.dirty_bytes().saturating_sub(in_flight) > self.dirty_limit;
+                let Some((zi, bytes, reason)) = self.background_pick(&busy, over) else {
                     break;
                 };
                 busy[zi] = true;
                 in_flight += bytes;
                 let engine: &Engine = &self;
-                running.push(async move {
-                    (zi, bytes, engine.flush_zone(zi, Reason::Background).await)
-                });
+                running.push(async move { (zi, bytes, engine.flush_zone(zi, reason).await) });
             }
             if running.is_empty() {
                 // `notify_one` keeps a permit, so a kick sent meanwhile is not lost.
@@ -745,19 +753,29 @@ impl Engine {
         }
     }
 
-    /// Next zone for the background flusher among those not being uploaded:
-    /// FULL zones first — nothing more will be written to them, and a zone
-    /// filled entirely in RAM goes out as one PUT — then the largest buffer.
-    fn background_pick(&self, busy: &[bool]) -> Option<(usize, u64)> {
+    /// Next zone for the background flusher among those not being uploaded,
+    /// with its buffered bytes and the upload reason. FULL and CLOSED zones go
+    /// first and always; open ones only when `over_limit`, the largest buffer
+    /// first.
+    fn background_pick(&self, busy: &[bool], over_limit: bool) -> Option<(usize, u64, Reason)> {
         (0..self.zones.len())
             .filter(|&i| !busy[i])
             .filter_map(|i| {
                 let st = self.zones[i].state.lock().unwrap();
                 let b = st.buffered();
-                (b > 0).then_some(((st.cond == Cond::Full, b), i))
+                let done = match st.cond {
+                    Cond::Full => Some(Reason::ZoneFull),
+                    Cond::Closed => Some(Reason::ZoneClosed),
+                    _ => None,
+                };
+                (b > 0 && (done.is_some() || over_limit)).then_some((
+                    (done.is_some(), b),
+                    i,
+                    done.unwrap_or(Reason::Background),
+                ))
             })
-            .max()
-            .map(|((_, b), i)| (i, b))
+            .max_by_key(|&(key, i, _)| (key, i))
+            .map(|((_, b), i, reason)| (i, b, reason))
     }
 
     pub fn dirty_limit(&self) -> u64 {
@@ -1075,5 +1093,39 @@ mod tests {
         // Uploading the FULL zone alone gets under the limit; the larger open
         // buffer stays in RAM for more appends.
         assert_eq!(e.unflushed(), vec![(1, 60 * B)]);
+    }
+    #[tokio::test]
+    async fn background_flusher_uploads_done_zones_at_once() {
+        let e = Arc::new(engine_with(mem()).await);
+        tokio::spawn(e.clone().background_flusher());
+        e.write(0, blk(1, ZS / B), false).unwrap(); // zone 0: FULL
+        e.write(ZS, blk(2, 8), false).unwrap(); // zone 1: closed below
+        e.close_zone(ZS).unwrap();
+        e.write(2 * ZS, blk(3, 8), false).unwrap(); // zone 2: open
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while e.unflushed().len() > 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // All under the limit: only the open zone waits for more data.
+        assert_eq!(e.unflushed(), vec![(2, 8 * B)]);
+    }
+
+    #[tokio::test]
+    async fn uploads_share_one_limit() {
+        let e = Arc::new(engine_with(mem()).await.with_uploads(2));
+        e.write(0, blk(1, 8), false).unwrap();
+        let taken = e.upload_slots.acquire_many(2).await.unwrap();
+        let flush = tokio::spawn({
+            let e = e.clone();
+            async move { e.flush_all(Reason::Explicit).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!flush.is_finished(), "upload ran without a free slot");
+        drop(taken);
+        flush.await.unwrap().unwrap();
+        assert!(e.unflushed().is_empty());
     }
 }

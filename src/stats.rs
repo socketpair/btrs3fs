@@ -142,6 +142,10 @@ pub enum Reason {
     Fua,
     /// Buffered data above `dirty_limit_bytes`.
     Background,
+    /// Zone became FULL: uploaded at once.
+    ZoneFull,
+    /// Zone was CLOSED: uploaded at once.
+    ZoneClosed,
     /// Explicit flush by btrs3fs itself (`create`).
     Explicit,
     /// Zone FINISH: data is stored before the zone is tagged as finished.
@@ -153,7 +157,7 @@ pub struct Stats {
     pub upload_latency_ms: Histogram,
     pub uploads_put: Counter,
     pub uploads_patch: Counter,
-    pub upload_reason: [Counter; 5],
+    pub upload_reason: [Counter; 7],
     pub uploads: InFlight,
     pub upload_errors: Counter,
     pub retries: Counter,
@@ -187,7 +191,7 @@ pub static STATS: Stats = Stats {
     upload_latency_ms: Histogram::new(LATENCY_BOUNDS_MS),
     uploads_put: Counter::new(),
     uploads_patch: Counter::new(),
-    upload_reason: [const { Counter::new() }; 5],
+    upload_reason: [const { Counter::new() }; 7],
     uploads: InFlight::new(),
     upload_errors: Counter::new(),
     retries: Counter::new(),
@@ -255,6 +259,8 @@ pub struct Snapshot {
     pub uploads_flush: u64,
     pub uploads_fua: u64,
     pub uploads_background: u64,
+    pub uploads_zone_full: u64,
+    pub uploads_zone_closed: u64,
     pub uploads_explicit: u64,
     pub uploads_finish: u64,
     pub uploads_in_flight: u64,
@@ -315,6 +321,8 @@ impl Stats {
             uploads_flush: self.reason(Reason::Flush).get(),
             uploads_fua: self.reason(Reason::Fua).get(),
             uploads_background: self.reason(Reason::Background).get(),
+            uploads_zone_full: self.reason(Reason::ZoneFull).get(),
+            uploads_zone_closed: self.reason(Reason::ZoneClosed).get(),
             uploads_explicit: self.reason(Reason::Explicit).get(),
             uploads_finish: self.reason(Reason::Finish).get(),
             uploads_in_flight: self.uploads.current.load(Relaxed),
