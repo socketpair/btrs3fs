@@ -306,18 +306,11 @@ impl S3Store {
         .await
     }
 
-    /// Adds `FINISHED_TAG` to the object's tags without rewriting the data.
-    /// PutObjectTagging replaces the whole tag set, so tags set by people (the
-    /// "labels" of the Yandex console) are read first and kept.
+    /// PutObjectTagging with `FINISHED_TAG` as the only tag; the data is not
+    /// rewritten. It replaces the whole tag set: labels set on a zone object
+    /// by hand are dropped on purpose (user decision, SPEC.md §4.4).
     pub async fn mark_finished(&self, key: &str) -> StoreResult<()> {
-        let mut tags: Vec<(String, String)> = self
-            .get_tags(key)
-            .await?
-            .into_iter()
-            .filter(|(k, _)| k != FINISHED_TAG.0)
-            .collect();
-        tags.push((FINISHED_TAG.0.into(), FINISHED_TAG.1.into()));
-        let xml = tagging_xml(&tags);
+        let xml = tagging_xml(&[(FINISHED_TAG.0.into(), FINISHED_TAG.1.into())]);
 
         let url = format!("{}?tagging", self.object_url(key));
         let body = Body::new(vec![Bytes::from(xml)]);
@@ -677,7 +670,7 @@ mod bucket_tests {
             Err(StoreError::NotFound(_))
         ));
 
-        // A label set by a person (Yandex console) survives marking the object finished.
+        // Marking replaces the tag set: a label set by hand is dropped.
         let tag_url = format!("{}?tagging", s3.object_url(&key));
         let user = Body::new(vec![Bytes::from(tagging_xml(&[(
             "qwe".into(),
@@ -690,14 +683,9 @@ mod bucket_tests {
         assert!(resp.status().is_success());
         assert!(!s3.is_finished(&key).await.unwrap());
         s3.mark_finished(&key).await.unwrap();
-        let mut tags = s3.get_tags(&key).await.unwrap();
-        tags.sort();
         assert_eq!(
-            tags,
-            vec![
-                ("btrs3fs-zone".to_string(), "finished".to_string()),
-                ("qwe".to_string(), "asd".to_string())
-            ]
+            s3.get_tags(&key).await.unwrap(),
+            vec![("btrs3fs-zone".to_string(), "finished".to_string())]
         );
 
         let listed = s3.list(&format!("{prefix}/")).await.unwrap();
