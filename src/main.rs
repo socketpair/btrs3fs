@@ -894,7 +894,8 @@ fn format_disk(
     let on_ready: device::OnReady = Box::new(move |bdev| {
         info!("formatting {bdev} with zoned btrfs");
         let res = Process::new("mkfs.btrfs")
-            .args(["-O", "zoned", bdev])
+            // No DUP anywhere (SPEC.md §1): system follows the metadata profile.
+            .args(["-O", "zoned", "-d", "single", "-m", "single", bdev])
             .output()
             .context("cannot run mkfs.btrfs")
             .and_then(|out| {
