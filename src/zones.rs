@@ -577,29 +577,61 @@ impl Engine {
         }
     }
 
-    /// Uploads the largest buffers whenever buffered data exceeds the soft limit.
+    /// Uploads zones whenever buffered data exceeds the soft limit, up to
+    /// `S3_PARALLELISM` at once (SPEC.md §5.3). A new upload starts as soon as
+    /// one ends, while the data not yet being uploaded is above the limit.
     pub async fn background_flusher(self: Arc<Self>) {
+        let mut running = futures_util::stream::FuturesUnordered::new();
+        let mut busy = vec![false; self.zones.len()];
+        // Bytes the running uploads were picked for (buffered at pick time).
+        let mut in_flight = 0u64;
         loop {
-            if self.dirty_bytes() <= self.dirty_limit {
+            while running.len() < S3_PARALLELISM
+                && self.dirty_bytes().saturating_sub(in_flight) > self.dirty_limit
+            {
+                let Some((zi, bytes)) = self.background_pick(&busy) else {
+                    break;
+                };
+                busy[zi] = true;
+                in_flight += bytes;
+                let engine: &Engine = &self;
+                running.push(async move {
+                    (zi, bytes, engine.flush_zone(zi, Reason::Background).await)
+                });
+            }
+            if running.is_empty() {
+                // `notify_one` keeps a permit, so a kick sent meanwhile is not lost.
                 self.kick.notified().await;
                 continue;
             }
-            let Some(zi) = self.largest_buffer() else {
-                continue;
-            };
-            if let Err(e) = self.flush_zone(zi, Reason::Background).await {
-                warn!("background flush of zone {zi} failed: {e}");
-                tokio::time::sleep(BACKGROUND_RETRY_PAUSE).await;
+            tokio::select! {
+                Some((zi, bytes, res)) = running.next() => {
+                    busy[zi] = false;
+                    in_flight -= bytes;
+                    if let Err(e) = res {
+                        warn!("background flush of zone {zi} failed: {e}");
+                        tokio::time::sleep(BACKGROUND_RETRY_PAUSE).await;
+                    }
+                }
+                // More data arrived: maybe room for another upload.
+                _ = self.kick.notified() => {}
             }
         }
     }
 
-    fn largest_buffer(&self) -> Option<usize> {
+    /// Next zone for the background flusher among those not being uploaded:
+    /// FULL zones first — nothing more will be written to them, and a zone
+    /// filled entirely in RAM goes out as one PUT — then the largest buffer.
+    fn background_pick(&self, busy: &[bool]) -> Option<(usize, u64)> {
         (0..self.zones.len())
-            .map(|i| (self.zones[i].state.lock().unwrap().buffered(), i))
-            .filter(|&(b, _)| b > 0)
+            .filter(|&i| !busy[i])
+            .filter_map(|i| {
+                let st = self.zones[i].state.lock().unwrap();
+                let b = st.buffered();
+                (b > 0).then_some(((st.cond == Cond::Full, b), i))
+            })
             .max()
-            .map(|(_, i)| i)
+            .map(|((_, b), i)| (i, b))
     }
 
     pub fn dirty_limit(&self) -> u64 {
@@ -834,5 +866,26 @@ mod tests {
         .await
         .unwrap();
         e.wait_for_room().await;
+    }
+
+    #[tokio::test]
+    async fn background_flusher_prefers_full_zones() {
+        let e = Arc::new(engine_with(mem()).await);
+        e.write(0, blk(1, ZS / B - 56), false).unwrap();
+        e.flush_zone(0, Reason::Explicit).await.unwrap();
+        e.write(ZS - 56 * B, blk(1, 56), false).unwrap(); // zone 0: FULL, 56 blocks in RAM
+        e.write(ZS, blk(2, 60), false).unwrap(); // zone 1: open, 60 blocks in RAM
+        tokio::spawn(e.clone().background_flusher());
+        e.kick.notify_one(); // 116 blocks > limit of 64
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while e.dirty_bytes() > 64 * B {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Uploading the FULL zone alone gets under the limit; the larger open
+        // buffer stays in RAM for more appends.
+        assert_eq!(e.unflushed(), vec![(1, 60 * B)]);
     }
 }
