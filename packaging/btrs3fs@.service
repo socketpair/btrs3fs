@@ -2,7 +2,7 @@
 #   CREDS=/etc/btrs3fs/creds.json   credentials file (mode 0600)
 #   PREFIX=disks/main               object key prefix of the disk
 #   DEV_ID=0                        device becomes /dev/ublkb<DEV_ID>
-#   EXTRA_ARGS=                     optional, e.g. "--queues 8 --read-window 1M"
+#   EXTRA_ARGS=                     optional, e.g. the --s3-* flags printed by `btrs3fs measure`
 #
 # Mount through fstab so the filesystem is unmounted before the device stops:
 #   /dev/ublkb0 /mnt/data btrfs noatime,lazytime,commit=300,_netdev,x-systemd.requires=btrs3fs@main.service 0 0

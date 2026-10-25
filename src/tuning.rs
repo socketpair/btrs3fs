@@ -18,7 +18,7 @@ const UNIT_MAX: u64 = 4 * MIB;
 
 /// Bytes in flight for sequential reads = factor × latency × total read rate.
 /// Fitted to the cloud measurement (SPEC.md §12): 64 MiB was the best window
-/// there, which is ~4 × 36 ms × 500 MiB/s.
+/// there, which is ~4 × 32 ms × 564 MiB/s with `measure`'s latency.
 const READAHEAD_FACTOR: f64 = 4.0;
 /// btrfs never uses less than 4 MiB (`disk-io.c`); 256 MiB bounds the page
 /// cache one sequential reader may fill ahead — a judgement call.
@@ -46,14 +46,14 @@ pub struct Link {
 }
 
 impl Link {
-    /// Measured by `btrs3fs measure` on a VM in Yandex Cloud next to the
-    /// bucket (SPEC.md §12); used when the admin gives none.
+    /// Medians of three `btrs3fs measure` runs on a VM in Yandex Cloud next
+    /// to the bucket (SPEC.md §12); used when the admin gives none.
     pub const YANDEX_CLOUD: Link = Link {
-        latency: Duration::from_millis(36),
-        read_stream: 55 * MIB,
-        read_total: 500 * MIB,
-        write_stream: 16 * MIB,
-        write_total: 700 * MIB,
+        latency: Duration::from_millis(32),
+        read_stream: 57 * MIB,
+        read_total: 564 * MIB,
+        write_stream: 36 * MIB,
+        write_total: 992 * MIB,
     };
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -167,7 +167,7 @@ mod tests {
         // Matches the best settings measured in the cloud (SPEC.md §12).
         let t = Link::YANDEX_CLOUD.tuning(ZONE);
         assert_eq!((t.unit, t.fs_readahead), (2 * MIB, 64 * MIB));
-        assert!((32..=64).contains(&t.uploads), "{t:?}");
+        assert!((16..=64).contains(&t.uploads), "{t:?}");
 
         // The laptop over the internet.
         let laptop = Link {

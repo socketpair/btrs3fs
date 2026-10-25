@@ -1,6 +1,7 @@
 mod config;
 mod device;
 mod logging;
+mod measure;
 mod readahead;
 mod s3;
 mod stats;
@@ -74,6 +75,8 @@ enum Command {
     Detach(DetachArgs),
     /// Delete all objects of a disk.
     Destroy(DestroyArgs),
+    /// Measure the link to S3 from this host and print the --s3-* flags for mount/run.
+    Measure(DiskArgs),
 }
 
 #[derive(Args)]
@@ -267,6 +270,7 @@ fn main() {
         Command::Detach(a) if a.force => kill_server(a.dev_id),
         Command::Detach(a) => detach(a.dev_id),
         Command::Destroy(a) => cmd_destroy(a),
+        Command::Measure(a) => cmd_measure(a),
     };
     let code = match res {
         Ok(code) => code,
@@ -929,6 +933,16 @@ fn format_disk(
         .unwrap_or_else(|| Err(anyhow::anyhow!("device stopped before formatting")))?;
     flushed.context("storing the new filesystem failed")?;
     Ok(())
+}
+
+fn cmd_measure(a: DiskArgs) -> anyhow::Result<i32> {
+    let creds = config::Creds::load(&a.creds)?;
+    let defaults = DiskConfig::new(0, DiskConfig::DEFAULT_ZONE_SIZE);
+    let s3 = S3Store::new(&creds, &a.transport, RetryPolicy::from_config(&defaults))?;
+    eprintln!("measuring the link to S3, about 20 s…");
+    let measured = runtime()?.block_on(measure::measure(&s3, &a.prefix))?;
+    println!("{}", measure::report(&measured));
+    Ok(0)
 }
 
 fn cmd_destroy(a: DestroyArgs) -> anyhow::Result<i32> {
