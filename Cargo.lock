@@ -1471,8 +1471,6 @@ dependencies = [
 [[package]]
 name = "libublk"
 version = "0.4.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "212246283957aba80cbd6f04586d19eb57cf94aa49232c2a8a6b25b72c356239"
 dependencies = [
  "async-lock",
  "bitflags 2.13.2",
