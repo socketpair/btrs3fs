@@ -12,6 +12,7 @@
 //! `Zone::state` (sync, never held across `.await`).
 
 use crate::config::{BLOCK_SIZE, DiskConfig};
+use crate::readahead::{ReadAhead, ReadCache};
 use crate::stats::{Reason, STATS, ZoneCounts};
 use crate::store::{Body, Layout, Store, StoreError, StoreResult};
 use bytes::Bytes;
@@ -83,7 +84,16 @@ pub struct ZoneInfo {
 /// A part of a read request.
 #[derive(Debug)]
 pub enum Piece {
-    Store { key: String, offset: u64, len: u64 },
+    Store {
+        key: String,
+        offset: u64,
+        len: u64,
+        /// Zone index and generation, for the read-ahead cache key.
+        zone: usize,
+        generation: u64,
+        /// Stored bytes of the zone when the plan was made.
+        flushed: u64,
+    },
     Mem(Bytes),
     Zero(u64),
 }
@@ -100,6 +110,8 @@ struct ZoneState {
     chunks: VecDeque<Bytes>,
     /// The zone object exists in the store (an empty one for a finished empty zone).
     object: bool,
+    /// Bumped on every RESET; part of the read-ahead cache key.
+    generation: u64,
 }
 
 impl ZoneState {
@@ -126,6 +138,8 @@ pub struct Engine {
     room: Notify,
     /// Wakes the background flusher.
     kick: Notify,
+    /// `None`: read-ahead disabled.
+    read_cache: Option<ReadCache>,
 }
 
 impl Engine {
@@ -201,6 +215,7 @@ impl Engine {
                         flushed: size,
                         chunks: VecDeque::new(),
                         object: obj.is_some(),
+                        generation: 0,
                     }),
                     upload: tokio::sync::Mutex::new(()),
                 }
@@ -217,9 +232,24 @@ impl Engine {
             dirty: AtomicU64::new(0),
             room: Notify::new(),
             kick: Notify::new(),
+            read_cache: None,
         };
         info!("restored {nr_zones} zones: {closed} closed, {full} full, {empty} empty");
         Ok(engine)
+    }
+
+    /// Enables read-ahead (SPEC.md §5.4); without this call it is off.
+    pub fn with_read_ahead(mut self, ra: ReadAhead) -> anyhow::Result<Self> {
+        ra.validate(self.zone_size)?;
+        self.read_cache = ReadCache::new(ra);
+        if let Some(c) = &self.read_cache {
+            info!(
+                "read-ahead: {} byte windows, {} bytes of cache",
+                c.window(),
+                ra.cache
+            );
+        }
+        Ok(self)
     }
 
     /// Zone index and offset inside the zone.
@@ -304,6 +334,9 @@ impl Engine {
                 key: self.layout.zone_key(zone.start),
                 offset: pos,
                 len: n,
+                zone: zi,
+                generation: st.generation,
+                flushed: st.flushed,
             });
             pos += n;
         }
@@ -335,16 +368,24 @@ impl Engine {
         let mut out = Vec::with_capacity(pieces.len());
         for p in pieces {
             match p {
-                Piece::Store { key, offset, len } => {
-                    let started = Instant::now();
-                    out.push(self.store.get_range(&key, offset, len).await?);
-                    STATS.gets.inc();
-                    STATS.get_size.record(len);
-                    STATS.read_from_s3.add(len);
-                    STATS
-                        .get_latency_ms
-                        .record(started.elapsed().as_millis() as u64);
-                }
+                Piece::Store {
+                    key,
+                    offset,
+                    len,
+                    zone,
+                    generation,
+                    flushed,
+                } => match &self.read_cache {
+                    // Only small reads, and only windows wholly stored: they never change.
+                    Some(c)
+                        if len < c.window()
+                            && (offset + len).next_multiple_of(c.window()) <= flushed =>
+                    {
+                        self.read_windows(c, &key, (zone, generation), offset, len, &mut out)
+                            .await?
+                    }
+                    _ => out.push(self.get(&key, offset, len).await?),
+                },
                 Piece::Mem(b) => {
                     STATS.read_from_ram.add(b.len() as u64);
                     out.push(b);
@@ -356,6 +397,54 @@ impl Engine {
             }
         }
         Ok(out)
+    }
+
+    /// One GET, counted in the statistics.
+    async fn get(&self, key: &str, offset: u64, len: u64) -> ZResult<Bytes> {
+        let started = Instant::now();
+        let data = self.store.get_range(key, offset, len).await?;
+        STATS.gets.inc();
+        STATS.get_size.record(len);
+        STATS.read_from_s3.add(len);
+        STATS
+            .get_latency_ms
+            .record(started.elapsed().as_millis() as u64);
+        Ok(data)
+    }
+
+    /// Serves `[offset, offset + len)` of a zone from read-ahead windows,
+    /// fetching the missing ones (one GET per window, shared by concurrent readers).
+    async fn read_windows(
+        &self,
+        cache: &ReadCache,
+        key: &str,
+        (zone, generation): (usize, u64),
+        offset: u64,
+        len: u64,
+        out: &mut Vec<Bytes>,
+    ) -> ZResult<()> {
+        let w = cache.window();
+        let end = offset + len;
+        for wi in offset / w..end.div_ceil(w) {
+            let start = wi * w;
+            let slot = cache.slot((zone, generation, wi));
+            let mut fetched = false;
+            let data = slot
+                .get_or_try_init(|| {
+                    fetched = true;
+                    self.get(key, start, w)
+                })
+                .await?;
+            let (from, to) = (offset.max(start) - start, end.min(start + w) - start);
+            out.push(data.slice(from as usize..to as usize));
+            if fetched {
+                STATS.read_ahead_misses.inc();
+            } else {
+                STATS.read_ahead_hits.inc();
+                STATS.read_from_cache.add(to - from);
+            }
+        }
+        Ok(())
     }
 
     /// Uploads buffered data of one zone. Returns once everything that was
@@ -517,8 +606,10 @@ impl Engine {
     /// Makes the zone EMPTY and drops its buffer; the caller holds `upload`
     /// and has deleted the zone object.
     fn clear_locked(&self, zi: usize) {
-        let dropped = {
+        let (dropped, had_object) = {
             let mut st = self.zones[zi].state.lock().unwrap();
+            let had_object = st.object;
+            st.generation += 1;
             let dropped = st.buffered();
             st.cond = Cond::Empty;
             st.wp = 0;
@@ -526,8 +617,12 @@ impl Engine {
             st.flushed = 0;
             st.chunks.clear();
             st.object = false;
-            dropped
+            (dropped, had_object)
         };
+        // Only stored data is cached.
+        if let (Some(c), true) = (&self.read_cache, had_object) {
+            c.forget_zone(zi);
+        }
         if dropped > 0 {
             self.dirty.fetch_sub(dropped, Ordering::SeqCst);
             self.room.notify_waiters();
@@ -813,6 +908,52 @@ mod tests {
         assert!(obj.is_empty() && store.is_finished("t/0000000000100000").await.unwrap());
         e.reset_zone(ZS).await.unwrap();
         assert!(store.get("t/0000000000100000").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_ahead_windows() {
+        let store = mem();
+        let ra = ReadAhead {
+            window: 4 * B,
+            cache: 64 * B,
+        };
+        let e = engine_with(store.clone())
+            .await
+            .with_read_ahead(ra)
+            .unwrap();
+        let gets = || mem_store(&store).range_gets();
+        let data: Vec<u8> = (0..18 * B).map(|i| (i / B) as u8).collect();
+        let blocks =
+            |from: u64, n: u64| data[(from * B) as usize..((from + n) * B) as usize].to_vec();
+        e.write(0, Bytes::from(data[..(16 * B) as usize].to_vec()), false)
+            .unwrap();
+        e.flush_all(Reason::Explicit).await.unwrap();
+
+        assert_eq!(read(&e, B, B).await, blocks(1, 1)); // fetches window 0 (blocks 0–3)
+        assert_eq!(gets(), 1);
+        assert_eq!(read(&e, 2 * B, B).await, blocks(2, 1)); // from the cache
+        assert_eq!(read(&e, 3 * B, 2 * B).await, blocks(3, 2)); // windows 0 and 1
+        assert_eq!(gets(), 2);
+        assert_eq!(read(&e, 4 * B, 4 * B).await, blocks(4, 4)); // a whole window: plain GET
+        assert_eq!(gets(), 3);
+
+        // The window past the stored data is not cached: it may still grow.
+        e.write(
+            16 * B,
+            Bytes::from(data[(16 * B) as usize..].to_vec()),
+            false,
+        )
+        .unwrap();
+        e.flush_all(Reason::Explicit).await.unwrap();
+        assert_eq!(read(&e, 16 * B, B).await, blocks(16, 1));
+        assert_eq!(read(&e, 17 * B, B).await, blocks(17, 1));
+        assert_eq!(gets(), 5);
+
+        // After RESET the zone's new data is read, not the cached windows.
+        e.reset_zone(0).await.unwrap();
+        e.write(0, blk(9, 8), false).unwrap();
+        e.flush_all(Reason::Explicit).await.unwrap();
+        assert_eq!(read(&e, B, B).await, blk(9, 1).to_vec());
     }
 
     #[tokio::test]

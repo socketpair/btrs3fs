@@ -1,6 +1,7 @@
 mod config;
 mod device;
 mod logging;
+mod readahead;
 mod s3;
 mod stats;
 mod store;
@@ -11,6 +12,7 @@ use bytes::Bytes;
 use clap::{Args, Parser, Subcommand};
 use config::{DiskConfig, parse_size};
 use log::{error, info, warn};
+use readahead::ReadAhead;
 use s3::{RetryPolicy, S3Store, Transport};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -125,6 +127,30 @@ struct MountArgs {
     queues: Option<u16>,
     #[command(flatten)]
     stats: StatsArgs,
+    #[command(flatten)]
+    read_ahead: ReadAheadArgs,
+}
+
+/// Read-ahead of the device server (SPEC.md §5.4); per run, not in disk.json.
+#[derive(Args, Clone, Copy)]
+struct ReadAheadArgs {
+    /// A read of stored data smaller than this fetches the whole aligned
+    /// window around it; must divide the zone size; 0 disables read-ahead
+    /// [default: 256K].
+    #[arg(long, value_parser = parse_size, default_value_t = config::DEFAULT_READ_WINDOW, hide_default_value = true)]
+    read_window: u64,
+    /// RAM for read-ahead windows; 0 disables read-ahead [default: 64M].
+    #[arg(long, value_parser = parse_size, default_value_t = config::DEFAULT_READ_CACHE, hide_default_value = true)]
+    read_cache: u64,
+}
+
+impl ReadAheadArgs {
+    fn settings(self) -> ReadAhead {
+        ReadAhead {
+            window: self.read_window,
+            cache: self.read_cache,
+        }
+    }
 }
 
 /// Statistics web page of the device server.
@@ -166,6 +192,8 @@ struct RunArgs {
     queues: Option<u16>,
     #[command(flatten)]
     stats: StatsArgs,
+    #[command(flatten)]
+    read_ahead: ReadAheadArgs,
     #[command(flatten)]
     transport: Transport,
 }
@@ -273,6 +301,7 @@ fn serve_disk(
         dev_id,
         queues,
         stats: stats_opt,
+        read_ahead,
     } = serve;
     if let Some(q) = queues {
         cfg.nr_queues = q;
@@ -286,7 +315,8 @@ fn serve_disk(
         cfg.zone_size
     );
     let disk = layout.dir();
-    let engine = Arc::new(rt.block_on(Engine::open(&cfg, layout, Arc::new(store)))?);
+    let engine = rt.block_on(Engine::open(&cfg, layout, Arc::new(store)))?;
+    let engine = Arc::new(engine.with_read_ahead(read_ahead)?);
     rt.spawn(engine.clone().background_flusher());
     let opts = device::DeviceOptions {
         dev_id,
@@ -338,6 +368,7 @@ struct ServeOptions {
     queues: Option<u16>,
     /// `None` — no statistics page (temporary device of `create`).
     stats: Option<StatsArgs>,
+    read_ahead: ReadAhead,
 }
 
 /// Port the statistics page actually listens on, once started.
@@ -391,6 +422,7 @@ fn cmd_run(a: RunArgs) -> anyhow::Result<i32> {
             dev_id: a.dev_id,
             queues: a.queues,
             stats: Some(a.stats),
+            read_ahead: a.read_ahead.settings(),
         },
         on_ready,
     )?;
@@ -508,6 +540,7 @@ fn mount_daemon(a: &MountArgs, creds: &Path, status: File, keep_stderr: bool) ->
                 dev_id: a.dev_id,
                 queues: a.queues,
                 stats: Some(a.stats),
+                read_ahead: a.read_ahead.settings(),
             },
             on_ready,
         )?;
@@ -818,6 +851,8 @@ fn format_disk(
             dev_id: -1,
             queues: None,
             stats: None,
+            // mkfs reads next to nothing.
+            read_ahead: ReadAhead::DISABLED,
         },
         on_ready,
     )?;

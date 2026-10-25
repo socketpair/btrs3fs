@@ -47,6 +47,19 @@ pub const DEFAULT_ZONE_SIZE: u64 = 16 << 20;
 /// daemon's RAM; not measured. Per disk, `create --dirty-limit`.
 pub const DEFAULT_DIRTY_LIMIT: u64 = 256 << 20;
 
+/// Read-ahead window: a small read of stored data fetches the aligned window
+/// around it (SPEC.md §5.4). Modelled on a real layout (SPEC.md §13.3): 256 KiB
+/// cuts cold reads of small files from 5354 GETs to 588 for 3 % more bytes,
+/// while a random 4 KiB read costs ~0.2 s instead of ~0.05 s; 1 MiB saves
+/// little more time (161 GETs) but makes that random read ~0.5 s. User
+/// decision 2026-10-25. Per mount, `--read-window`.
+pub const DEFAULT_READ_WINDOW: u64 = 256 << 10;
+
+/// RAM for read-ahead windows. Same model: 64 MiB keeps neighbouring windows
+/// long enough (16 MiB needed 655 GETs instead of 588 at 256 KiB). User
+/// decision 2026-10-25. Per mount, `--read-cache`.
+pub const DEFAULT_READ_CACHE: u64 = 64 << 20;
+
 /// Total time one S3 operation may retry before the request fails with EIO.
 /// Judgement call accepted by the user: long enough to ride out a short network
 /// or S3 hiccup, short enough that a FLUSH does not hang for minutes.

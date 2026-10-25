@@ -8,7 +8,7 @@
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -153,6 +153,7 @@ struct MemObject {
 pub struct MemStore {
     objects: Mutex<BTreeMap<String, MemObject>>,
     fail: AtomicBool,
+    range_gets: AtomicU64,
 }
 
 impl MemStore {
@@ -160,6 +161,12 @@ impl MemStore {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_fail(&self, fail: bool) {
         self.fail.store(fail, Ordering::SeqCst);
+    }
+
+    /// Ranged GETs served so far (tests count requests with it).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn range_gets(&self) -> u64 {
+        self.range_gets.load(Ordering::SeqCst)
     }
 
     fn check_fail(&self) -> StoreResult<()> {
@@ -214,6 +221,7 @@ impl MemStore {
 
     fn get_range(&self, key: &str, offset: u64, len: u64) -> StoreResult<Bytes> {
         self.check_fail()?;
+        self.range_gets.fetch_add(1, Ordering::SeqCst);
         let objects = self.objects.lock().unwrap();
         let data = &objects
             .get(key)

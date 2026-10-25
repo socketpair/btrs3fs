@@ -223,6 +223,8 @@ function render(s, p, dt) {
   table("t-rd", ["", "total", "/s"], [
     ["from S3", bytes(s.read_from_s3), rate(rdRate)],
     ["GET requests", num(s.gets), num(d("gets"))],
+    ["from read-ahead cache", bytes(s.read_from_cache), rate(d("read_from_cache"))],
+    ["read-ahead windows: hits / fetched", `${num(s.read_ahead_hits)} / ${num(s.read_ahead_misses)}`, `${num(d("read_ahead_hits"))} / ${num(d("read_ahead_misses"))}`],
     ["from RAM buffers", bytes(s.read_from_ram), rate(d("read_from_ram"))],
     ["zeros (past write pointer)", bytes(s.read_zeros), rate(d("read_zeros"))],
   ]);
