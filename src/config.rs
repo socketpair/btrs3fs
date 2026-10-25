@@ -60,6 +60,13 @@ pub const DEFAULT_READ_WINDOW: u64 = 256 << 10;
 /// decision 2026-10-25. Per mount, `--read-cache`.
 pub const DEFAULT_READ_CACHE: u64 = 64 << 20;
 
+/// Largest request the kernel sends to the device (`queue/max_sectors_kb`).
+/// Measured (SPEC.md §13.3): btrfs's 4 MiB readahead window then goes out as
+/// 8 requests at once; cold sequential reads 9.4–9.5 MiB/s against 4.3–5.9
+/// at the zone size, about 2 GETs per MiB; 256 KiB was faster (10–13 MiB/s)
+/// for twice the GETs. User decision 2026-10-25. Per mount, `--max-request`.
+pub const DEFAULT_MAX_REQUEST: u64 = 512 << 10;
+
 /// Total time one S3 operation may retry before the request fails with EIO.
 /// Judgement call accepted by the user: long enough to ride out a short network
 /// or S3 hiccup, short enough that a FLUSH does not hang for minutes.

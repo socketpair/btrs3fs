@@ -140,10 +140,10 @@ struct ReadAheadArgs {
     #[arg(long, value_parser = parse_size, default_value_t = config::DEFAULT_READ_WINDOW, hide_default_value = true)]
     read_window: u64,
     /// Largest request the kernel sends to the device (multiple of 4K, up to
-    /// the zone size) [default: zone size]. Smaller requests split a kernel
-    /// readahead window into parallel GETs; writes of metadata are split too.
-    #[arg(long, value_parser = parse_size)]
-    max_request: Option<u64>,
+    /// the zone size) [default: 512K]. Smaller requests split a kernel
+    /// readahead window into parallel GETs; writes are split too.
+    #[arg(long, value_parser = parse_size, default_value_t = config::DEFAULT_MAX_REQUEST, hide_default_value = true)]
+    max_request: u64,
     /// RAM for read-ahead windows; 0 disables read-ahead [default: 64M].
     #[arg(long, value_parser = parse_size, default_value_t = config::DEFAULT_READ_CACHE, hide_default_value = true)]
     read_cache: u64,
@@ -440,7 +440,7 @@ fn cmd_run(a: RunArgs) -> anyhow::Result<i32> {
             queues: a.queues,
             stats: Some(a.stats),
             read_ahead: a.read_ahead.settings(),
-            max_request: a.read_ahead.max_request,
+            max_request: Some(a.read_ahead.max_request),
         },
         on_ready,
     )?;
@@ -559,7 +559,7 @@ fn mount_daemon(a: &MountArgs, creds: &Path, status: File, keep_stderr: bool) ->
                 queues: a.queues,
                 stats: Some(a.stats),
                 read_ahead: a.read_ahead.settings(),
-                max_request: a.read_ahead.max_request,
+                max_request: Some(a.read_ahead.max_request),
             },
             on_ready,
         )?;
