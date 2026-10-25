@@ -46,6 +46,9 @@ pub struct DeviceOptions {
     pub dev_id: i32,
     pub nr_queues: u16,
     pub queue_depth: u16,
+    /// Largest request the kernel sends (`queue/max_sectors_kb`), bytes;
+    /// `None` keeps the zone size.
+    pub max_request: Option<u64>,
 }
 
 struct Ctx {
@@ -139,6 +142,7 @@ pub fn serve(
         q_live.fetch_sub(1, Ordering::SeqCst);
     };
 
+    let max_request = opts.max_request;
     let device_fn = move |ctrl: &UblkCtrl| {
         let bdev = ctrl.get_bdev_path();
         info!(
@@ -147,6 +151,9 @@ pub fn serve(
             ctrl.dev_info().queue_depth
         );
         disable_wbt(&bdev);
+        if let Some(bytes) = max_request {
+            set_max_request(&bdev, bytes);
+        }
         if on_ready(&bdev) {
             loop {
                 if let Some(sig) = signals.pending().next() {
@@ -185,6 +192,21 @@ fn disable_wbt(bdev: &str) {
         // Kernel built without wbt: nothing to disable.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => warn!("cannot disable writeback throttling in {path}: {e}"),
+    }
+}
+
+/// Caps the size of a request the kernel sends to the device (SPEC.md §2).
+/// A readahead window larger than the cap goes out as several requests at
+/// once, i.e. parallel GETs. Only this device is affected; zone append (data)
+/// keeps its own limit, but btrfs mounted afterwards sizes appends by it too.
+fn set_max_request(bdev: &str, bytes: u64) {
+    let Some(name) = bdev.strip_prefix("/dev/") else {
+        return;
+    };
+    let path = format!("/sys/block/{name}/queue/max_sectors_kb");
+    match std::fs::write(&path, (bytes >> 10).to_string()) {
+        Ok(()) => info!("{path}: requests limited to {bytes} bytes"),
+        Err(e) => warn!("cannot limit request size in {path}: {e}"),
     }
 }
 

@@ -139,6 +139,11 @@ struct ReadAheadArgs {
     /// [default: 256K].
     #[arg(long, value_parser = parse_size, default_value_t = config::DEFAULT_READ_WINDOW, hide_default_value = true)]
     read_window: u64,
+    /// Largest request the kernel sends to the device (multiple of 4K, up to
+    /// the zone size) [default: zone size]. Smaller requests split a kernel
+    /// readahead window into parallel GETs; writes of metadata are split too.
+    #[arg(long, value_parser = parse_size)]
+    max_request: Option<u64>,
     /// RAM for read-ahead windows; 0 disables read-ahead [default: 64M].
     #[arg(long, value_parser = parse_size, default_value_t = config::DEFAULT_READ_CACHE, hide_default_value = true)]
     read_cache: u64,
@@ -302,11 +307,20 @@ fn serve_disk(
         queues,
         stats: stats_opt,
         read_ahead,
+        max_request,
     } = serve;
     if let Some(q) = queues {
         cfg.nr_queues = q;
     }
     cfg.validate()?;
+    if let Some(r) = max_request {
+        ensure!(
+            r >= config::BLOCK_SIZE && r % config::BLOCK_SIZE == 0 && r <= cfg.zone_size,
+            "max request {r} must be a multiple of {} up to the zone size {}",
+            config::BLOCK_SIZE,
+            cfg.zone_size
+        );
+    }
     info!(
         "disk {}: {} bytes, {} zones of {} bytes",
         layout.dir(),
@@ -322,6 +336,7 @@ fn serve_disk(
         dev_id,
         nr_queues: cfg.nr_queues,
         queue_depth: cfg.queue_depth,
+        max_request,
     };
 
     // The statistics page starts once the device number is known.
@@ -369,6 +384,8 @@ struct ServeOptions {
     /// `None` — no statistics page (temporary device of `create`).
     stats: Option<StatsArgs>,
     read_ahead: ReadAhead,
+    /// Largest kernel request, bytes; `None` — the zone size.
+    max_request: Option<u64>,
 }
 
 /// Port the statistics page actually listens on, once started.
@@ -423,6 +440,7 @@ fn cmd_run(a: RunArgs) -> anyhow::Result<i32> {
             queues: a.queues,
             stats: Some(a.stats),
             read_ahead: a.read_ahead.settings(),
+            max_request: a.read_ahead.max_request,
         },
         on_ready,
     )?;
@@ -541,6 +559,7 @@ fn mount_daemon(a: &MountArgs, creds: &Path, status: File, keep_stderr: bool) ->
                 queues: a.queues,
                 stats: Some(a.stats),
                 read_ahead: a.read_ahead.settings(),
+                max_request: a.read_ahead.max_request,
             },
             on_ready,
         )?;
@@ -853,6 +872,7 @@ fn format_disk(
             stats: None,
             // mkfs reads next to nothing.
             read_ahead: ReadAhead::DISABLED,
+            max_request: None,
         },
         on_ready,
     )?;
