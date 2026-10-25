@@ -642,9 +642,12 @@ fn detach(dev_id: i32) -> anyhow::Result<i32> {
         Ok(_) => {}
     }
 
-    let pid = ctrl.dev_info().ublksrv_pid;
+    let info = ctrl.dev_info();
+    let pid = info.ublksrv_pid;
+    // In FAIL_IO the server is dead and its pid is stale: do not signal it.
+    let server_dead = info.state == libublk::sys::UBLK_S_DEV_FAIL_IO as u16;
     // SAFETY: plain syscall.
-    if pid <= 0 || unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+    if server_dead || pid <= 0 || unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
         // The server crashed or was killed: the device is dead, only remove it.
         warn!("server process {pid} of device {dev_id} is gone, removing the device");
         ctrl.del_dev()
@@ -662,7 +665,12 @@ fn detach(dev_id: i32) -> anyhow::Result<i32> {
 fn kill_server(dev_id: i32) -> anyhow::Result<i32> {
     let ctrl = libublk::ctrl::UblkCtrl::new_simple(dev_id)
         .with_context(|| format!("ublk device {dev_id} not found"))?;
-    let pid = ctrl.dev_info().ublksrv_pid;
+    let info = ctrl.dev_info();
+    let pid = info.ublksrv_pid;
+    ensure!(
+        info.state != libublk::sys::UBLK_S_DEV_FAIL_IO as u16,
+        "server of device {dev_id} is already dead; unmount the filesystem and run detach"
+    );
     ensure!(pid > 0, "device {dev_id} has no server process");
     warn!("killing server process {pid} of device {dev_id} with SIGKILL");
     // SAFETY: plain syscall.

@@ -54,9 +54,15 @@ pub fn serve(
     on_ready: OnReady,
 ) -> anyhow::Result<UblkCtrl> {
     let features = UblkCtrl::get_features().context("ublk driver is not available")?;
-    let needed = (sys::UBLK_F_USER_COPY | sys::UBLK_F_ZONED) as u64;
+    // FAIL_IO: if we die, the kernel keeps the disk and fails its I/O instead
+    // of removing it with del_gendisk() under a mounted filesystem (SPEC.md
+    // §10, "Смерть демона"). We never recover, USER_RECOVERY only enables it.
+    let needed = (sys::UBLK_F_USER_COPY
+        | sys::UBLK_F_ZONED
+        | sys::UBLK_F_USER_RECOVERY
+        | sys::UBLK_F_USER_RECOVERY_FAIL_IO) as u64;
     if features & needed != needed {
-        bail!("ublk driver lacks zoned/user-copy support (features {features:#x})");
+        bail!("ublk driver lacks zoned/user-copy/recovery-fail-io support (features {features:#x})");
     }
 
     // Register before the device appears so a signal never kills us mid-setup.
