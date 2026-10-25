@@ -93,6 +93,51 @@ pub struct DiskConfig {
     pub retry_backoff_factor: f64,
     pub nr_queues: u16,
     pub queue_depth: u16,
+    /// Disk serial number shown by lsblk (SPEC.md §2); absent in disks
+    /// created before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+    /// World Wide Name shown by lsblk, `0x3` + 15 hex digits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wwn: Option<String>,
+}
+
+/// Longest serial number: it goes into udev properties, a by-id link and
+/// the filesystem label. Judgement call, well above disks' 20 characters.
+const SERIAL_MAX: usize = 64;
+
+/// Serial numbers: letters, digits, `.`, `_`, `-` — safe in udev property
+/// files, device links and labels.
+pub fn validate_serial(s: &str) -> anyhow::Result<()> {
+    ensure!(
+        (1..=SERIAL_MAX).contains(&s.len())
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
+        "serial {s:?} must be 1..={SERIAL_MAX} letters, digits, '.', '_' or '-'"
+    );
+    Ok(())
+}
+
+/// Random serial number: 16 hex digits.
+pub fn random_serial() -> anyhow::Result<String> {
+    Ok(format!("{:016x}", random_u64()?))
+}
+
+/// Random World Wide Name, NAA type 3 (locally assigned): `0x3` + 60 bits.
+pub fn random_wwn() -> anyhow::Result<String> {
+    Ok(format!("0x3{:015x}", random_u64()? >> 4))
+}
+
+fn random_u64() -> anyhow::Result<u64> {
+    let mut buf = [0u8; 8];
+    // SAFETY: the kernel writes at most `buf.len()` bytes into `buf`.
+    let n = unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) };
+    ensure!(
+        n == buf.len() as isize,
+        "getrandom failed: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok(u64::from_ne_bytes(buf))
 }
 
 impl DiskConfig {
@@ -112,6 +157,8 @@ impl DiskConfig {
             retry_backoff_factor: DEFAULT_RETRY_BACKOFF,
             nr_queues: DEFAULT_QUEUES,
             queue_depth: DEFAULT_QUEUE_DEPTH,
+            serial: None,
+            wwn: None,
         }
     }
 
@@ -163,6 +210,17 @@ impl DiskConfig {
             "queue_depth {} must be in 1..={UBLK_MAX_QUEUE_DEPTH}",
             self.queue_depth
         );
+        if let Some(s) = &self.serial {
+            validate_serial(s)?;
+        }
+        if let Some(w) = &self.wwn {
+            ensure!(
+                w.len() == 18
+                    && w.starts_with("0x3")
+                    && w[2..].bytes().all(|b| b.is_ascii_hexdigit()),
+                "wwn {w:?} must be 0x3 followed by 15 hex digits"
+            );
+        }
         Ok(())
     }
 
@@ -253,6 +311,21 @@ pub fn parse_size(s: &str) -> anyhow::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serial_and_wwn() {
+        let mut cfg = DiskConfig::new(10 << 30, DiskConfig::DEFAULT_ZONE_SIZE);
+        cfg.serial = Some(random_serial().unwrap());
+        cfg.wwn = Some(random_wwn().unwrap());
+        cfg.validate().unwrap();
+        assert_eq!(cfg.serial.as_ref().unwrap().len(), 16);
+        assert_eq!(DiskConfig::from_json(&cfg.to_json()).unwrap(), cfg);
+        for bad in ["", "a/b", "a b", &"x".repeat(65)] {
+            assert!(validate_serial(bad).is_err(), "{bad:?}");
+        }
+        cfg.wwn = Some("0x5000000000000001".into());
+        assert!(cfg.validate().is_err());
+    }
 
     #[test]
     fn default_config_is_valid() {

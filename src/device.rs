@@ -194,9 +194,39 @@ pub fn serve(
         }
     };
 
+    write_udev_props(ctrl.dev_info().dev_id, cfg);
     ctrl.run_target(tgt_init, q_handler, device_fn)
         .context("ublk device failed")?;
     Ok(ctrl)
+}
+
+/// Directory of the udev property files (SPEC.md §2).
+const UDEV_PROPS_DIR: &str = "/run/btrs3fs";
+
+fn udev_props_path(dev_id: u32) -> String {
+    format!("{UDEV_PROPS_DIR}/ublkb{dev_id}")
+}
+
+/// Writes what lsblk shows for the device as udev properties, before the
+/// disk appears; the udev rule from setup-permissions.sh imports them
+/// (SPEC.md §2). Without the rule the file is unused.
+fn write_udev_props(dev_id: u32, cfg: &DiskConfig) {
+    let mut props = format!(
+        "ID_MODEL=btrs3fs\nID_REVISION={}\n",
+        env!("BTRS3FS_VERSION")
+    );
+    if let Some(s) = &cfg.serial {
+        props += &format!("ID_SERIAL_SHORT={s}\nID_SERIAL=btrs3fs_{s}\n");
+    }
+    if let Some(w) = &cfg.wwn {
+        props += &format!("ID_WWN={w}\n");
+    }
+    let path = udev_props_path(dev_id);
+    let written =
+        std::fs::create_dir_all(UDEV_PROPS_DIR).and_then(|()| std::fs::write(&path, props));
+    if let Err(e) = written {
+        warn!("cannot write udev properties to {path}: {e}");
+    }
 }
 
 /// Turns off the kernel's writeback throttling (wbt) for the device
@@ -290,6 +320,7 @@ pub fn sd_notify(state: &str) {
 
 /// Removes the stopped device.
 pub fn delete(ctrl: &UblkCtrl) {
+    let _ = std::fs::remove_file(udev_props_path(ctrl.dev_info().dev_id));
     if let Err(e) = ctrl.del_dev() {
         warn!("removing device failed: {e:?}");
     }

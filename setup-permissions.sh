@@ -112,8 +112,12 @@ install() {
 
     echo ublk_drv > "$MODULES_LOAD"
 
+    # Identity for lsblk and /dev/disk/by-id: the daemon writes the properties
+    # to /run/btrs3fs/ublkbN before the disk appears (SPEC.md §2).
     cat > "$UDEV_RULES" <<EOF
 KERNEL=="ublkb[0-9]*", GROUP="$GROUP", MODE="0660"
+KERNEL=="ublkb[0-9]*", TEST=="/run/btrs3fs/%k", IMPORT{file}="/run/btrs3fs/%k"
+KERNEL=="ublkb[0-9]*", ENV{ID_SERIAL_SHORT}=="?*", SYMLINK+="disk/by-id/btrs3fs-\$env{ID_SERIAL_SHORT}"
 EOF
     udevadm control --reload
     modprobe ublk_drv

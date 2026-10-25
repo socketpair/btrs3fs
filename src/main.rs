@@ -47,7 +47,7 @@ const EXIT_REPORT_EVERY: Duration = Duration::from_secs(5);
 
 /// Zoned ublk block device backed by S3, one object per zone.
 #[derive(Parser)]
-#[command(version)]
+#[command(version = env!("BTRS3FS_VERSION"))]
 struct Cli {
     /// Log filter: error, warn, info, debug, trace (env_logger syntax).
     #[arg(long, global = true, default_value = "info,libublk=warn")]
@@ -113,6 +113,9 @@ struct CreateArgs {
     queues: Option<u16>,
     #[arg(long)]
     queue_depth: Option<u16>,
+    /// Disk serial number for lsblk and /dev/disk/by-id [default: 16 random hex digits].
+    #[arg(long)]
+    serial: Option<String>,
 }
 
 #[derive(Args)]
@@ -843,6 +846,11 @@ fn cmd_create(a: CreateArgs) -> anyhow::Result<i32> {
     if let Some(v) = a.queue_depth {
         cfg.queue_depth = v;
     }
+    cfg.serial = Some(match a.serial {
+        Some(s) => s,
+        None => config::random_serial()?,
+    });
+    cfg.wwn = Some(config::random_wwn()?);
     cfg.validate()?;
 
     let creds = config::Creds::load(&a.disk.creds)?;
@@ -890,11 +898,14 @@ fn format_disk(
 ) -> anyhow::Result<()> {
     let mkfs_result = Arc::new(Mutex::new(None));
     let result = mkfs_result.clone();
+    let label = cfg.serial.as_ref().map(|s| format!("on-{s}"));
     let on_ready: device::OnReady = Box::new(move |bdev| {
         info!("formatting {bdev} with zoned btrfs");
         let res = Process::new("mkfs.btrfs")
             // No DUP anywhere (SPEC.md §1): system follows the metadata profile.
-            .args(["-O", "zoned", "-d", "single", "-m", "single", bdev])
+            .args(["-O", "zoned", "-d", "single", "-m", "single"])
+            .args(label.iter().flat_map(|l| ["-L", l.as_str()]))
+            .arg(bdev)
             .output()
             .context("cannot run mkfs.btrfs")
             .and_then(|out| {
