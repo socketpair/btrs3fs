@@ -48,8 +48,9 @@ pub const DEFAULT_ZONE_SIZE: u64 = 16 << 20;
 pub const DEFAULT_DIRTY_LIMIT: u64 = 256 << 20;
 
 /// RAM for read-ahead windows (SPEC.md §6): a memory budget, not a property
-/// of the link. 64 MiB keeps neighbouring windows long enough in the model on
-/// a real file layout (SPEC.md §12). Per mount, `--read-cache`.
+/// of the link. Judgement call: 64 MiB holds 32 windows of 2 MiB (the cloud
+/// window), enough for a cold scan of small files to find its neighbours
+/// (SPEC.md §12). Per mount, `--read-cache`.
 pub const DEFAULT_READ_CACHE: u64 = 64 << 20;
 
 /// Total time one S3 operation may retry before the request fails with EIO.
