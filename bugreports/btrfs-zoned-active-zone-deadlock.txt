@@ -1,0 +1,190 @@
+Subject: btrfs: zoned: permanent writeback hang in cow_file_range() waiting
+ for BTRFS_FS_NEED_ZONE_FINISH when max_active_zones is small
+
+Suggested recipients (please verify with scripts/get_maintainer.pl fs/btrfs/zoned.c):
+  To: linux-btrfs@vger.kernel.org
+  Cc: Naohiro Aota <naohiro.aota@wdc.com>,
+      Johannes Thumshirn <johannes.thumshirn@wdc.com>,
+      David Sterba <dsterba@suse.com>, Josef Bacik <josef@toxicpanda.com>
+
+Hi,
+
+Background
+----------
+
+We are building a zoned block device backed by object storage (S3): a ublk
+server (UBLK_F_ZONED) that exposes a host-managed zoned disk, with one zone
+mapped to one object. Zoned btrfs runs on top of it. The device lets us choose
+the zone limits. On one test disk we set max_active_zones=8, which is exactly
+the minimum btrfs accepts (BTRFS_MIN_ACTIVE_ZONES), and max_open_zones=0
+(no limit).
+
+On that disk btrfs hangs forever on the first buffered write. No data reaches
+the device. Every writer, the flusher and async reclaim end up in D state.
+The hang does not depend on the device: in-flight requests on the disk stay
+at 0 the whole time. Nothing the device does (returning errors, removing the
+disk) can unblock it. In the end the task that holds the folio locks blocks
+umount, sync and the block device removal path forever, so the only way out
+is a reboot.
+
+Environment
+-----------
+
+  Kernel:      7.2.11-200.fc44.x86_64 (Fedora 44)
+  btrfs-progs: 7.1
+  Device:      ublk, host-managed zoned, 1 GiB, 64 zones x 16 MiB,
+               max_active_zones=8, max_open_zones=0,
+               zone append supported (max = zone size)
+  mkfs:        mkfs.btrfs -O zoned /dev/ublkb0   (defaults: metadata DUP,
+               system DUP, data single)
+  mount:       noatime,lazytime,commit=300
+
+Reproducer
+----------
+
+  1. Create a host-managed zoned device with 64 x 16 MiB zones,
+     max_active_zones=8, max_open_zones=0.
+  2. mkfs.btrfs -O zoned <dev>; mount.
+  3. Write a few files with buffered I/O, e.g. 10 files of 3 MiB each
+     (cp or dd), then sync.
+
+Result: the writers and the sync hang. In an earlier run with the same
+configuration we checked the data space_info: bytes_used=0 and
+bytes_may_use around 30 MiB. Data was never allocated and no write request
+was ever issued to the device.
+
+We have not tried null_blk yet, but it should reproduce the same way:
+  modprobe null_blk nr_devices=1 zoned=1 zone_size=16 gb=1 memory_backed=1 \
+                    zone_max_active=8 zone_max_open=0
+
+Hung tasks (from /proc/<pid>/stack)
+-----------------------------------
+
+kworker/u50:6+events_unbound (async metadata reclaim):
+  cow_file_range+0x2fc/0x4c0        <- wait_on_bit_io(NEED_ZONE_FINISH)
+  run_delalloc_cow+0xa0/0x130
+  writepage_delalloc+0x2f8/0x5f0
+  extent_writepage+0x12a/0x3b0
+  extent_write_cache_pages+0x15e/0x4d0
+  btrfs_writepages+0xa5/0x160
+  do_writepages+0xd0/0x160
+  filemap_writeback+0xc2/0xf0
+  start_delalloc_inodes+0x170/0x3f0
+  btrfs_start_delalloc_roots+0x180/0x2a0
+  shrink_delalloc+0x10e/0x2c0
+  flush_space+0x25c/0x300
+  do_async_reclaim_metadata_space+0x8c/0x1d0
+  btrfs_async_reclaim_metadata_space+0x54/0x70
+  process_one_work+0x19e/0x370
+  worker_thread+0x1a6/0x310
+
+kworker/u49:4+flush-btrfs-35 (writeback, waiting for the folios that the
+task above holds locked):
+  folio_wait_bit_common+0x15f/0x360
+  extent_write_cache_pages+0x32d/0x4d0
+  btrfs_writepages+0xa5/0x160
+  do_writepages+0xd0/0x160
+  __writeback_single_inode+0x53/0x250
+  writeback_sb_inodes+0x270/0x530
+  wb_writeback+0x2dd/0x360
+  wb_workfn+0x56/0x180
+
+Offsets resolved with debuginfo: cow_file_range+0x2fc is the
+wait_on_bit_io() at fs/btrfs/inode.c:1425. extent_write_cache_pages+0x32d
+is folio_lock() (include/linux/pagemap.h).
+
+Analysis (based on 7.2.11 sources)
+----------------------------------
+
+1. At mount, btrfs_get_dev_zone_info() counts every open/closed zone as
+   active, including the superblock log zone, and sets
+       active_zones_left = max_active_zones - nactive.
+   On this disk 6 of the 64 zones were non-empty at mount (the device
+   reported them CLOSED), so active_zones_left = 8 - 6 = 2.
+
+2. btrfs_check_active_zone_reservation() sets
+       zinfo->reserved_active_zones = 4 (metadata DUP) + 2 (system DUP) = 6
+   and then subtracts one for each stripe of a metadata/system block group
+   that is already active.
+
+3. A data block group can be activated only if
+       atomic_read(&zinfo->active_zones_left) > reserved_active_zones
+   (btrfs_zone_activate()), or
+       active_zones_left >= 1 + reserved_active_zones
+   (btrfs_can_activate_zone()).
+   With max_active_zones=8, the superblock log zone, the active
+   metadata/system block groups and the reserved slots use up the whole
+   budget, so no data zone can ever be activated. We have not yet captured
+   the exact values of active_zones_left and reserved_active_zones from the
+   hung kernel, but the observed behaviour (no data allocation at all)
+   matches this.
+
+4. find_free_extent() -> can_allocate_chunk_zoned():
+     - btrfs_can_activate_zone() returns false and sets
+       BTRFS_FS_NEED_ZONE_FINISH;
+     - btrfs_zone_finish_one_bg() looks only at active DATA block groups
+       with alloc_offset > 0. There are none, because no data was ever
+       written, so it returns 0;
+     - the allocation fails with -EAGAIN.
+
+5. cow_file_range() handles -EAGAIN on the first iteration by
+       wait_on_bit_io(&fs_info->flags, BTRFS_FS_NEED_ZONE_FINISH,
+                      TASK_UNINTERRUPTIBLE);
+   and then retrying. Only do_zone_finish() clears that bit, and here no
+   zone can ever be finished:
+     - there is no active data block group to finish;
+     - metadata block groups are finished only when they fill up, and
+       metadata does not grow because data cannot be written;
+     - the task that is waiting is the async metadata reclaim worker
+       (flush_space -> shrink_delalloc), which is itself one of the paths
+       expected to make progress on space. In effect the reclaim worker
+       waits for itself.
+   The wait is TASK_UNINTERRUPTIBLE with no timeout, and the locked folios
+   of the range are held for its whole duration.
+
+6. Losing the device does not break the wait. In our case the ublk server
+   was killed (SIGKILL) after the hang. del_gendisk() ->
+   fs_bdev_mark_dead() -> btrfs_remove_bdev() marked the device MISSING
+   ("btrfs device id 1 has gone missing, can not maintain read-write") and
+   took it off fs_devices->alloc_list. Nothing wakes the
+   NEED_ZONE_FINISH waiters, and btrfs_can_activate_zone() now cannot
+   succeed at all, because alloc_list is empty. btrfs_force_shutdown()
+   does not wake them either. The reclaim worker stays stuck holding the
+   folio locks, and that pins:
+     - del_gendisk() (the fallback path in fs_bdev_mark_dead() calls
+       sync_filesystem() under s_umount, which waits for the flusher);
+     - umount (deactivate_super() waits for s_umount);
+     - sync(2) (super_lock());
+   We are reporting that part separately to linux-block, since ublk calls
+   del_gendisk() as a non-surprise removal.
+
+Expected behaviour
+------------------
+
+Either of these would be fine:
+  a) mount refuses, or warns and lowers the reservation, when
+     max_active_zones minus the superblock zones minus
+     reserved_active_zones leaves no room for even one data block group.
+     Right now a value btrfs explicitly accepts (8) makes the filesystem
+     unable to ever write data;
+  b) when an allocation finds that no zone can be activated and
+     btrfs_zone_finish_one_bg() has nothing to finish, cow_file_range()
+     (and the same wait in direct-io.c:194) does not sleep forever and
+     returns -ENOSPC instead. At minimum, a filesystem error, shutdown or
+     the device going missing should wake the NEED_ZONE_FINISH waiters
+     and make them fail.
+
+Questions
+---------
+
+  - Is max_active_zones=8 with DUP metadata meant to be supported? If not,
+    should BTRFS_MIN_ACTIVE_ZONES account for reserved_active_zones?
+  - Is it intended that btrfs_zone_finish_one_bg() never finishes an
+    active metadata block group to make room for data?
+
+We can test patches on this setup, and we can also provide a drgn dump of
+fs_info, zone_info, the active block group list and space_info from the
+live hung kernel.
+
+Thanks,
+Mark Korenberg

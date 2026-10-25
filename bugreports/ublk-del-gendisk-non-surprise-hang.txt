@@ -1,0 +1,161 @@
+Subject: ublk: server death runs del_gendisk() as a non-surprise removal
+ under ub->mutex and ublk_ctl_mutex; a stuck filesystem blocks all ublk
+ control commands forever
+
+Suggested recipients (please verify with scripts/get_maintainer.pl drivers/block/ublk_drv.c):
+  To: Ming Lei <ming.lei@redhat.com>, linux-block@vger.kernel.org
+  Cc: Jens Axboe <axboe@kernel.dk>
+
+Hi,
+
+Background
+----------
+
+We are building a zoned block device backed by object storage (S3): a ublk
+server (UBLK_F_ZONED | UBLK_F_USER_COPY, no recovery flags) with zoned btrfs
+on top of it. In one configuration btrfs hit its own writeback deadlock. One
+btrfs worker sleeps forever, TASK_UNINTERRUPTIBLE, holding folio locks; no
+I/O is involved, and the disk shows 0 in-flight requests. This is being
+reported separately to linux-btrfs.
+
+To recover, we killed the ublk server with SIGKILL, expecting the kernel to
+fail all I/O and remove the disk. It did not. The release path ran
+del_gendisk() as a regular (non-surprise) removal, which went into the
+filesystem's sync_filesystem() while holding ub->mutex. Since then:
+
+  - the disk can never be removed;
+  - the filesystem can never be unmounted;
+  - UBLK_CMD_STOP_DEV / UBLK_CMD_DEL_DEV for that device block forever in
+    D state, and the task stays stuck even after SIGKILL;
+  - because DEL_DEV holds the global ublk_ctl_mutex across that
+    uninterruptible wait, *every* ublk control command for *every* device
+    (ADD_DEV, DEL_DEV, ...) blocks too: no new ublk device can be created
+    on the system until reboot.
+
+In other words, a bug in an unrelated filesystem turns into a system-wide
+ublk outage. Killing the server, the usual "last resort" for a ublk
+device, makes things worse.
+
+Environment
+-----------
+
+  Kernel: 7.2.11-200.fc44.x86_64 (Fedora 44)
+  Device: ublk, 4 queues, depth 128, UBLK_F_ZONED | UBLK_F_USER_COPY,
+          no UBLK_F_USER_RECOVERY*, host-managed zoned, btrfs mounted on it
+
+Sequence
+--------
+
+  00:20:35  btrfs mounted on /dev/ublkb0
+  ...       btrfs writeback deadlocks internally (no I/O to the device)
+  00:32:22  ublk server SIGKILLed
+            kernel: "BTRFS critical (device ublkb0): btrfs device id 1 has
+            gone missing, can not maintain read-write"
+  00:32:26  UBLK_CMD_DEL_DEV (libublk)              -> stuck in D
+  00:40:05  umount -f /mnt/...                      -> stuck in D
+  00:42:38  new ublk server for another disk never got its device created
+            (presumably blocked on ublk_ctl_mutex in ADD_DEV; it was later
+            killed, so we have no stack for it)
+  00:47:42  "ublk del -a 0" (ublksrv)               -> stuck in D, unkillable
+
+Hung tasks (from /proc/<pid>/stack; offsets resolved with debuginfo)
+--------------------------------------------------------------------
+
+kworker/0:2+events  (ublk_ch_release_work_fn, holds ub->mutex and s_umount
+shared):
+  wb_wait_for_completion+0xa3/0x100
+  __writeback_inodes_sb_nr+0xc0/0xf0
+  sync_filesystem+0x2b/0xa0
+  fs_bdev_mark_dead+0x9f/0xc0           <- !surprise -> sync_filesystem()
+  bdev_mark_dead+0x3b/0xa0
+  blk_report_disk_dead+0x8c/0x100       <- called with surprise=false
+  __del_gendisk+0x347/0x3a0
+  del_gendisk+0x90/0xd0
+  ublk_stop_dev_unlocked.part.0+0x3b/0x140 [ublk_drv]
+  ublk_ch_release_work_fn+0x2d1/0x610 [ublk_drv]
+  process_one_work+0x19e/0x370
+  worker_thread+0x1a6/0x310
+
+iou-wrk of the DEL_DEV caller (holds ublk_ctl_mutex, waits for ub->mutex):
+  ublk_remove+0x19/0x80 [ublk_drv]      <- ublk_stop_dev(): mutex_lock(&ub->mutex)
+  ublk_ctrl_del_dev+0x1aa/0x1d0 [ublk_drv]
+  ublk_ctrl_uring_cmd+0x4e8/0x9b0 [ublk_drv]
+  io_uring_cmd+0xd4/0x1b0
+  io_wq_submit_work+0xa2/0x3b0
+  io_wq_worker+0xe2/0x370
+The owning thread got SIGKILL and is stuck in io_wq_put_and_exit(),
+waiting for this worker.
+
+iou-wrk of "ublk del -a 0" (UBLK_CMD_STOP_DEV):
+  ublk_ctrl_uring_cmd+0x410/0x9b0 [ublk_drv]  <- inlined ublk_stop_dev(),
+                                                mutex_lock(&ub->mutex)
+  io_uring_cmd+0xd4/0x1b0
+  io_wq_worker+0xe2/0x370
+
+umount:
+  deactivate_super+0x3a/0x50            <- __super_lock_excl(), s_umount
+  cleanup_mnt+0xfe/0x170
+  task_work_run+0x66/0xa0
+
+/sys/block/ublkb0/inflight: 0 0 (nothing is pending in the driver)
+
+Analysis (based on 7.2.11 sources)
+----------------------------------
+
+1. When the server dies, ublk_ch_release_work_fn() aborts all queues, sets
+   force_abort and then calls ublk_stop_dev_unlocked() -> del_gendisk()
+   with ub->mutex held. The comment above it says forward progress must be
+   guaranteed without depending on ub->mutex, but del_gendisk() can call
+   into the filesystem, which may block indefinitely.
+
+2. GD_DEAD is not set at that point, so __del_gendisk() calls
+   blk_report_disk_dead(disk, false). For btrfs, ->remove_bdev() returns
+   -EIO (single device, cannot stay read-write), so fs_bdev_mark_dead()
+   falls back to
+       if (!surprise)
+               sync_filesystem(sb);
+   under s_umount (shared). Syncing a filesystem whose only device has just
+   lost its server cannot succeed. At best it fails with EIO. At worst, as
+   here, it waits for writeback that is stuck for reasons unrelated to the
+   device, and then it never returns.
+
+   Losing the ublk server is a surprise removal by nature: the backing
+   store is gone. NVMe handles the equivalent case (a dead controller) with
+   nvme_mark_namespaces_dead() -> blk_mark_disk_dead() before removing the
+   namespaces, so that __del_gendisk() skips the non-surprise sync.
+
+3. ublk_ctrl_del_dev() takes the global ublk_ctl_mutex with
+   mutex_lock_killable() and then, inside ublk_remove() -> ublk_stop_dev(),
+   takes ub->mutex with plain mutex_lock(). If ub->mutex is held by a
+   stuck del_gendisk(), the DEL_DEV caller becomes unkillable while holding
+   ublk_ctl_mutex. Every later control command (including ADD_DEV for
+   unrelated devices) then blocks. In our case the second DEL_DEV attempt
+   and, apparently, an ADD_DEV from another server were stuck behind it.
+
+Suggested changes
+-----------------
+
+  a) On server death, when the device is going to be stopped
+     (ublk_nosrv_should_stop_dev()), call blk_mark_disk_dead(disk) before
+     del_gendisk(), preferably without holding ub->mutex. The filesystem
+     then gets a surprise removal (shutdown, no sync), and new I/O fails
+     immediately.
+  b) In ublk_stop_dev(), use mutex_lock_killable(&ub->mutex) (or otherwise
+     avoid sleeping uninterruptibly on ub->mutex) for paths reached from
+     control commands, and do not hold ublk_ctl_mutex across
+     ublk_remove(). One stuck device should not block control of all
+     others.
+  c) Optionally, a control command or sysfs knob to force a surprise
+     removal of a ublk disk (blk_mark_disk_dead()) for administrators to
+     recover from such states without a reboot.
+
+Note that (a) alone does not fix the underlying btrfs hang; the umount
+would still block in btrfs. But it would release ub->mutex and
+ublk_ctl_mutex and keep the rest of the ublk subsystem usable. We can
+also try UBLK_F_USER_RECOVERY_FAIL_IO as a workaround on our side, which
+avoids del_gendisk() on server death altogether.
+
+We can test patches on this setup.
+
+Thanks,
+Mark Korenberg
