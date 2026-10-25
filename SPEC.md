@@ -374,6 +374,13 @@ crates.io её ещё нет. Поэтому зависимость — git с �
   под метаданные/system: с лимитом устройства 8 btrfs навсегда виснет на первой записи данных
   (`bugreports/`). Если активных зон при монтировании больше лимита, а устройство лимит
   сообщает — отказ монтирования; без лимита btrfs учёт отключает.
+- Идентификация (ядро 7.2, systemd-udev Fedora 44, util-linux 2.41): ublk не передаёт ни
+  модель, ни серийный номер, у устройства нет `/sys/block/…/device/`. `lsblk` берёт `MODEL`,
+  `SERIAL`, `WWN`, `REV` из свойств udev (`ID_MODEL_ENC`/`ID_MODEL`, `ID_SERIAL_SHORT`, `ID_WWN`,
+  `ID_REVISION`), `VENDOR`/`TRAN`/`HCTL` — только из sysfs. Пределы длины: метка btrfs —
+  255 байт (`mkfs.btrfs`); имя ссылки udev — 255 байт (`NAME_MAX`), то есть серийный номер в
+  `btrs3fs-<serial>` — до 247 символов, длиннее udev ссылку не создаёт. У настоящих дисков
+  серийный номер — 20 символов (ATA, NVMe, virtio-blk).
 - Два диска btrs3fs (разные префиксы) в одной ФС: `btrfs device add` работает, `balance
   -mconvert=raid1 -sconvert=raid1` проходит, scrub чист. Данные в RAID1 — отказ «zoned: data
   raid1 needs raid-stripe-tree»: в zoned нужен `raid-stripe-tree` (mkfs), а он только при
