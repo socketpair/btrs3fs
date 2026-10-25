@@ -288,13 +288,20 @@ impl S3Store {
         .await
     }
 
-    /// PutObjectTagging: sets `FINISHED_TAG` without rewriting the data.
+    /// Adds `FINISHED_TAG` to the object's tags without rewriting the data.
+    /// PutObjectTagging replaces the whole tag set, so tags set by people (the
+    /// "labels" of the Yandex console) are read first and kept.
     pub async fn mark_finished(&self, key: &str) -> StoreResult<()> {
+        let mut tags: Vec<(String, String)> = self
+            .get_tags(key)
+            .await?
+            .into_iter()
+            .filter(|(k, _)| k != FINISHED_TAG.0)
+            .collect();
+        tags.push((FINISHED_TAG.0.into(), FINISHED_TAG.1.into()));
+        let xml = tagging_xml(&tags);
+
         let url = format!("{}?tagging", self.object_url(key));
-        let xml = format!(
-            "<Tagging><TagSet><Tag><Key>{}</Key><Value>{}</Value></Tag></TagSet></Tagging>",
-            FINISHED_TAG.0, FINISHED_TAG.1
-        );
         let body = Body::new(vec![Bytes::from(xml)]);
         self.with_retries(&format!("PUT {key}?tagging"), || async {
             let headers = [("content-type", "application/xml".to_string())];
@@ -306,8 +313,8 @@ impl S3Store {
         .await
     }
 
-    /// GetObjectTagging: whether the object carries `FINISHED_TAG`.
-    pub async fn is_finished(&self, key: &str) -> StoreResult<bool> {
+    /// GetObjectTagging: all tags of the object as (key, value).
+    async fn get_tags(&self, key: &str) -> StoreResult<Vec<(String, String)>> {
         let url = format!("{}?tagging", self.object_url(key));
         self.with_retries(&format!("GET {key}?tagging"), || async {
             let resp = self.send(reqwest::Method::GET, &url, &[], None).await?;
@@ -315,9 +322,22 @@ impl S3Store {
             let tagging: Tagging = quick_xml::de::from_str(&xml).map_err(|e| {
                 Attempt::Fatal(anyhow!("cannot parse tagging response: {e}").into())
             })?;
-            Ok(tagging.tag_set.has_finished())
+            Ok(tagging
+                .tag_set
+                .tags
+                .into_iter()
+                .map(|t| (t.key, t.value))
+                .collect())
         })
         .await
+    }
+
+    /// GetObjectTagging: whether the object carries `FINISHED_TAG`.
+    pub async fn is_finished(&self, key: &str) -> StoreResult<bool> {
+        let tags = self.get_tags(key).await?;
+        Ok(tags
+            .iter()
+            .any(|(k, v)| k == FINISHED_TAG.0 && v == FINISHED_TAG.1))
     }
 
     pub async fn list(&self, prefix: &str) -> StoreResult<Vec<ObjectInfo>> {
@@ -396,6 +416,20 @@ struct Tag {
 struct Tagging {
     #[serde(default)]
     tag_set: TagSet,
+}
+
+/// PutObjectTagging request body.
+fn tagging_xml(tags: &[(String, String)]) -> String {
+    let mut xml = String::from("<Tagging><TagSet>");
+    for (k, v) in tags {
+        xml.push_str(&format!(
+            "<Tag><Key>{}</Key><Value>{}</Value></Tag>",
+            quick_xml::escape::escape(k.as_str()),
+            quick_xml::escape::escape(v.as_str())
+        ));
+    }
+    xml.push_str("</TagSet></Tagging>");
+    xml
 }
 
 /// Maps the HTTP status to success, a retryable or a fatal error.
@@ -517,6 +551,30 @@ mod tests {
     }
 
     #[test]
+    fn tagging_body_keeps_and_escapes_tags() {
+        let xml = tagging_xml(&[
+            ("qwe".into(), "a<b&c".into()),
+            (FINISHED_TAG.0.into(), FINISHED_TAG.1.into()),
+        ]);
+        let parsed: Tagging = quick_xml::de::from_str(&xml).unwrap();
+        let tags: Vec<(String, String)> = parsed
+            .tag_set
+            .tags
+            .into_iter()
+            .map(|t| (t.key, t.value))
+            .collect();
+        assert_eq!(tags[0], ("qwe".to_string(), "a<b&c".to_string()));
+        assert!(parsed_has_finished(&xml));
+    }
+
+    fn parsed_has_finished(xml: &str) -> bool {
+        quick_xml::de::from_str::<Tagging>(xml)
+            .unwrap()
+            .tag_set
+            .has_finished()
+    }
+
+    #[test]
     fn error_summary() {
         let body = "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>";
         assert_eq!(
@@ -596,6 +654,29 @@ mod bucket_tests {
             s3.get(&format!("{prefix}/none")).await,
             Err(StoreError::NotFound(_))
         ));
+
+        // A label set by a person (Yandex console) survives marking the object finished.
+        let tag_url = format!("{}?tagging", s3.object_url(&key));
+        let user = Body::new(vec![Bytes::from(tagging_xml(&[(
+            "qwe".into(),
+            "asd".into(),
+        )]))]);
+        let resp = s3
+            .send(reqwest::Method::PUT, &tag_url, &[], Some(&user))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        assert!(!s3.is_finished(&key).await.unwrap());
+        s3.mark_finished(&key).await.unwrap();
+        let mut tags = s3.get_tags(&key).await.unwrap();
+        tags.sort();
+        assert_eq!(
+            tags,
+            vec![
+                ("btrs3fs-zone".to_string(), "finished".to_string()),
+                ("qwe".to_string(), "asd".to_string())
+            ]
+        );
 
         let listed = s3.list(&format!("{prefix}/")).await.unwrap();
         assert_eq!(listed.len(), 1);
