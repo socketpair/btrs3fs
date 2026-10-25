@@ -132,7 +132,8 @@ pub struct Engine {
     kick: Notify,
     /// `None`: read-ahead disabled.
     read_cache: Option<ReadCache>,
-    /// Zones uploaded at once by FLUSH and the background flusher.
+    /// Uploads at once, all reasons together; also how many zones FLUSH and
+    /// the background flusher start at once.
     uploads: usize,
     /// `uploads` permits shared by every upload, whatever its reason
     /// (SPEC.md §5).

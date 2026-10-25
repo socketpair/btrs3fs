@@ -152,12 +152,17 @@ pub enum Reason {
     Finish,
 }
 
+impl Reason {
+    /// Number of reasons: `Finish` is the last one.
+    const COUNT: usize = Reason::Finish as usize + 1;
+}
+
 pub struct Stats {
     pub upload_size: Histogram,
     pub upload_latency_ms: Histogram,
     pub uploads_put: Counter,
     pub uploads_patch: Counter,
-    pub upload_reason: [Counter; 7],
+    pub upload_reason: [Counter; Reason::COUNT],
     pub uploads: InFlight,
     pub upload_errors: Counter,
     pub retries: Counter,
@@ -191,7 +196,7 @@ pub static STATS: Stats = Stats {
     upload_latency_ms: Histogram::new(LATENCY_BOUNDS_MS),
     uploads_put: Counter::new(),
     uploads_patch: Counter::new(),
-    upload_reason: [const { Counter::new() }; 7],
+    upload_reason: [const { Counter::new() }; Reason::COUNT],
     uploads: InFlight::new(),
     upload_errors: Counter::new(),
     retries: Counter::new(),
