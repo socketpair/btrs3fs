@@ -9,7 +9,6 @@ license = "MIT"
 # ublk
 # main after the merge of UBLK_F_USER_RECOVERY_FAIL_IO (SPEC.md §9.4); 0.5.0 is not on crates.io yet
 libublk = { git = "https://github.com/ublk-org/libublk-rs", rev = "5dff30dff04f7e9b5aae226cad263d62898f315f" }
-io-uring = "0.7.12"
 libc = "0.2"
 
 # async runtime and HTTP/S3

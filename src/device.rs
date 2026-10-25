@@ -13,9 +13,9 @@ use crate::stats::{Reason, STATS};
 use crate::zones::{Cond, Engine, Piece, ZResult, ZoneError};
 use anyhow::{Context, bail};
 use bytes::Bytes;
-use io_uring::{opcode, types};
 use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
 use libublk::io::{BufDesc, UblkDev, UblkIOCtx, UblkQueue};
+use libublk::io_uring::{opcode, types};
 use libublk::{UblkError, UblkFlags, UblkRuntime, ops, sys};
 use log::{debug, error, info, trace, warn};
 use std::future::Future;
@@ -335,7 +335,7 @@ async fn io_task(q: &UblkQueue, tag: u16, ctx: &Ctx) -> Result<(), UblkError> {
                     error!("I/O error: {e}");
                     STATS.req_errors.inc();
                 }
-                (-e.errno(), 0)
+                (-libc::EIO, 0)
             }
         };
         q.submit_io_commit_cmd(tag, BufDesc::ZonedAppendLba(lba), res)

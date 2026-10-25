@@ -64,7 +64,7 @@ pub enum Store {
 
 impl Store {
     /// Whole object, `None` if it does not exist.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub async fn get(&self, key: &str) -> StoreResult<Option<Bytes>> {
         let res = match self {
             Store::Mem(m) => m.get(key),
@@ -158,13 +158,13 @@ pub struct MemStore {
 
 impl MemStore {
     /// Makes every subsequent operation fail (failure injection for tests).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn set_fail(&self, fail: bool) {
         self.fail.store(fail, Ordering::SeqCst);
     }
 
     /// Ranged GETs served so far (tests count requests with it).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn range_gets(&self) -> u64 {
         self.range_gets.load(Ordering::SeqCst)
     }
@@ -176,6 +176,7 @@ impl MemStore {
         Ok(())
     }
 
+    #[cfg(test)]
     fn get(&self, key: &str) -> StoreResult<Bytes> {
         self.check_fail()?;
         let objects = self.objects.lock().unwrap();

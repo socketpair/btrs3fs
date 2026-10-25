@@ -57,13 +57,6 @@ pub enum ZoneError {
     Store(#[from] StoreError),
 }
 
-impl ZoneError {
-    /// Errno reported to the kernel.
-    pub fn errno(&self) -> i32 {
-        libc::EIO
-    }
-}
-
 pub type ZResult<T> = Result<T, ZoneError>;
 
 fn invalid<T>(msg: String) -> ZResult<T> {

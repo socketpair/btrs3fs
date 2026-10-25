@@ -309,7 +309,6 @@ dependencies = [
  "env_logger",
  "futures-util",
  "http",
- "io-uring",
  "libc",
  "libublk",
  "log",
