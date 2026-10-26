@@ -409,7 +409,9 @@ fn serve_disk(
             let device = bdev.to_string();
             let fs = Arc::new(btrfs::Btrfs::new(device.trim_start_matches("/dev/")));
             let json_fs = fs.clone();
+            let snap_fs = fs.clone();
             let act_engine = stats_engine.clone();
+            let map_engine = stats_engine.clone();
             let snapshot = move || {
                 let (zones, dirty_zones) = stats_engine.zone_summary();
                 stats::STATS.snapshot(stats::DiskState {
@@ -422,6 +424,8 @@ fn serve_disk(
                     dirty_hard_limit: stats_engine.hard_limit(),
                     dirty_zones,
                     zones,
+                    uploads_limit: stats_engine.uploads_limit() as u64,
+                    read_only: snap_fs.read_only(),
                 })
             };
             let act_rt = act_rt.clone();
@@ -451,6 +455,7 @@ fn serve_disk(
             let json = move |name: &str| match name {
                 "stats.json" => serde_json::to_string(&snapshot()).ok(),
                 "btrfs.json" => serde_json::to_string(&json_fs.info()).ok(),
+                "zones.json" => serde_json::to_string(&map_engine.zone_map()).ok(),
                 _ => None,
             };
             match stats::serve_http(port, json, action) {

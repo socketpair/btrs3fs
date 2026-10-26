@@ -334,6 +334,7 @@ async fn io_task(q: &UblkQueue, tag: u16, ctx: &Ctx) -> Result<(), UblkError> {
                 if !matches!(e, ZoneError::Invalid(_)) {
                     error!("I/O error: {e}");
                     STATS.req_errors.inc();
+                    STATS.err_io.record(&e);
                 }
                 (-libc::EIO, 0)
             }
@@ -390,6 +391,7 @@ async fn handle_io(q: &UblkQueue, tag: u16, ctx: &Ctx, efd: &Arc<OwnedFd>) -> ZR
             // data (SPEC.md §5).
             if !engine.try_reserve(len) {
                 let e = engine.clone();
+                let _waiting = STATS.writes_waiting.enter();
                 on_tokio(ctx, efd, async move { e.reserve(len).await }).await?;
             }
             let append = op == sys::UBLK_IO_OP_ZONE_APPEND;

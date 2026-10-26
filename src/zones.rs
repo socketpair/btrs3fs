@@ -82,6 +82,21 @@ pub struct ZoneInfo {
     pub cond: Cond,
 }
 
+/// `/zones.json`: per zone, in zone order. Sizes in blocks keep it small.
+#[derive(serde::Serialize)]
+pub struct ZoneMap {
+    pub zone_size: u64,
+    pub block_size: u64,
+    /// One letter per zone: `e`mpty, `o`pen, `c`losed, `f`ull.
+    pub cond: String,
+    /// Blocks holding data (stored or in RAM).
+    pub used: Vec<u32>,
+    /// S3 objects serving the zone.
+    pub objects: Vec<u32>,
+    /// Blocks in RAM, not stored yet.
+    pub buffered: Vec<u32>,
+}
+
 /// A part of a read request.
 #[derive(Debug)]
 pub enum Piece {
@@ -598,7 +613,16 @@ impl Engine {
     /// One GET, counted in the statistics.
     async fn get(&self, key: &str, offset: u64, len: u64) -> ZResult<Bytes> {
         let started = Instant::now();
-        let data = self.store.get_range(key, offset, len).await?;
+        let data = self
+            .store
+            .get_range(key, offset, len)
+            .await
+            // 404 is no error on a SEGMENTS disk: a concatenated segment, read anew.
+            .inspect_err(|e| {
+                if !matches!(e, StoreError::NotFound(_)) {
+                    STATS.err_read.record(e)
+                }
+            })?;
         STATS.gets.inc();
         STATS.get_size.record(len);
         STATS.read_from_s3.add(len);
@@ -683,6 +707,7 @@ impl Engine {
         };
         if let Err(e) = uploaded {
             STATS.upload_errors.inc();
+            STATS.err_upload.record(&e);
             return Err(e.into());
         }
         STATS
@@ -1119,6 +1144,7 @@ impl Engine {
                     busy[zi] = false;
                     if let Err(e) = res {
                         STATS.compact_errors.inc();
+                        STATS.err_compact.record(&e);
                         warn!("concatenation of zone {zi} failed: {e}");
                         tokio::time::sleep(BACKGROUND_RETRY_PAUSE).await;
                     }
@@ -1226,6 +1252,37 @@ impl Engine {
 
     pub fn dirty_limit(&self) -> u64 {
         self.dirty_limit
+    }
+
+    /// Uploads allowed at once.
+    pub fn uploads_limit(&self) -> usize {
+        self.uploads
+    }
+
+    /// Every zone for the zone map of the page (SPEC.md §9.3).
+    pub fn zone_map(&self) -> ZoneMap {
+        let n = self.zones.len();
+        let mut m = ZoneMap {
+            zone_size: self.zone_size,
+            block_size: BLOCK_SIZE,
+            cond: String::with_capacity(n),
+            used: Vec::with_capacity(n),
+            objects: Vec::with_capacity(n),
+            buffered: Vec::with_capacity(n),
+        };
+        for z in &self.zones {
+            let st = z.state.lock().unwrap();
+            m.cond.push(match st.cond {
+                Cond::Empty => 'e',
+                Cond::ImpOpen | Cond::ExpOpen => 'o',
+                Cond::Closed => 'c',
+                Cond::Full => 'f',
+            });
+            m.used.push((st.data_end / BLOCK_SIZE) as u32);
+            m.objects.push(st.objects.len() as u32);
+            m.buffered.push((st.buffered() / BLOCK_SIZE) as u32);
+        }
+        m
     }
 
     /// Zone conditions, filling, fragmentation and the concatenation queue

@@ -172,6 +172,11 @@ impl Btrfs {
         })
     }
 
+    /// Whether the filesystem is mounted read-only; `None` when not mounted.
+    pub fn read_only(&self) -> Option<bool> {
+        mount_of(&format!("/dev/{}", self.device)).map(|(_, ro)| ro)
+    }
+
     pub fn info(&self) -> Info {
         let mut info = Info {
             device: format!("/dev/{}", self.device),

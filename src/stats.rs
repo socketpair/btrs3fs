@@ -8,7 +8,9 @@
 use anyhow::anyhow;
 use log::{info, warn};
 use serde::Serialize;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::time::Instant;
 
 /// Default port is `BASE_PORT + device number`, so several disks on one host
 /// get different ports. 9470 is an arbitrary port outside the well-known
@@ -182,6 +184,70 @@ impl Histogram {
     }
 }
 
+/// The latest error of one kind, for the page (SPEC.md §9.3).
+pub struct LastError(Mutex<Option<(Instant, String)>>);
+
+impl LastError {
+    const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    pub fn record(&self, error: impl std::fmt::Display) {
+        *self.0.lock().unwrap() = Some((Instant::now(), error.to_string()));
+    }
+
+    fn snapshot(&self) -> Option<ErrorInfo> {
+        self.0.lock().unwrap().as_ref().map(|(at, text)| ErrorInfo {
+            secs_ago: at.elapsed().as_secs(),
+            text: text.clone(),
+        })
+    }
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct ErrorInfo {
+    pub secs_ago: u64,
+    pub text: String,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct LastErrors {
+    pub upload: Option<ErrorInfo>,
+    pub read: Option<ErrorInfo>,
+    /// Errors returned to the kernel: the filesystem saw them.
+    pub io: Option<ErrorInfo>,
+    pub compact: Option<ErrorInfo>,
+}
+
+/// Something the page should point out: `bad` needs action, `warn` may.
+#[derive(Serialize, Clone, Debug)]
+pub struct Alert {
+    pub level: &'static str,
+    pub text: String,
+}
+
+/// How long an error stays an alert, seconds: a judgement call — long
+/// enough to be seen on a page refreshed every second, short enough that an
+/// old error does not keep the page alarmed. I/O errors reached the
+/// filesystem, so they stay longer.
+const ALERT_RECENT_SECS: u64 = 60;
+const ALERT_IO_SECS: u64 = 600;
+
+/// `1.5 MiB`-style size for alert texts.
+fn human_bytes(n: u64) -> String {
+    let units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let (mut v, mut i) = (n as f64, 0);
+    while v >= 1024.0 && i < units.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", units[i])
+    }
+}
+
 /// Current and highest number of operations in progress.
 pub struct InFlight {
     current: AtomicU64,
@@ -281,6 +347,12 @@ pub struct Stats {
     pub req_report: Counter,
     pub req_errors: Counter,
     pub requests: InFlight,
+    /// Kernel writes waiting for room in RAM (at the hard limit).
+    pub writes_waiting: InFlight,
+    pub err_upload: LastError,
+    pub err_read: LastError,
+    pub err_io: LastError,
+    pub err_compact: LastError,
 }
 
 pub static STATS: Stats = Stats {
@@ -326,6 +398,11 @@ pub static STATS: Stats = Stats {
     req_report: Counter::new(),
     req_errors: Counter::new(),
     requests: InFlight::new(),
+    writes_waiting: InFlight::new(),
+    err_upload: LastError::new(),
+    err_read: LastError::new(),
+    err_io: LastError::new(),
+    err_compact: LastError::new(),
 };
 
 impl Stats {
@@ -442,6 +519,13 @@ pub struct Snapshot {
     pub req_errors: u64,
     pub requests_in_flight: u64,
     pub requests_in_flight_max: u64,
+    pub writes_waiting: u64,
+    pub writes_waiting_max: u64,
+    /// Uploads allowed at once.
+    pub uploads_limit: u64,
+    pub last_errors: LastErrors,
+    /// Problems to point out, worst first.
+    pub alerts: Vec<Alert>,
 }
 
 /// State of the disk that is not a counter, filled in by the caller.
@@ -455,11 +539,77 @@ pub struct DiskState {
     pub dirty_hard_limit: u64,
     pub dirty_zones: u64,
     pub zones: ZoneCounts,
+    pub uploads_limit: u64,
+    /// The filesystem on the device is mounted read-only (`None`: not mounted).
+    pub read_only: Option<bool>,
 }
 
 impl Stats {
+    /// What the page should point out (SPEC.md §9.3).
+    fn alerts(&self, d: &DiskState, e: &LastErrors) -> Vec<Alert> {
+        let mut out = Vec::new();
+        let mut push = |level, text: String| out.push(Alert { level, text });
+        if d.read_only == Some(true) {
+            push(
+                "bad",
+                "The filesystem is mounted read-only: btrfs stopped writing after an error. \
+                 Unmount it and mount it again."
+                    .into(),
+            );
+        }
+        if let Some(io) = e.io.as_ref().filter(|x| x.secs_ago < ALERT_IO_SECS) {
+            push(
+                "bad",
+                format!(
+                    "The filesystem got an I/O error {} s ago: {}",
+                    io.secs_ago, io.text
+                ),
+            );
+        }
+        let waiting = self.writes_waiting.current.load(Relaxed);
+        if waiting > 0 {
+            push(
+                "warn",
+                format!(
+                    "{waiting} writes are waiting for room in RAM ({} of {} buffered): \
+                     uploads to S3 are slower than the writes.",
+                    human_bytes(d.dirty_bytes),
+                    human_bytes(d.dirty_hard_limit)
+                ),
+            );
+        }
+        for (what, err) in [
+            ("Upload to S3", &e.upload),
+            ("Read from S3", &e.read),
+            ("Concatenation", &e.compact),
+        ] {
+            if let Some(x) = err.as_ref().filter(|x| x.secs_ago < ALERT_RECENT_SECS) {
+                push(
+                    "warn",
+                    format!(
+                        "{what} failed {} s ago and is retried: {}",
+                        x.secs_ago, x.text
+                    ),
+                );
+            }
+        }
+        out
+    }
+
     pub fn snapshot(&self, d: DiskState) -> Snapshot {
+        let last_errors = LastErrors {
+            upload: self.err_upload.snapshot(),
+            read: self.err_read.snapshot(),
+            io: self.err_io.snapshot(),
+            compact: self.err_compact.snapshot(),
+        };
+        let alerts = self.alerts(&d, &last_errors);
         Snapshot {
+            writes_waiting: self.writes_waiting.current.load(Relaxed),
+            writes_waiting_max: self.writes_waiting.max.load(Relaxed),
+            uploads_limit: d.uploads_limit,
+            last_errors,
+            alerts,
             disk: d.disk,
             device: d.device,
             append: d.append,
@@ -625,6 +775,45 @@ mod tests {
 
         let empty = Histogram::new(Scale::Count).snapshot();
         assert_eq!((empty.count, empty.avg, empty.p50), (0, None, None));
+    }
+
+    #[test]
+    fn alerts_point_out_problems() {
+        let disk = |read_only| DiskState {
+            disk: "t/".into(),
+            device: "/dev/ublkb9".into(),
+            append: Default::default(),
+            uptime_secs: 1,
+            dirty_bytes: 512 << 20,
+            dirty_limit: 256 << 20,
+            dirty_hard_limit: 512 << 20,
+            dirty_zones: 1,
+            zones: ZoneCounts::default(),
+            uploads_limit: 4,
+            read_only,
+        };
+        let err = |secs_ago, text: &str| {
+            Some(ErrorInfo {
+                secs_ago,
+                text: text.into(),
+            })
+        };
+        let quiet = LastErrors::default();
+        assert!(STATS.alerts(&disk(Some(false)), &quiet).is_empty());
+        let ro = STATS.alerts(&disk(Some(true)), &quiet);
+        assert_eq!(ro[0].level, "bad");
+        let errors = LastErrors {
+            upload: err(5, "timeout"),
+            read: err(3600, "old"),
+            io: err(30, "EIO"),
+            compact: None,
+        };
+        let a = STATS.alerts(&disk(None), &errors);
+        let texts: Vec<&str> = a.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(a.len(), 2, "{texts:?}");
+        assert!(texts[0].contains("I/O error 30 s ago: EIO"));
+        assert!(texts[1].contains("Upload to S3 failed 5 s ago"));
+        assert_eq!(human_bytes(512 << 20), "512.0 MiB");
     }
 
     #[test]
