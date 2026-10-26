@@ -304,8 +304,10 @@ dependencies = [
  "anyhow",
  "aws-credential-types",
  "aws-sigv4",
+ "base64",
  "bytes",
  "clap",
+ "crc32c",
  "env_logger",
  "futures-util",
  "http",
@@ -507,6 +509,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "crc32c"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
+dependencies = [
+ "rustc_version",
 ]
 
 [[package]]

@@ -315,7 +315,6 @@ impl S3Store {
 
     /// DeleteObjects: deletes `keys` in batches of `DELETE_BATCH`, up to
     /// `DELETE_PARALLELISM` batches at once; missing keys are not an error.
-    /// Yandex does not require `Content-MD5` here (SPEC.md §11).
     pub async fn delete_many(&self, keys: &[String]) -> StoreResult<()> {
         // Futures built up front: a borrowing closure inside the stream would
         // make the future not provably `Send` (a known rustc limitation).
@@ -332,10 +331,15 @@ impl S3Store {
 
     async fn delete_batch(&self, keys: &[String]) -> StoreResult<()> {
         let url = format!("{}?delete", self.base);
-        let body = Body::new(vec![Bytes::from(delete_xml(keys))]);
+        let xml = delete_xml(keys);
+        let checksum = crc32c_header(xml.as_bytes());
+        let body = Body::new(vec![Bytes::from(xml)]);
         let what = format!("DELETE {} objects from {}", keys.len(), keys[0]);
         self.with_retries(&what, || async {
-            let headers = [("content-type", "application/xml".to_string())];
+            let headers = [
+                ("content-type", "application/xml".to_string()),
+                ("x-amz-checksum-crc32c", checksum.clone()),
+            ];
             let resp = self
                 .send(reqwest::Method::POST, &url, &headers, Some(&body))
                 .await?;
@@ -499,6 +503,15 @@ struct DeleteError {
     code: String,
     #[serde(default)]
     message: String,
+}
+
+/// `x-amz-checksum-crc32c` of a request body: base64 of the big-endian CRC32C.
+/// DeleteObjects must carry a checksum of its key list (standard S3; Selectel
+/// enforces it, Yandex does not); CRC32C is the fastest the standard allows
+/// — one CPU instruction per 8 bytes on x86 (SSE4.2) and ARM (SPEC.md §8).
+fn crc32c_header(body: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(crc32c::crc32c(body).to_be_bytes())
 }
 
 /// DeleteObjects request body; quiet: the answer lists only failures.
@@ -672,6 +685,12 @@ mod tests {
             .collect();
         assert_eq!(tags[0], ("qwe".to_string(), "a<b&c".to_string()));
         assert!(parsed_has_finished(&xml));
+    }
+
+    #[test]
+    fn crc32c_checksum() {
+        // CRC32C of "123456789" is the standard check value 0xE3069283.
+        assert_eq!(crc32c_header(b"123456789"), "4waSgw==");
     }
 
     #[test]
