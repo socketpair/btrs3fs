@@ -104,7 +104,11 @@ function bytes(n) {
   while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
   return (i === 0 ? n.toFixed(0) : n.toFixed(n < 10 ? 2 : 1)) + " " + u[i];
 }
-const rate = n => bytes(n) + "/s";
+/* Speeds in megabits per second (decimal, as network links are rated): user decision. */
+function rate(n) {
+  const mbit = n * 8 / 1e6;
+  return mbit.toLocaleString("en-US", { maximumFractionDigits: mbit < 10 ? 2 : mbit < 100 ? 1 : 0 }) + " Mbit/s";
+}
 const num = n => n.toLocaleString("en-US", { maximumFractionDigits: n < 10 ? 1 : 0 });
 const sizeLabel = b => b >= 1048576 ? (b / 1048576) + "M" : (b / 1024) + "K";
 function duration(s) {
