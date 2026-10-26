@@ -781,6 +781,12 @@ async fn check(resp: reqwest::Response, key: &str) -> Result<reqwest::Response, 
     let detail = format!("HTTP {status}: {}", s3_error_summary(&body));
     Err(match status {
         StatusCode::NOT_FOUND => Attempt::Fatal(StoreError::NotFound(key.to_string())),
+        // 409 OperationAborted: an earlier request to the key (one we gave up
+        // on) is still in progress on the server; it says to try again
+        // (Selectel, SPEC.md §11).
+        StatusCode::CONFLICT if xml_tag(&body, "Code").as_deref() == Some("OperationAborted") => {
+            Attempt::Retry(anyhow!(detail))
+        }
         // 409: Ceph RGW append at a position that is not the object's size.
         StatusCode::RANGE_NOT_SATISFIABLE | StatusCode::CONFLICT => {
             Attempt::Fatal(StoreError::InvalidRange {
@@ -890,17 +896,19 @@ const ERROR_BODY_PREVIEW: usize = 200;
 
 /// `Code: Message` from an S3 XML error body.
 fn s3_error_summary(body: &str) -> String {
-    let tag = |name: &str| {
-        let open = format!("<{name}>");
-        let start = body.find(&open)? + open.len();
-        let end = body[start..].find(&format!("</{name}>"))? + start;
-        Some(body[start..end].to_string())
-    };
-    match (tag("Code"), tag("Message")) {
+    match (xml_tag(body, "Code"), xml_tag(body, "Message")) {
         (Some(c), Some(m)) => format!("{c}: {m}"),
         (Some(c), None) => c,
         _ => body.chars().take(ERROR_BODY_PREVIEW).collect(),
     }
+}
+
+/// Text of the first `<name>…</name>` in an S3 XML body.
+fn xml_tag(body: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let start = body.find(&open)? + open.len();
+    let end = body[start..].find(&format!("</{name}>"))? + start;
+    Some(body[start..end].to_string())
 }
 
 fn is_unreserved(b: u8) -> bool {
@@ -1030,6 +1038,21 @@ mod tests {
         assert_eq!(
             s3_error_summary(body),
             "NoSuchKey: The specified key does not exist."
+        );
+        let busy = "<Error><Code>OperationAborted</Code><Message>A conflicting conditional \
+                    operation is currently in progress against this resource. Try again.</Message></Error>";
+        assert_eq!(xml_tag(busy, "Code").as_deref(), Some("OperationAborted"));
+        assert_eq!(xml_tag("<html>408</html>", "Code"), None);
+    }
+
+    #[test]
+    fn store_errors_show_their_causes() {
+        let e: StoreError = anyhow!("operation timed out")
+            .context("PUT k: giving up after 1 attempts")
+            .into();
+        assert_eq!(
+            e.to_string(),
+            "PUT k: giving up after 1 attempts: operation timed out"
         );
     }
 }

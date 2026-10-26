@@ -20,7 +20,8 @@ pub enum StoreError {
     /// The S3 service does not implement the request (HTTP 405 or 501).
     #[error("{0}")]
     Unsupported(String),
-    #[error(transparent)]
+    /// With the whole chain of causes: "giving up" alone says nothing.
+    #[error("{0:#}")]
     Other(#[from] anyhow::Error),
 }
 
