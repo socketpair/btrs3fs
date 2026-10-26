@@ -383,7 +383,8 @@ function legend(z, map) {
 }
 
 let zmap = null, zgeom = null, zkind = "";
-const KIND = { d: "data", m: "metadata", u: "kind not known yet" };
+const KIND = { d: "data", m: "metadata" };
+const kindOf = i => zmap.kind[i] === "m" ? "m" : "d";
 for (const b of document.querySelectorAll("[data-kind]")) b.onclick = () => {
   zkind = b.dataset.kind;
   for (const o of document.querySelectorAll("[data-kind]")) o.setAttribute("aria-checked", String(o === b));
@@ -417,7 +418,8 @@ function drawZones() {
   for (let i = 0; i < n; i++) {
     const x = (i % cols) * (cell + gap), y = Math.floor(i / cols) * (cell + gap), k = zmap.cond[i];
     // The kind filter dims the other zones instead of adding marks to every cell.
-    g.globalAlpha = zkind && zmap.kind[i] !== zkind && k !== "e" ? 0.35 : 1;
+    // Everything that is not metadata is data, as for concatenation (SPEC.md §5).
+    g.globalAlpha = zkind && kindOf(i) !== zkind && k !== "e" ? 0.35 : 1;
     g.fillStyle = col.e;
     g.fillRect(x, y, cell, cell);
     // Zones fill from the bottom by how much they hold. A zone FINISHed early is
@@ -451,7 +453,7 @@ $("zmap").addEventListener("mousemove", ev => {
   const b = zmap.block_size;
   const early = zmap.cond[i] === "f" && zmap.used[i] * zmap.block_size < zmap.zone_size;
   tip.innerHTML = `zone ${num(i)} at ${bytes(i * zmap.zone_size)} · ${early ? "full: finished early" : ZONE[zmap.cond[i]][0]}` +
-    (zmap.cond[i] === "e" ? "" : ` · ${KIND[zmap.kind[i]]}`) + `<br>` +
+    (zmap.cond[i] === "e" ? "" : ` · ${KIND[kindOf(i)]}`) + `<br>` +
     `${bytes(zmap.used[i] * b)} of ${bytes(zmap.zone_size)} written · ${num(zmap.objects[i])} S3 object${zmap.objects[i] === 1 ? "" : "s"}` +
     (zmap.buffered[i] ? ` · ${bytes(zmap.buffered[i] * b)} in RAM` : "");
   tip.style.display = "block";
@@ -476,8 +478,7 @@ function renderZones(s) {
   $("zstrip").innerHTML = stripSpans(s.zones);
   $("zlegend").innerHTML = legend(s.zones, true) + concatLine(s);
   const z = s.zones;
-  $("zkinds").textContent = `${num(z.data_zones)} data zones · ${num(z.meta_zones)} metadata zones` +
-    (z.unknown_zones ? ` · ${num(z.unknown_zones)} not known yet (no request since the start)` : "");
+  $("zkinds").textContent = `${num(z.meta_zones)} metadata zones · ${num(z.data_zones + z.unknown_zones)} data zones`;
   $("btn-compact").hidden = s.append !== "SEGMENTS";
 }
 
