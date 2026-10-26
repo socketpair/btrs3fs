@@ -3,142 +3,239 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>btrs3fs statistics</title>
+<title>btrs3fs</title>
 <style>
+  /* Colour carries meaning only: data flow, state of a zone, health. */
   :root {
-    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #6b7385; --line: #e3e6ec;
-    --accent: #2f6fde; --accent2: #12a37c; --warn: #d9822b; --bad: #d64545; --bar: #c9d8f6;
+    --bg: #f2f4f6; --surface: #ffffff; --ink: #1b2430; --muted: #64707d; --rule: #dde2e7;
+    --flow: #2563c9; --ok: #1e8e5a; --warn: #b7791f; --bad: #c53030;
+    --z-empty: #e6e9ed; --z-open: #3b82c4; --z-closed: #d9a13b; --z-full: #5b6b7c;
+    --warn-bg: #fbf3e4; --bad-bg: #fbeaea;
+    color-scheme: light;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #12151b; --panel: #1b1f27; --text: #e4e7ee; --muted: #8f97a8; --line: #2b313c;
-      --accent: #6b9cff; --accent2: #3ccf9f; --warn: #f0a050; --bad: #ff6b6b; --bar: #2e4370;
+      --bg: #15191e; --surface: #1d232a; --ink: #e6eaef; --muted: #94a0ad; --rule: #2c343d;
+      --flow: #6fa3f2; --ok: #3fb984; --warn: #e0a43c; --bad: #f06262;
+      --z-empty: #262d35; --z-open: #4f97d8; --z-closed: #d8a64a; --z-full: #7d8d9e;
+      --warn-bg: #2e2717; --bad-bg: #33191b;
+      color-scheme: dark;
     }
   }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--text);
-         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
-  header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline;
-           padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
-  header h1 { font-size: 18px; margin: 0; }
-  header .sub { color: var(--muted); }
-  #status { margin-left: auto; font-size: 13px; }
-  #status::before { content: "●"; margin-right: 6px; }
-  #status.live { color: var(--accent2); }
-  #status.down { color: var(--bad); }
-  main { padding: 16px 20px 32px; max-width: 1400px; margin: 0 auto; }
-  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
-       margin: 22px 0 10px; }
-  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
-  .wide { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
-  .card .label { color: var(--muted); font-size: 12px; }
-  .card .value { font-size: 24px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
-  .card .detail { color: var(--muted); font-size: 12px; margin-top: 4px; font-variant-numeric: tabular-nums; }
-  .btn { margin-top: 8px; padding: 3px 10px; font: inherit; font-size: 12px; color: var(--text);
-         background: var(--line); border: 1px solid var(--line); border-radius: 4px; cursor: pointer; }
-  .btn:hover { border-color: var(--accent); }
-  .tabs { margin-left: auto; display: flex; gap: 4px; }
-  .tab { font: inherit; font-size: 13px; padding: 4px 12px; color: var(--muted); background: none;
-         border: 1px solid var(--line); border-radius: 4px; cursor: pointer; }
-  .tab.active { color: var(--text); border-color: var(--accent); }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
+         font-variant-numeric: tabular-nums; }
+  a { color: var(--flow); }
+  button { font: inherit; }
+  :focus-visible { outline: 2px solid var(--flow); outline-offset: 2px; }
+
+  header { background: var(--surface); border-bottom: 1px solid var(--rule); }
+  .bar { max-width: 1200px; margin: 0 auto; padding: 14px 20px 0; }
+  .ident { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; }
+  .ident h1 { font-size: 20px; font-weight: 650; margin: 0; }
+  .ident .meta { color: var(--muted); }
+  #live { margin-left: auto; color: var(--muted); }
+  #live::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+                  background: var(--muted); margin-right: 6px; vertical-align: 1px; }
+  #live.on::before { background: var(--ok); }
+  #live.off { color: var(--bad); }
+  #live.off::before { background: var(--bad); }
+  nav { display: flex; gap: 2px; margin-top: 10px; overflow-x: auto; }
+  nav button { background: none; border: 0; border-bottom: 2px solid transparent; color: var(--muted);
+               padding: 8px 14px; cursor: pointer; white-space: nowrap; }
+  nav button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--flow); font-weight: 600; }
+  #feedback { color: var(--muted); font-size: 13px; min-height: 1.4em; padding: 4px 0 8px; }
+
+  main { max-width: 1200px; margin: 0 auto; padding: 18px 20px 40px; }
+  h2 { font-size: 16px; font-weight: 650; margin: 28px 0 10px; }
+  .note { color: var(--muted); font-size: 13px; }
+  .panel { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 14px 16px; }
+  .panel .title { font-weight: 600; margin-bottom: 6px; }
+
+  /* Alerts: the answer to "is everything fine?" comes first. */
+  .alerts { display: grid; gap: 8px; }
+  .alert { border-left: 4px solid var(--warn); background: var(--warn-bg); padding: 9px 12px; border-radius: 0 4px 4px 0; }
+  .alert.bad { border-left-color: var(--bad); background: var(--bad-bg); }
+  .alert b { margin-right: 6px; }
+  .allgood { color: var(--ok); }
+
+  /* The pipeline: where data waits shows at a glance. */
+  .pipe { display: grid; align-items: stretch;
+          grid-template-columns: minmax(150px, 1fr) minmax(110px, .8fr) minmax(220px, 1.4fr) minmax(110px, .8fr) minmax(170px, 1fr); }
+  .stage { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 12px 14px; }
+  .stage.hot { border-color: var(--warn); }
+  .stage .name { color: var(--muted); font-size: 13px; }
+  .stage .big { font-size: 24px; font-weight: 650; margin: 2px 0; }
+  .stage .big small { font-size: 14px; font-weight: 400; color: var(--muted); }
+  .stage .sub { color: var(--muted); font-size: 13px; }
+  .stage .sub .warn { color: var(--warn); }
+  .stage .sub .bad { color: var(--bad); }
+  .link { display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 0 6px; text-align: center; }
+  .link .rate { font-weight: 600; }
+  .link .what { color: var(--muted); font-size: 12px; }
+  .link svg { width: 100%; height: 14px; margin: 4px 0; overflow: visible; }
+  .link line { stroke: var(--rule); stroke-width: 3; }
+  .link polygon { fill: var(--rule); }
+  .link.moving line { stroke: var(--flow); stroke-dasharray: 8 6; animation: flow .9s linear infinite; }
+  .link.moving polygon { fill: var(--flow); }
+  @keyframes flow { to { stroke-dashoffset: -14; } }
+  @media (prefers-reduced-motion: reduce) { .link.moving line { animation: none; } }
+  .gauge { position: relative; height: 12px; background: var(--z-empty); border-radius: 3px; margin: 8px 0 4px; overflow: hidden; }
+  .gauge .fill { position: absolute; top: 0; bottom: 0; left: 0; background: var(--flow); }
+  .gauge.full .fill { background: var(--warn); }
+  .gauge .mark { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--ink); opacity: .45; }
+
+  .charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+  .chart .head { display: flex; justify-content: space-between; align-items: baseline; }
+  .chart .now { font-weight: 650; font-size: 17px; }
+  .chart svg { width: 100%; height: 70px; display: block; margin-top: 6px; }
+  .chart polyline { fill: none; stroke: var(--flow); stroke-width: 1.6; vector-effect: non-scaling-stroke; }
+  .chart polygon { fill: var(--flow); opacity: .12; }
+  .chart .limit { stroke: var(--warn); stroke-width: 1; stroke-dasharray: 4 3; vector-effect: non-scaling-stroke; }
+  .chart .axis { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 12px; }
+  .chart .axis span { white-space: nowrap; }
+  .chart .axis span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; }
+
+  /* Zones: proportions strip and the map. */
+  .strip { display: flex; height: 14px; border-radius: 3px; overflow: hidden; background: var(--z-empty); }
+  .strip span { display: block; height: 100%; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 10px; }
+  .legend i { display: inline-block; width: 11px; height: 11px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; position: relative; }
+  .legend i.ram { outline: 2px solid var(--bad); outline-offset: -2px; background: var(--z-open); }
+  .legend i.frag { background: var(--z-full); }
+  .legend i.frag::after { content: ""; position: absolute; left: 3px; top: 3px; width: 5px; height: 5px; border-radius: 50%; background: var(--surface); }
+  #zmap-wrap { position: relative; margin-top: 12px; }
+  #zmap { display: block; width: 100%; cursor: crosshair; }
+  #ztip { position: absolute; pointer-events: none; background: var(--ink); color: var(--surface); font-size: 12px;
+          padding: 6px 8px; border-radius: 4px; white-space: nowrap; display: none; z-index: 2; }
+
+  .facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
   .kv { width: 100%; border-collapse: collapse; }
-  .kv td { padding: 1px 0; }
-  .kv td:last-child { text-align: right; padding-left: 12px; color: var(--text); }
-  .meter { height: 6px; border-radius: 3px; background: var(--line); margin-top: 8px; overflow: hidden; }
-  .meter > div { height: 100%; background: var(--accent); width: 0; }
-  .chart svg { width: 100%; height: 90px; display: block; margin-top: 6px; }
-  .chart polyline { fill: none; stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
-  .chart .area { fill: var(--accent); opacity: .12; stroke: none; }
-  .chart .axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; }
-  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-  th, td { padding: 4px 6px; text-align: right; border-bottom: 1px solid var(--line); white-space: nowrap; }
-  th:first-child, td:first-child { text-align: left; }
-  th { color: var(--muted); font-weight: 500; font-size: 12px; }
-  .hist td.bar { width: 55%; }
-  .hist .b { height: 12px; background: var(--bar); border-radius: 2px; }
-  .bad { color: var(--bad); }
-  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .kv td { padding: 2px 0; vertical-align: top; }
+  .kv td:first-child { white-space: nowrap; }
+  .kv td:last-child { text-align: right; padding-left: 12px; }
+  .kv tr.bad td:last-child { color: var(--bad); font-weight: 600; }
+
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .btn { background: var(--surface); color: var(--ink); border: 1px solid var(--rule); border-radius: 5px; padding: 6px 12px; cursor: pointer; }
+  .btn:hover:not(:disabled) { border-color: var(--flow); }
+  .btn:disabled { color: var(--muted); cursor: default; }
+
+  table.grid { width: 100%; border-collapse: collapse; }
+  table.grid th, table.grid td { padding: 5px 8px; border-bottom: 1px solid var(--rule); text-align: right; white-space: nowrap; }
+  table.grid th { color: var(--muted); font-weight: 500; font-size: 13px; }
+  table.grid th:first-child, table.grid td:first-child { text-align: left; }
+  .scroll { overflow-x: auto; }
+
+  .hists { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 12px; }
+  .hist { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .hist td { padding: 1px 0; }
+  .hist td.l { color: var(--muted); white-space: nowrap; padding-right: 8px; }
+  .hist td.b { width: 60%; }
+  .hist td.b div { height: 10px; background: var(--flow); opacity: .75; border-radius: 1px; }
+  .hist tr.zero td.n { color: var(--muted); }
+  .hist td.n { text-align: right; padding-left: 8px; white-space: nowrap; }
+  .sum { color: var(--muted); font-size: 12px; margin-top: 6px; }
+
+  @media (max-width: 860px) {
+    .pipe { grid-template-columns: 1fr; }
+    .link { flex-direction: row; gap: 10px; padding: 6px 4px; justify-content: flex-start; }
+    .link svg { width: 26px; height: 14px; transform: rotate(90deg); }
+    #live { margin-left: 0; }
+  }
 </style>
 </head>
 <body>
 <header>
-  <h1>btrs3fs</h1>
-  <span class="sub" id="title">connecting…</span>
-  <span id="status">—</span>
-  <span class="sub" id="action"></span>
-  <nav class="tabs">
-    <button class="tab active" data-tab="dev" onclick="showTab('dev')">Device</button>
-    <button class="tab" data-tab="btrfs" onclick="showTab('btrfs')">btrfs</button>
-  </nav>
+  <div class="bar">
+    <div class="ident">
+      <h1 id="disk">btrs3fs</h1>
+      <span class="meta" id="meta">connecting to the device server…</span>
+      <span id="live">waiting</span>
+    </div>
+    <nav role="tablist">
+      <button role="tab" aria-selected="true" data-tab="overview">Overview</button>
+      <button role="tab" aria-selected="false" data-tab="zones">Zones</button>
+      <button role="tab" aria-selected="false" data-tab="btrfs">btrfs</button>
+      <button role="tab" aria-selected="false" data-tab="details">Details</button>
+    </nav>
+    <div id="feedback" role="status"></div>
+  </div>
 </header>
 <main>
-<div id="tab-dev">
-  <div class="grid" id="cards"></div>
-
+<section id="tab-overview">
+  <div class="alerts" id="alerts"></div>
+  <h2>Writes</h2>
+  <div class="pipe" id="pipe-w"></div>
+  <h2>Reads</h2>
+  <div class="pipe" id="pipe-r"></div>
   <h2>Last 5 minutes</h2>
-  <div class="grid wide">
-    <div class="card chart" id="ch-up"></div>
-    <div class="card chart" id="ch-rd"></div>
-    <div class="card chart" id="ch-par"></div>
-    <div class="card chart" id="ch-dirty"></div>
-  </div>
+  <div class="charts" id="charts"></div>
+  <h2>Zones</h2>
+  <div class="panel" id="zones-brief"></div>
+</section>
 
-  <h2>Distributions since start</h2>
-  <div class="grid wide">
-    <div class="card"><div class="label">Kernel READ size</div><table class="hist" id="h-kread"></table></div>
-    <div class="card"><div class="label">Kernel ZONE_APPEND size (data)</div><table class="hist" id="h-kappend"></table></div>
-    <div class="card"><div class="label">Kernel WRITE size (metadata, superblock)</div><table class="hist" id="h-kwrite"></table></div>
-    <div class="card"><div class="label">Upload size (PUT/PATCH body)</div><table class="hist" id="h-size"></table></div>
-    <div class="card"><div class="label">Upload time</div><table class="hist" id="h-uplat"></table></div>
-    <div class="card"><div class="label">Zones uploaded per FLUSH</div><table class="hist" id="h-zones"></table></div>
-    <div class="card"><div class="label">GET size (Range)</div><table class="hist" id="h-getsize"></table></div>
-    <div class="card"><div class="label">GET time</div><table class="hist" id="h-getlat"></table></div>
-    <div class="card segments"><div class="label">Concatenation time</div><table class="hist" id="h-cattime"></table></div>
-    <div class="card segments"><div class="label">Segments per concatenation</div><table class="hist" id="h-catsegs"></table></div>
-  </div>
-
-  <h2>Details</h2>
-  <div class="grid wide">
-    <div class="card"><div class="label">Uploads to S3</div><table id="t-up"></table></div>
-    <div class="card"><div class="label">Reads</div><table id="t-rd"></table></div>
-    <div class="card"><div class="label">Kernel requests</div><table id="t-req"></table></div>
-    <div class="card segments"><div class="label">Concatenation of segments (SEGMENTS)</div><table id="t-cat"></table></div>
-  </div>
-  <p class="hint">Counters are totals since the device server started; “/s” columns are the last second.
-     Raw data: <a href="stats.json">stats.json</a>.</p>
-</div>
-<div id="tab-btrfs" style="display:none">
-  <div class="grid" id="b-cards"></div>
-  <h2>Space by block group type</h2>
-  <div class="grid wide">
-    <div class="card" style="grid-column: 1 / -1"><table id="b-spaces"></table></div>
-  </div>
-  <h2>Actions</h2>
-  <div class="grid wide">
-    <div class="card"><div class="label">Operations on the filesystem</div>
-      <button class="btn" onclick="fsAct('balance')">balance -dusage=0</button>
-      <button class="btn" onclick="fsAct('syncfs')">syncfs()</button>
-      <div class="detail" id="b-action"></div>
-      <div class="detail">balance -dusage=0 removes data block groups nothing lives in (in zoned mode
-        that resets their zones and deletes their objects); syncfs() commits the btrfs transaction,
-        so all written files are stored in S3.</div>
+<section id="tab-zones" hidden>
+  <div class="panel">
+    <div class="strip" id="zstrip"></div>
+    <div class="legend" id="zlegend"></div>
+    <div id="zmap-wrap"><canvas id="zmap" height="10" aria-label="Map of all zones"></canvas><div id="ztip"></div></div>
+    <div class="actions">
+      <button class="btn" data-act="flush">Upload buffered data</button>
+      <button class="btn" data-act="compact" id="btn-compact">Concatenate fragmented zones</button>
     </div>
+    <p class="note">One cell per zone in disk order, left to right; partly written zones fill from the bottom.
+      Hover a cell for its details. “Upload buffered data” stores everything held in RAM now but does not commit
+      btrfs — use “Commit the filesystem” on the btrfs tab for that. “Concatenate fragmented zones” merges the S3
+      objects of every zone that has more than one.</p>
   </div>
-  <p class="hint">From sysfs (<code>/sys/fs/btrfs/&lt;fsid&gt;</code>) and btrfs ioctls; refreshed every second
-     while this tab is open. Raw data: <a href="btrfs.json">btrfs.json</a>.</p>
-</div>
+</section>
+
+<section id="tab-btrfs" hidden>
+  <div class="facts" id="b-facts"></div>
+  <h2>Space by block group type</h2>
+  <div class="panel scroll"><table class="grid" id="b-spaces"></table></div>
+  <h2>Operations</h2>
+  <div class="panel">
+    <div class="actions" style="margin-top:0">
+      <button class="btn" data-fsact="balance">Remove empty data block groups</button>
+      <button class="btn" data-fsact="syncfs">Commit the filesystem</button>
+    </div>
+    <div id="b-action" class="note" style="margin-top:8px"></div>
+    <p class="note">Removing empty block groups is <code>btrfs balance start -dusage=0</code>: their zones are reset and
+      their S3 objects deleted. Committing is <code>syncfs()</code>: btrfs writes its transaction, so every written file
+      is stored in S3.</p>
+  </div>
+</section>
+
+<section id="tab-details" hidden>
+  <h2>Last errors</h2>
+  <div class="panel" id="d-errors"></div>
+  <h2>Kernel requests</h2>
+  <div class="hists" id="h-kernel"></div>
+  <h2>Uploads to S3</h2>
+  <div class="hists" id="h-up"></div>
+  <h2>Reads from S3</h2>
+  <div class="hists" id="h-rd"></div>
+  <div id="h-cat-wrap"><h2>Concatenation of segments</h2><div class="hists" id="h-cat"></div></div>
+  <h2>Counters</h2>
+  <div class="facts" id="d-counters"></div>
+  <p class="note">Counters are totals since the device server started; rates are over the last second.
+    Raw data: <a href="stats.json">stats.json</a>, <a href="zones.json">zones.json</a>, <a href="btrfs.json">btrfs.json</a>.</p>
+</section>
 </main>
 <script>
 "use strict";
 const HISTORY = 300;  // chart length in samples: 5 minutes at one sample per second
-const series = { up: [], rd: [], par: [], dirty: [] };
-let prev = null, prevTime = 0;
+const series = { up: [], rd: [], dirty: [], par: [] };
+let prev = null, prevTime = 0, last = null, rates = null, delta = () => 0, tab = "overview";
 
 const $ = id => document.getElementById(id);
-const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const num = n => n === null || n === undefined ? "–" : Number(n).toLocaleString("en-US", { maximumFractionDigits: n < 10 ? 1 : 0 });
 function bytes(n) {
+  if (n === null || n === undefined) return "–";
   const u = ["B", "KiB", "MiB", "GiB", "TiB"];
   let i = 0;
   while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
@@ -149,249 +246,341 @@ function rate(n) {
   const mbit = n * 8 / 1e6;
   return mbit.toLocaleString("en-US", { maximumFractionDigits: mbit < 10 ? 2 : mbit < 100 ? 1 : 0 }) + " Mbit/s";
 }
-const num = n => n.toLocaleString("en-US", { maximumFractionDigits: n < 10 ? 1 : 0 });
-const sizeLabel = b => b >= 1048576 ? (b / 1048576) + "M" : (b / 1024) + "K";
-function duration(s) {
-  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
-  return (d ? d + "d " : "") + (d || h ? h + "h " : "") + m + "m " + (s % 60) + "s";
-}
-
-/* Label and number per line, numbers aligned on the right. */
-const kv = rows => `<table class="kv">${rows.map(([k, v]) => `<tr><td>${k}</td><td>${num(v)}</td></tr>`).join("")}</table>`;
-
-function card(label, value, detail, meter) {
-  return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div>` +
-    (detail ? `<div class="detail">${detail}</div>` : "") +
-    (meter !== undefined ? `<div class="meter"><div style="width:${Math.min(100, meter).toFixed(1)}%"></div></div>` : "") +
-    `</div>`;
-}
-
-/* The daemon sends ready buckets (lo, hi] and the summary; only the unit decides the format. */
+const sizeLabel = b => b >= 1048576 ? (b / 1048576) + "M" : b >= 1024 ? (b / 1024) + "K" : String(b);
 const ms = v => v >= 1000 ? (v / 1000) + " s" : v + " ms";
-const fmtOf = unit => ({ bytes: sizeLabel, ms: ms }[unit] || num);
-function histRows(h) {
-  if (!h.count) return `<tr><td>no data yet</td></tr>`;
-  const f = fmtOf(h.unit), max = Math.max(...h.buckets.map(b => b.count));
-  return h.buckets.map(b => {
-    const name = b.lo === null ? "≤ " + f(b.hi) : f(b.lo) + " – " + f(b.hi);
-    return `<tr><td>${name}</td><td class="bar"><div class="b" style="width:${(b.count / max * 100).toFixed(1)}%"></div></td>` +
-      `<td>${num(b.count)}</td><td>${(b.count / h.count * 100).toFixed(1)}%</td></tr>`;
-  }).join("") +
-    `<tr><td colspan="4">average ${h.unit === "bytes" ? bytes(h.avg) : h.unit === "ms" ? ms(Math.round(h.avg)) : num(h.avg)}` +
-    ` · p50 ≤ ${f(h.p50)} · p90 ≤ ${f(h.p90)} · p99 ≤ ${f(h.p99)}</td></tr>`;
+function span(s) {
+  s = Math.max(0, Math.round(s));
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`;
 }
+const kv = rows => `<table class="kv">${rows.map(([k, v, bad]) => `<tr class="${bad ? "bad" : ""}"><td>${k}</td><td>${v}</td></tr>`).join("")}</table>`;
+const panel = (title, body) => `<div class="panel"><div class="title">${title}</div>${body}</div>`;
+const say = text => { $("feedback").textContent = text; };
 
-function chart(id, title, data, fmt) {
-  const max = Math.max(1e-9, ...data);
-  const n = data.length;
-  const pts = data.map((v, i) => `${(HISTORY - n + i) / (HISTORY - 1) * 100},${(1 - v / max) * 100}`).join(" ");
-  const first = n ? (HISTORY - n) / (HISTORY - 1) * 100 : 0;
-  const area = n ? `${first},100 ${pts} 100,100` : "";
-  const cur = n ? data[n - 1] : 0;
-  $(id).innerHTML = `<div class="label">${title}</div><div class="value">${fmt(cur)}</div>` +
-    `<svg viewBox="0 0 100 100" preserveAspectRatio="none"><polygon class="area" points="${area}"/><polyline points="${pts}"/></svg>` +
-    `<div class="axis"><span>−5 min</span><span>peak ${fmt(Math.max(0, ...data))}</span><span>now</span></div>`;
-}
-
-function push(name, v) {
-  const s = series[name];
-  s.push(v);
-  if (s.length > HISTORY) s.shift();
-}
-
-function table(id, head, rows) {
-  $(id).innerHTML = `<tr>${head.map(h => `<th>${h}</th>`).join("")}</tr>` +
-    rows.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join("")}</tr>`).join("");
-}
-
-function render(s, p, dt) {
-  // Rates over the last interval; zero on the first sample or after a restart.
-  const fresh = !p || s.uptime_secs < p.uptime_secs || dt <= 0;
-  const d = k => fresh ? 0 : Math.max(0, s[k] - p[k]) / dt;
-  const dsum = k => fresh ? 0 : Math.max(0, s[k].sum - p[k].sum) / dt;
-  const uploads = s.uploads_put + s.uploads_patch;
-  const z = s.zones;
-
-  $("title").innerHTML = `${esc(s.disk)} on ${esc(s.device)} · up ${duration(s.uptime_secs)}`;
-  document.title = `btrs3fs ${s.device}`;
-
-  const upRate = dsum("upload_size"), rdRate = d("read_from_s3");
-  const upPerSec = fresh ? 0 : Math.max(0, uploads - p.uploads_put - p.uploads_patch) / dt;
-  const errRate = d("upload_errors") + d("req_errors");
-  $("cards").innerHTML =
-    card("Upload to S3", rate(upRate), `${num(upPerSec)} uploads/s · total ${bytes(s.upload_size.sum)}`) +
-    card("Read from S3", rate(rdRate), `${num(d("gets"))} GET/s · total ${bytes(s.read_from_s3)}`) +
-    card("RAM buffers", bytes(s.dirty_bytes), `${s.dirty_zones} zones · background uploads above ${bytes(s.dirty_limit)} · writes wait at ${bytes(s.dirty_hard_limit)}` +
-         `<br><button class="btn" onclick="act('flush')">Upload buffered data</button>`,
-         s.dirty_bytes / s.dirty_hard_limit * 100) +
-    card("Uploads in parallel", `${s.uploads_in_flight}`, `max ${s.uploads_in_flight_max} · kernel requests ${s.requests_in_flight} (max ${s.requests_in_flight_max})`) +
-    card("Zones in use", `${num(z.open + z.closed + z.full)} of ${num(z.open + z.closed + z.full + z.empty)}`,
-         kv([["open", z.open], ["closed", z.closed], ["full", z.full], ["empty", z.empty],
-             ["partly filled (data, but less than a zone)", z.partial],
-             ["fragmented (more than one S3 object)", z.fragmented],
-             ["S3 objects of all zones", z.objects],
-             ["most S3 objects in one zone", z.max_objects]]) +
-         (s.append === "SEGMENTS" ? `<button class="btn" onclick="act('compact')">Concatenate fragmented zones</button>` : "")) +
-    card("Problems", `<span class="${s.upload_errors + s.req_errors ? "bad" : ""}">${num(s.upload_errors + s.req_errors)}</span>`,
-         `failed uploads ${num(s.upload_errors)} · I/O errors ${num(s.req_errors)} · S3 retries ${num(s.retries)}` +
-         (errRate ? ` · <span class="bad">${num(errRate)}/s</span>` : ""));
-
-  push("up", upRate); push("rd", rdRate); push("par", s.uploads_in_flight); push("dirty", s.dirty_bytes);
-  chart("ch-up", "Upload to S3", series.up, rate);
-  chart("ch-rd", "Read from S3", series.rd, rate);
-  chart("ch-par", "Uploads in flight", series.par, v => num(v));
-  chart("ch-dirty", "RAM buffers", series.dirty, bytes);
-
-  $("h-kread").innerHTML = histRows(s.req_read_size);
-  $("h-kappend").innerHTML = histRows(s.req_append_size);
-  $("h-kwrite").innerHTML = histRows(s.req_write_size);
-  $("h-size").innerHTML = histRows(s.upload_size);
-  $("h-uplat").innerHTML = histRows(s.upload_latency_ms);
-  $("h-zones").innerHTML = histRows(s.zones_per_flush);
-  $("h-getsize").innerHTML = histRows(s.get_size);
-  $("h-getlat").innerHTML = histRows(s.get_latency_ms);
-  $("h-cattime").innerHTML = histRows(s.compact_time_ms);
-  $("h-catsegs").innerHTML = histRows(s.segments_per_compaction);
-  for (const el of document.querySelectorAll(".segments")) el.style.display = s.append === "SEGMENTS" ? "" : "none";
-
-  table("t-up", ["", "total", "/s"], [
-    ["PUT (first write to a zone)", num(s.uploads_put), num(d("uploads_put"))],
-    ["appends (PATCH, append, new segment)", num(s.uploads_patch), num(d("uploads_patch"))],
-    ["reason: FLUSH", num(s.uploads_flush), num(d("uploads_flush"))],
-    ["reason: FUA", num(s.uploads_fua), num(d("uploads_fua"))],
-    ["reason: zone full", num(s.uploads_zone_full), num(d("uploads_zone_full"))],
-    ["reason: zone closed", num(s.uploads_zone_closed), num(d("uploads_zone_closed"))],
-    ["reason: buffer limit", num(s.uploads_background), num(d("uploads_background"))],
-    ["reason: explicit", num(s.uploads_explicit), num(d("uploads_explicit"))],
-    ["reason: zone FINISH", num(s.uploads_finish), num(d("uploads_finish"))],
-    ["reason: upload button", num(s.uploads_manual), num(d("uploads_manual"))],
-    ["S3 retries", num(s.retries), num(d("retries"))],
-    ["failed uploads", num(s.upload_errors), num(d("upload_errors"))],
-  ]);
-  table("t-rd", ["", "total", "/s"], [
-    ["from S3", bytes(s.read_from_s3), rate(rdRate)],
-    ["GET requests", num(s.gets), num(d("gets"))],
-    ["from read-ahead cache", bytes(s.read_from_cache), rate(d("read_from_cache"))],
-    ["read-ahead windows: hits / fetched", `${num(s.read_ahead_hits)} / ${num(s.read_ahead_misses)}`, `${num(d("read_ahead_hits"))} / ${num(d("read_ahead_misses"))}`],
-    ["from RAM buffers", bytes(s.read_from_ram), rate(d("read_from_ram"))],
-    ["zeros (past write pointer)", bytes(s.read_zeros), rate(d("read_zeros"))],
-  ]);
-  table("t-cat", ["", "total", "/s"], [
-    ["fragmented zones now", num(s.zones.fragmented), ""],
-    ["waiting / of them FULL", `${num(s.zones.compact_queued)} / ${num(s.zones.compact_urgent)}`, ""],
-    ["running now / max", `${num(s.compacting)} / ${num(s.compacting_max)}`, ""],
-    ["completed", num(s.compactions), num(d("compactions"))],
-    ["segments merged", num(s.compacted_segments), num(d("compacted_segments"))],
-    ["copied on the server", bytes(s.compacted_bytes), rate(d("compacted_bytes"))],
-    ["dropped (zone changed meanwhile)", num(s.compact_aborted), num(d("compact_aborted"))],
-    ["failed", num(s.compact_errors), num(d("compact_errors"))],
-  ]);
-  table("t-req", ["", "count", "/s", "bytes"], [
-    ["READ", num(s.req_read), num(d("req_read")), bytes(s.req_read_bytes)],
-    ["WRITE (metadata, superblock)", num(s.req_write), num(d("req_write")), bytes(s.req_write_bytes)],
-    ["ZONE_APPEND (data)", num(s.req_append), num(d("req_append")), bytes(s.req_append_bytes)],
-    ["FLUSH", num(s.req_flush), num(d("req_flush")), ""],
-    ["FUA writes", num(s.req_fua), num(d("req_fua")), ""],
-    ["zone reset", num(s.req_zone_reset), num(d("req_zone_reset")), ""],
-    ["other zone ops", num(s.req_zone_mgmt), num(d("req_zone_mgmt")), ""],
-    ["zone reports", num(s.req_report), num(d("req_report")), ""],
-    ["errors", num(s.req_errors), num(d("req_errors")), ""],
-  ]);
-}
-
-/* Actions of the daemon (POST); the answer goes to the header line. */
-async function act(name) {
-  try {
-    const r = await fetch(name, { method: "POST" });
-    if (!r.ok) throw new Error(r.status);
-    const j = await r.json();
-    $("action").textContent = name === "compact"
-      ? `${num(j.queued)} fragmented zones queued for concatenation`
-      : `uploading ${bytes(j.bytes)} buffered in ${num(j.zones)} zones`;
-  } catch (e) {
-    $("action").textContent = `${name} failed: ${e.message}`;
-  }
-}
-
-let tab = "dev";
+/* ---------- tabs ---------- */
 function showTab(t) {
   tab = t;
-  $("tab-dev").style.display = t === "dev" ? "" : "none";
-  $("tab-btrfs").style.display = t === "btrfs" ? "" : "none";
-  for (const b of document.querySelectorAll(".tab")) b.className = "tab" + (b.dataset.tab === t ? " active" : "");
+  // The tab is in the address, so reloading or sharing the link keeps it.
+  if (location.hash !== "#" + t) history.replaceState(null, "", t === "overview" ? location.pathname : "#" + t);
+  for (const b of document.querySelectorAll("nav button")) b.setAttribute("aria-selected", String(b.dataset.tab === t));
+  for (const s of ["overview", "zones", "btrfs", "details"]) $("tab-" + s).hidden = s !== t;
+  if (t === "zones") tickZones();
   if (t === "btrfs") tickBtrfs();
+  if (last) draw(last);
+}
+for (const b of document.querySelectorAll("nav button")) b.onclick = () => showTab(b.dataset.tab);
+if (["zones", "btrfs", "details"].includes(location.hash.slice(1))) showTab(location.hash.slice(1));
+
+/* ---------- overview ---------- */
+function link(count, what, moving) {
+  return `<div class="link ${moving ? "moving" : ""}"><span class="rate">${count}</span>` +
+    `<svg viewBox="0 0 100 14" preserveAspectRatio="none" aria-hidden="true"><line x1="0" y1="7" x2="92" y2="7"/><polygon points="92,1 100,7 92,13"/></svg>` +
+    `<span class="what">${what}</span></div>`;
+}
+const stage = (name, big, sub, extra = "", hot = false) =>
+  `<div class="stage ${hot ? "hot" : ""}"><div class="name">${name}</div><div class="big">${big}</div>${extra}<div class="sub">${sub}</div></div>`;
+
+function renderOverview(s) {
+  const r = rates;
+  const alerts = s.alerts || [];
+  $("alerts").innerHTML = alerts.length
+    ? alerts.map(a => `<div class="alert ${a.level}"><b>${a.level === "bad" ? "Needs attention" : "Warning"}</b>${esc(a.text)}</div>`).join("")
+    : `<div class="allgood">All good: no recent errors, writes are not waiting.</div>`;
+
+  // Writes: kernel → RAM → S3.
+  const hard = s.dirty_hard_limit, soft = s.dirty_limit, waiting = s.writes_waiting > 0;
+  const drain = r.up > 0 ? `drains in about ${span(s.dirty_bytes / r.up)}` : s.dirty_bytes ? "not draining now" : "nothing to upload";
+  const gauge = `<div class="gauge ${waiting ? "full" : ""}"><div class="fill" style="width:${Math.min(100, s.dirty_bytes / hard * 100).toFixed(1)}%"></div>` +
+    `<div class="mark" style="left:${(soft / hard * 100).toFixed(1)}%" title="background uploads start here"></div></div>`;
+  $("pipe-w").innerHTML =
+    stage("Kernel writes", rate(r.kw),
+          waiting ? `<span class="warn">${num(s.writes_waiting)} requests waiting for room</span>` : "into the daemon") +
+    link(`${num(r.kwReq)} req/s`, "into RAM", r.kw > 0) +
+    stage("RAM buffers", `${bytes(s.dirty_bytes)} <small>of ${bytes(hard)}</small>`,
+          `${num(s.dirty_zones)} zones · ${drain} · uploads start above ${bytes(soft)}`, gauge, waiting) +
+    link(`${num(r.upReq)} uploads/s`, "to S3", r.up > 0) +
+    stage("S3", `${num(s.uploads_in_flight)} <small>of ${num(s.uploads_limit)} uploading</small>`,
+          `${bytes(s.upload_size.sum)} stored since start` +
+          (s.upload_errors ? ` · <span class="bad">${num(s.upload_errors)} failed</span>` : "") +
+          (s.retries ? ` · ${num(s.retries)} retries` : ""));
+
+  // Reads: S3 → cache and RAM → kernel.
+  const hits = s.read_ahead_hits, miss = s.read_ahead_misses;
+  const hitRate = hits + miss ? `${(hits / (hits + miss) * 100).toFixed(0)}% of small reads hit the cache` : "no small reads yet";
+  $("pipe-r").innerHTML =
+    stage("S3", rate(r.rd), `median GET time ${s.get_latency_ms.p50 ? "≤ " + ms(s.get_latency_ms.p50) : "–"}`) +
+    link(`${num(r.gets)} GET/s`, "from S3", r.rd > 0) +
+    stage("Read cache and RAM", rate(r.cache + r.ram), `${hitRate} · ${rate(r.ram)} of not yet stored data`) +
+    link(`${num(r.krReq)} req/s`, "to the kernel", r.kr > 0) +
+    stage("Kernel reads", rate(r.kr), "out of the daemon");
+
+  $("charts").innerHTML =
+    chart("Upload to S3", series.up, rate) +
+    chart("Read from S3", series.rd, rate) +
+    chart("RAM buffers", series.dirty, bytes, hard) +
+    chart("Uploads in flight", series.par, num, s.uploads_limit);
+
+  const z = s.zones, used = z.open + z.closed + z.full;
+  $("zones-brief").innerHTML = `<div class="strip">${stripSpans(z)}</div><div class="legend">${legend(z, false)}</div>` +
+    `<p class="note" style="margin-bottom:0">${num(used)} of ${num(used + z.empty)} zones hold data · ${num(z.partial)} partly filled · ` +
+    `${num(z.fragmented)} fragmented · <a href="#" data-goto="zones">open the zone map</a></p>`;
+  $("zones-brief").querySelector("[data-goto]").onclick = ev => { ev.preventDefault(); showTab("zones"); };
 }
 
-const optBytes = v => v === null || v === undefined ? "–" : bytes(v);
-const optNum = v => v === null || v === undefined ? "–" : num(v);
+function chart(title, data, fmt, limit) {
+  const peak = Math.max(0, ...data);
+  const max = Math.max(1e-9, peak, limit || 0);
+  const n = data.length;
+  const x = i => (HISTORY - n + i) / (HISTORY - 1) * 100;
+  const pts = data.map((v, i) => `${x(i)},${(1 - v / max) * 100}`).join(" ");
+  const area = n ? `${x(0)},100 ${pts} 100,100` : "";
+  const ly = limit ? (1 - limit / max) * 100 : 0;
+  const lim = limit ? `<line class="limit" x1="0" x2="100" y1="${ly}" y2="${ly}"/>` : "";
+  return `<div class="panel chart"><div class="head"><span>${title}</span><span class="now">${fmt(n ? data[n - 1] : 0)}</span></div>` +
+    `<svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><polygon points="${area}"/><polyline points="${pts}"/>${lim}</svg>` +
+    `<div class="axis"><span>−5 min</span><span>peak ${fmt(peak)}${limit ? ` · limit ${fmt(limit)}` : ""}</span><span>now</span></div></div>`;
+}
 
-function renderBtrfs(b) {
-  if (!b.mounted) {
-    $("b-cards").innerHTML = card("Filesystem", "not mounted", `no mounted btrfs on ${esc(b.device)}`);
-    $("b-spaces").innerHTML = "";
-  } else {
-    const c = b.commits, errs = Object.values(b.errors).reduce((a, x) => a + x, 0);
-    const bal = b.balance.running
-      ? `balance: ${num(b.balance.completed)} of ${num(b.balance.expected)} block groups done (${num(b.balance.considered)} considered)`
-      : "no balance running";
-    $("b-cards").innerHTML =
-      card("Filesystem", esc(b.mountpoint),
-           `${b.read_only ? '<span class="bad">read-only</span>' : "read-write"} · ${esc(b.device)} · label ${esc(b.label || "–")}<br>` +
-           `fsid ${esc(b.fsid)} · generation ${optNum(b.generation)} · node ${optBytes(b.nodesize)} · sector ${optBytes(b.sectorsize)}`) +
-      card("Transaction commits", optNum(c.commits),
-           `last ${optNum(c.last_commit_ms)} ms · max ${optNum(c.max_commit_ms)} ms · ` +
-           `average ${c.commits ? num(c.total_commit_ms / c.commits) : "–"} ms` + (c.cur_commit_ms ? ` · committing now ${num(c.cur_commit_ms)} ms` : "")) +
-      card("Device errors", `<span class="${errs ? "bad" : ""}">${num(errs)}</span>`,
-           Object.entries(b.errors).map(([k, v]) => `${esc(k.replace("_errs", ""))} ${num(v)}`).join(" · ")) +
-      card("Exclusive operation", esc(b.exclusive_operation || "–"), bal) +
-      card("Global reserve", optBytes(b.global_rsv_reserved), `of ${optBytes(b.global_rsv_size)} · reclaim threshold ${optNum(b.bg_reclaim_threshold)}%`);
-    table("b-spaces", ["", "allocated", "used", "zone unusable", "pinned", "reserved", "may use", "read-only", "on disk", "reclaimed (count / bytes)", "reclaim threshold / dynamic / periodic"],
-      b.spaces.map(x => [esc(x.kind), optBytes(x.total_bytes), optBytes(x.bytes_used), optBytes(x.bytes_zone_unusable),
-        optBytes(x.bytes_pinned), optBytes(x.bytes_reserved), optBytes(x.bytes_may_use), optBytes(x.bytes_readonly),
-        `${optBytes(x.disk_used)} of ${optBytes(x.disk_total)}`, `${optNum(x.reclaim_count)} / ${optBytes(x.reclaim_bytes)}` + (x.reclaim_errors ? ` · <span class="bad">${num(x.reclaim_errors)} errors</span>` : ""),
-        `${optNum(x.bg_reclaim_threshold)}% / ${optNum(x.dynamic_reclaim)} / ${optNum(x.periodic_reclaim)}`]));
+/* ---------- zones ---------- */
+const ZONE = { e: ["empty", "--z-empty"], o: ["open", "--z-open"], c: ["closed", "--z-closed"], f: ["full", "--z-full"] };
+const cssVar = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+function stripSpans(z) {
+  const total = z.empty + z.open + z.closed + z.full || 1;
+  return [["o", z.open], ["c", z.closed], ["f", z.full]].map(([k, v]) =>
+    `<span style="width:${v / total * 100}%;background:var(${ZONE[k][1]})" title="${num(v)} ${ZONE[k][0]}"></span>`).join("");
+}
+function legend(z, map) {
+  const item = (cls, style, text) => `<span><i class="${cls}" style="${style}"></i>${text}</span>`;
+  return item("", "background:var(--z-open)", `${num(z.open)} open`) +
+    item("", "background:var(--z-closed)", `${num(z.closed)} closed`) +
+    item("", "background:var(--z-full)", `${num(z.full)} full`) +
+    item("", "background:var(--z-empty)", `${num(z.empty)} empty`) +
+    (map ? item("ram", "", "data in RAM") +
+      item("frag", "", `fragmented: ${num(z.fragmented)}, at most ${num(z.max_objects)} S3 objects in one`) : "");
+}
+
+let zmap = null, zgeom = null;
+async function tickZones() {
+  try {
+    const r = await fetch("zones.json", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    zmap = await r.json();
+    drawZones();
+  } catch (e) { say(`Cannot read the zone map: ${e.message}`); }
+}
+function drawZones() {
+  if (!zmap || tab !== "zones") return;
+  const c = $("zmap"), n = zmap.cond.length;
+  const width = c.parentElement.clientWidth || 800;
+  const cell = n > 20000 ? 4 : n > 5000 ? 7 : 10, gap = 1;
+  const cols = Math.max(1, Math.floor((width + gap) / (cell + gap)));
+  const rows = Math.ceil(n / cols);
+  const dpr = window.devicePixelRatio || 1;
+  c.style.height = rows * (cell + gap) + "px";
+  c.width = Math.floor(width * dpr);
+  c.height = Math.floor(rows * (cell + gap) * dpr);
+  const g = c.getContext("2d");
+  g.scale(dpr, dpr);
+  const col = { e: cssVar("--z-empty"), o: cssVar("--z-open"), c: cssVar("--z-closed"), f: cssVar("--z-full") };
+  const ram = cssVar("--bad"), dot = cssVar("--surface");
+  const zoneBlocks = zmap.zone_size / zmap.block_size;
+  for (let i = 0; i < n; i++) {
+    const x = (i % cols) * (cell + gap), y = Math.floor(i / cols) * (cell + gap), k = zmap.cond[i];
+    g.fillStyle = col.e;
+    g.fillRect(x, y, cell, cell);
+    // Open and closed zones fill from the bottom by how much they hold.
+    const h = k === "f" ? cell : k === "e" ? 0 : Math.max(1, Math.round(zmap.used[i] / zoneBlocks * cell));
+    g.fillStyle = col[k];
+    g.fillRect(x, y + cell - h, cell, h);
+    if (zmap.buffered[i] > 0) {
+      g.strokeStyle = ram; g.lineWidth = 1.5;
+      g.strokeRect(x + .75, y + .75, cell - 1.5, cell - 1.5);
+    }
+    if (zmap.objects[i] > 1 && cell >= 6) {
+      g.fillStyle = dot; g.beginPath(); g.arc(x + cell / 2, y + cell / 2, cell / 5, 0, 7); g.fill();
+    }
   }
-  const l = b.last;
-  $("b-action").innerHTML = b.running
-    ? `${esc(b.running)} is running, ${num(b.running_secs)} s`
-    : l ? `last: ${esc(l.name)} <span class="${l.ok ? "" : "bad"}">${l.ok ? "done" : "failed"}</span> in ${num(l.secs)} s — ${esc(l.message)}` : "";
+  zgeom = { cell, gap, cols, n };
+}
+$("zmap").addEventListener("mousemove", ev => {
+  const tip = $("ztip");
+  if (!zmap || !zgeom) return;
+  const rect = $("zmap").getBoundingClientRect();
+  const cx = ev.clientX - rect.left, cy = ev.clientY - rect.top;
+  const step = zgeom.cell + zgeom.gap, colNo = Math.floor(cx / step);
+  const i = Math.floor(cy / step) * zgeom.cols + colNo;
+  if (cx < 0 || colNo >= zgeom.cols || i < 0 || i >= zgeom.n) { tip.style.display = "none"; return; }
+  const b = zmap.block_size;
+  tip.innerHTML = `zone ${num(i)} at ${bytes(i * zmap.zone_size)} · ${ZONE[zmap.cond[i]][0]}<br>` +
+    `${bytes(zmap.used[i] * b)} of ${bytes(zmap.zone_size)} written · ${num(zmap.objects[i])} S3 object${zmap.objects[i] === 1 ? "" : "s"}` +
+    (zmap.buffered[i] ? ` · ${bytes(zmap.buffered[i] * b)} in RAM` : "");
+  tip.style.display = "block";
+  tip.style.left = Math.max(0, Math.min(cx + 14, rect.width - tip.offsetWidth - 4)) + "px";
+  tip.style.top = (cy + 16) + "px";
+});
+$("zmap").addEventListener("mouseleave", () => { $("ztip").style.display = "none"; });
+window.addEventListener("resize", drawZones);
+
+function renderZones(s) {
+  $("zstrip").innerHTML = stripSpans(s.zones);
+  $("zlegend").innerHTML = legend(s.zones, true);
+  $("btn-compact").hidden = s.append !== "SEGMENTS";
 }
 
+/* ---------- details ---------- */
+const fmtOf = unit => ({ bytes: sizeLabel, ms: ms }[unit] || num);
+function hist(title, h) {
+  let body;
+  if (!h || !h.count) body = `<p class="note">No data yet.</p>`;
+  else {
+    const f = fmtOf(h.unit), max = Math.max(...h.buckets.map(b => b.count));
+    const avg = h.unit === "bytes" ? bytes(h.avg) : h.unit === "ms" ? ms(Math.round(h.avg)) : num(h.avg);
+    body = `<table class="hist">${h.buckets.map(b =>
+      `<tr class="${b.count ? "" : "zero"}"><td class="l">${b.lo === null ? "≤ " + f(b.hi) : f(b.lo) + " – " + f(b.hi)}</td>` +
+      `<td class="b"><div style="width:${(b.count / max * 100).toFixed(1)}%"></div></td><td class="n">${num(b.count)}</td></tr>`).join("")}</table>` +
+      `<div class="sum">${num(h.count)} in total · average ${avg} · half ≤ ${f(h.p50)} · 90% ≤ ${f(h.p90)} · 99% ≤ ${f(h.p99)}</div>`;
+  }
+  return panel(title, body);
+}
+function renderDetails(s) {
+  const d = delta, e = s.last_errors || {};
+  const err = (name, x) => [name, x ? `${span(x.secs_ago)} ago: ${esc(x.text)}` : "none", x && x.secs_ago < 600];
+  $("d-errors").innerHTML = kv([err("Upload to S3", e.upload), err("Read from S3", e.read),
+    err("I/O error returned to the filesystem", e.io), err("Concatenation", e.compact)]);
+  $("h-kernel").innerHTML = hist("READ size", s.req_read_size) + hist("ZONE_APPEND size (data)", s.req_append_size) +
+    hist("WRITE size (metadata, superblock)", s.req_write_size);
+  $("h-up").innerHTML = hist("Upload size", s.upload_size) + hist("Upload time", s.upload_latency_ms) +
+    hist("Zones uploaded per FLUSH", s.zones_per_flush);
+  $("h-rd").innerHTML = hist("GET size", s.get_size) + hist("GET time", s.get_latency_ms);
+  const seg = s.append === "SEGMENTS";
+  $("h-cat-wrap").hidden = !seg;
+  if (seg) $("h-cat").innerHTML = hist("Concatenation time", s.compact_time_ms) + hist("Segments per concatenation", s.segments_per_compaction);
+  const per = k => `${num(s[k])} <span class="note">· ${num(d(k))}/s</span>`;
+  $("d-counters").innerHTML =
+    panel("Uploads by reason", kv([["first write to a zone (PUT)", per("uploads_put")], ["appends", per("uploads_patch")],
+      ["FLUSH", per("uploads_flush")], ["FUA write", per("uploads_fua")], ["zone full", per("uploads_zone_full")],
+      ["zone closed", per("uploads_zone_closed")], ["over the RAM limit", per("uploads_background")],
+      ["zone FINISH", per("uploads_finish")], ["upload button", per("uploads_manual")], ["create", per("uploads_explicit")],
+      ["S3 retries", per("retries"), s.retries > 0], ["failed", per("upload_errors"), s.upload_errors > 0]])) +
+    panel("Reads by source", kv([["from S3", bytes(s.read_from_s3)], ["GET requests", num(s.gets)],
+      ["from the read cache", bytes(s.read_from_cache)], ["cache windows hit / fetched", `${num(s.read_ahead_hits)} / ${num(s.read_ahead_misses)}`],
+      ["from RAM buffers", bytes(s.read_from_ram)], ["zeros past the write pointer", bytes(s.read_zeros)]])) +
+    panel("Kernel requests", kv([["READ", `${num(s.req_read)} · ${bytes(s.req_read_bytes)}`],
+      ["ZONE_APPEND (data)", `${num(s.req_append)} · ${bytes(s.req_append_bytes)}`],
+      ["WRITE (metadata)", `${num(s.req_write)} · ${bytes(s.req_write_bytes)}`], ["FLUSH", num(s.req_flush)], ["FUA writes", num(s.req_fua)],
+      ["zone resets", num(s.req_zone_reset)], ["other zone operations", num(s.req_zone_mgmt)], ["zone reports", num(s.req_report)],
+      ["in flight now / max", `${num(s.requests_in_flight)} / ${num(s.requests_in_flight_max)}`],
+      ["waiting for RAM now / max", `${num(s.writes_waiting)} / ${num(s.writes_waiting_max)}`],
+      ["errors", num(s.req_errors), s.req_errors > 0]])) +
+    (seg ? panel("Concatenation", kv([["fragmented zones now", num(s.zones.fragmented)],
+      ["waiting / of them full", `${num(s.zones.compact_queued)} / ${num(s.zones.compact_urgent)}`],
+      ["running now / max", `${num(s.compacting)} / ${num(s.compacting_max)}`], ["completed", per("compactions")],
+      ["segments merged", per("compacted_segments")], ["copied on the server", bytes(s.compacted_bytes)],
+      ["dropped (zone changed meanwhile)", num(s.compact_aborted)], ["failed", num(s.compact_errors), s.compact_errors > 0]])) : "");
+}
+
+/* ---------- btrfs ---------- */
 async function tickBtrfs() {
   try {
     const r = await fetch("btrfs.json", { cache: "no-store" });
-    if (!r.ok) throw new Error(r.status);
+    if (!r.ok) throw new Error("HTTP " + r.status);
     renderBtrfs(await r.json());
-  } catch (e) {
-    $("b-cards").innerHTML = card("Filesystem", "–", `cannot read btrfs.json: ${esc(e.message)}`);
+  } catch (e) { $("b-facts").innerHTML = panel("Filesystem", `<p class="note">Cannot read btrfs.json: ${esc(e.message)}</p>`); }
+}
+function renderBtrfs(b) {
+  const busy = !!b.running;
+  for (const btn of document.querySelectorAll("[data-fsact]")) btn.disabled = busy || !b.mounted;
+  const l = b.last;
+  $("b-action").innerHTML = busy ? `${esc(b.running)} is running for ${span(b.running_secs)}.`
+    : l ? `Last: ${esc(l.name)} ${l.ok ? "finished" : '<span style="color:var(--bad)">failed</span>'} in ${num(l.secs)} s — ${esc(l.message)}` : "";
+  if (!b.mounted) {
+    $("b-facts").innerHTML = panel("Filesystem", `<p class="note">No btrfs on ${esc(b.device)} is mounted. Mount the disk to see it here.</p>`);
+    $("b-spaces").innerHTML = "";
+    return;
   }
+  const c = b.commits || {}, errs = Object.values(b.errors || {}).reduce((a, x) => a + x, 0);
+  $("b-facts").innerHTML =
+    panel("Filesystem", kv([["mounted on", esc(b.mountpoint)], ["writes", b.read_only ? "read-only — remount it" : "allowed", b.read_only],
+      ["label", esc(b.label || "none")], ["generation", num(b.generation)], ["fsid", `<span class="note">${esc(b.fsid)}</span>`]])) +
+    panel("Transaction commits", kv([["commits", num(c.commits)], ["last", `${num(c.last_commit_ms)} ms`], ["longest", `${num(c.max_commit_ms)} ms`],
+      ["average", c.commits ? `${num(c.total_commit_ms / c.commits)} ms` : "–"], ["running now", c.cur_commit_ms ? `${num(c.cur_commit_ms)} ms` : "no"]])) +
+    panel("Device errors", kv(Object.entries(b.errors || {}).map(([k, v]) => [esc(k.replace("_errs", "")), num(v), v > 0])
+      .concat([["total", num(errs), errs > 0]]))) +
+    panel("Running operation", kv([["exclusive operation", esc(b.exclusive_operation || "none")],
+      ["balance", b.balance.running ? `${num(b.balance.completed)} of ${num(b.balance.expected)} block groups` : "not running"],
+      ["global reserve", `${bytes(b.global_rsv_reserved)} of ${bytes(b.global_rsv_size)}`],
+      ["reclaim starts at", b.bg_reclaim_threshold === null ? "–" : `${num(b.bg_reclaim_threshold)}% allocated`]]));
+  $("b-spaces").innerHTML = `<tr><th></th><th>allocated</th><th>used</th><th>garbage in zones</th><th>pinned</th><th>reserved</th>` +
+    `<th>may use</th><th>reclaimed</th><th>reclaim below</th></tr>` +
+    b.spaces.map(x => `<tr><td>${esc(x.kind)}</td><td>${bytes(x.total_bytes)}</td><td>${bytes(x.bytes_used)}</td>` +
+      `<td>${bytes(x.bytes_zone_unusable)}</td><td>${bytes(x.bytes_pinned)}</td><td>${bytes(x.bytes_reserved)}</td><td>${bytes(x.bytes_may_use)}</td>` +
+      `<td>${num(x.reclaim_count)} · ${bytes(x.reclaim_bytes)}${x.reclaim_errors ? ` · <span style="color:var(--bad)">${num(x.reclaim_errors)} failed</span>` : ""}</td>` +
+      `<td>${x.bg_reclaim_threshold === null ? "–" : num(x.bg_reclaim_threshold) + "% used"}${x.dynamic_reclaim ? " · dynamic" : ""}${x.periodic_reclaim ? " · periodic" : ""}</td></tr>`).join("");
 }
 
-async function fsAct(name) {
+/* ---------- actions ---------- */
+async function post(name) {
+  const r = await fetch(name, { method: "POST" });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+for (const b of document.querySelectorAll("[data-act]")) b.onclick = async () => {
   try {
-    const r = await fetch(name, { method: "POST" });
-    const j = await r.json();
-    $("b-action").textContent = j.error ? `${name}: ${j.error}` : `${name} started`;
-  } catch (e) {
-    $("b-action").textContent = `${name} failed: ${e.message}`;
-  }
+    const j = await post(b.dataset.act);
+    say(b.dataset.act === "compact" ? `Queued ${num(j.queued)} fragmented zones for concatenation.`
+      : `Uploading ${bytes(j.bytes)} held in RAM for ${num(j.zones)} zones.`);
+    tickZones();
+  } catch (e) { say(`${b.textContent} failed: ${e.message}`); }
+};
+for (const b of document.querySelectorAll("[data-fsact]")) b.onclick = async () => {
+  try {
+    const j = await post(b.dataset.fsact);
+    say(j.error ? `${b.textContent}: ${j.error}` : `${b.textContent}: started.`);
+  } catch (e) { say(`${b.textContent} failed: ${e.message}`); }
   tickBtrfs();
+};
+
+/* ---------- loop ---------- */
+function push(name, v) { const s = series[name]; s.push(v); if (s.length > HISTORY) s.shift(); }
+
+/* Rates over the last interval; zero on the first sample or after a restart. */
+function update(s, p, dt) {
+  const fresh = !p || s.uptime_secs < p.uptime_secs || dt <= 0;
+  const d = k => fresh ? 0 : Math.max(0, s[k] - p[k]) / dt;
+  const dsum = k => fresh ? 0 : Math.max(0, s[k].sum - p[k].sum) / dt;
+  rates = {
+    kw: d("req_append_bytes") + d("req_write_bytes"), kwReq: d("req_append") + d("req_write"),
+    kr: d("req_read_bytes"), krReq: d("req_read"),
+    up: dsum("upload_size"), upReq: d("uploads_put") + d("uploads_patch"),
+    rd: d("read_from_s3"), gets: d("gets"), cache: d("read_from_cache"), ram: d("read_from_ram"),
+  };
+  delta = d;
+  push("up", rates.up); push("rd", rates.rd); push("dirty", s.dirty_bytes); push("par", s.uploads_in_flight);
+}
+function draw(s) {
+  $("disk").textContent = s.disk;
+  $("meta").textContent = `on ${s.device} · ${s.append} · up ${span(s.uptime_secs)}`;
+  document.title = `${s.alerts && s.alerts.length ? "⚠ " : ""}btrs3fs ${s.disk}`;
+  if (tab === "overview") renderOverview(s);
+  if (tab === "zones") renderZones(s);
+  if (tab === "details") renderDetails(s);
 }
 
+let ticks = 0;
 async function tick() {
   try {
     const r = await fetch("stats.json", { cache: "no-store" });
-    if (!r.ok) throw new Error(r.status);
+    if (!r.ok) throw new Error("HTTP " + r.status);
     const s = await r.json();
     const now = performance.now();
-    render(s, prev, (now - prevTime) / 1000);
+    update(s, prev, (now - prevTime) / 1000);
+    prev = s; prevTime = now; last = s;
+    draw(s);
+    $("live").className = "on"; $("live").textContent = "live";
     if (tab === "btrfs") tickBtrfs();
-    prev = s; prevTime = now;
-    $("status").className = "live";
-    $("status").textContent = "live, every 1 s";
+    if (tab === "zones" && ++ticks % 3 === 0) tickZones();  // the map changes slowly; every 3 s is enough
   } catch (e) {
-    $("status").className = "down";
-    $("status").textContent = "no connection to the device server";
+    $("live").className = "off"; $("live").textContent = "no connection to the device server";
   }
 }
 tick();
