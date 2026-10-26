@@ -86,6 +86,9 @@
 
   <h2>Distributions since start</h2>
   <div class="grid wide">
+    <div class="card"><div class="label">Kernel READ size</div><table class="hist" id="h-kread"></table></div>
+    <div class="card"><div class="label">Kernel ZONE_APPEND size (data)</div><table class="hist" id="h-kappend"></table></div>
+    <div class="card"><div class="label">Kernel WRITE size (metadata, superblock)</div><table class="hist" id="h-kwrite"></table></div>
     <div class="card"><div class="label">Upload size (PUT/PATCH body)</div><table class="hist" id="h-size"></table></div>
     <div class="card"><div class="label">Upload time</div><table class="hist" id="h-uplat"></table></div>
     <div class="card"><div class="label">Zones uploaded per FLUSH</div><table class="hist" id="h-zones"></table></div>
@@ -239,6 +242,9 @@ function render(s, p, dt) {
   chart("ch-par", "Uploads in flight", series.par, v => num(v));
   chart("ch-dirty", "RAM buffers", series.dirty, bytes);
 
+  $("h-kread").innerHTML = histRows(s.req_read_size);
+  $("h-kappend").innerHTML = histRows(s.req_append_size);
+  $("h-kwrite").innerHTML = histRows(s.req_write_size);
   $("h-size").innerHTML = histRows(s.upload_size);
   $("h-uplat").innerHTML = histRows(s.upload_latency_ms);
   $("h-zones").innerHTML = histRows(s.zones_per_flush);

@@ -364,6 +364,7 @@ async fn handle_io(q: &UblkQueue, tag: u16, ctx: &Ctx, efd: &Arc<OwnedFd>) -> ZR
         sys::UBLK_IO_OP_READ => {
             STATS.req_read.inc();
             STATS.req_read_bytes.add(len);
+            STATS.req_read_size.record(len);
             let pieces = engine.read_plan(offset, len)?;
             let bufs = if pieces.iter().any(|p| matches!(p, Piece::Store { .. })) {
                 let e = engine.clone();
@@ -379,9 +380,11 @@ async fn handle_io(q: &UblkQueue, tag: u16, ctx: &Ctx, efd: &Arc<OwnedFd>) -> ZR
             if op == sys::UBLK_IO_OP_ZONE_APPEND {
                 STATS.req_append.inc();
                 STATS.req_append_bytes.add(len);
+                STATS.req_append_size.record(len);
             } else {
                 STATS.req_write.inc();
                 STATS.req_write_bytes.add(len);
+                STATS.req_write_size.record(len);
             }
             // Room first, then the copy: a request waiting for room holds no
             // data (SPEC.md §5).
