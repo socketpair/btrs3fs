@@ -1,3 +1,4 @@
+mod btrfs;
 mod config;
 mod device;
 mod ident;
@@ -406,6 +407,8 @@ fn serve_disk(
         });
         if let Some(port) = port {
             let device = bdev.to_string();
+            let fs = Arc::new(btrfs::Btrfs::new(device.trim_start_matches("/dev/")));
+            let json_fs = fs.clone();
             let act_engine = stats_engine.clone();
             let snapshot = move || {
                 let (zones, dirty_zones) = stats_engine.zone_summary();
@@ -423,6 +426,10 @@ fn serve_disk(
             };
             let act_rt = act_rt.clone();
             let action = move |name: &str| match name {
+                "balance" | "syncfs" => Some(match fs.start(name) {
+                    Ok(()) => r#"{"started":true}"#.to_string(),
+                    Err(e) => serde_json::json!({ "error": e }).to_string(),
+                }),
                 "compact" => Some(format!("{{\"queued\":{}}}", act_engine.compact_all())),
                 "flush" => {
                     let pending = act_engine.unflushed();
@@ -441,7 +448,12 @@ fn serve_disk(
                 }
                 _ => None,
             };
-            match stats::serve_http(port, snapshot, action) {
+            let json = move |name: &str| match name {
+                "stats.json" => serde_json::to_string(&snapshot()).ok(),
+                "btrfs.json" => serde_json::to_string(&json_fs.info()).ok(),
+                _ => None,
+            };
+            match stats::serve_http(port, json, action) {
                 Ok(()) => {
                     let _ = STATS_PORT.set(port);
                 }

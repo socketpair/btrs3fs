@@ -38,6 +38,10 @@
   .btn { margin-top: 8px; padding: 3px 10px; font: inherit; font-size: 12px; color: var(--text);
          background: var(--line); border: 1px solid var(--line); border-radius: 4px; cursor: pointer; }
   .btn:hover { border-color: var(--accent); }
+  .tabs { margin-left: auto; display: flex; gap: 4px; }
+  .tab { font: inherit; font-size: 13px; padding: 4px 12px; color: var(--muted); background: none;
+         border: 1px solid var(--line); border-radius: 4px; cursor: pointer; }
+  .tab.active { color: var(--text); border-color: var(--accent); }
   .meter { height: 6px; border-radius: 3px; background: var(--line); margin-top: 8px; overflow: hidden; }
   .meter > div { height: 100%; background: var(--accent); width: 0; }
   .chart svg { width: 100%; height: 90px; display: block; margin-top: 6px; }
@@ -60,8 +64,13 @@
   <span class="sub" id="title">connecting…</span>
   <span id="status">—</span>
   <span class="sub" id="action"></span>
+  <nav class="tabs">
+    <button class="tab active" data-tab="dev" onclick="showTab('dev')">Device</button>
+    <button class="tab" data-tab="btrfs" onclick="showTab('btrfs')">btrfs</button>
+  </nav>
 </header>
 <main>
+<div id="tab-dev">
   <div class="grid" id="cards"></div>
 
   <h2>Last 5 minutes</h2>
@@ -92,6 +101,27 @@
   </div>
   <p class="hint">Counters are totals since the device server started; “/s” columns are the last second.
      Raw data: <a href="stats.json">stats.json</a>.</p>
+</div>
+<div id="tab-btrfs" style="display:none">
+  <div class="grid" id="b-cards"></div>
+  <h2>Space by block group type</h2>
+  <div class="grid wide">
+    <div class="card" style="grid-column: 1 / -1"><table id="b-spaces"></table></div>
+  </div>
+  <h2>Actions</h2>
+  <div class="grid wide">
+    <div class="card"><div class="label">Operations on the filesystem</div>
+      <button class="btn" onclick="fsAct('balance')">balance -dusage=0</button>
+      <button class="btn" onclick="fsAct('syncfs')">syncfs()</button>
+      <div class="detail" id="b-action"></div>
+      <div class="detail">balance -dusage=0 removes data block groups nothing lives in (in zoned mode
+        that resets their zones and deletes their objects); syncfs() commits the btrfs transaction,
+        so all written files are stored in S3.</div>
+    </div>
+  </div>
+  <p class="hint">From sysfs (<code>/sys/fs/btrfs/&lt;fsid&gt;</code>) and btrfs ioctls; refreshed every second
+     while this tab is open. Raw data: <a href="btrfs.json">btrfs.json</a>.</p>
+</div>
 </main>
 <script>
 "use strict";
@@ -266,6 +296,71 @@ async function act(name) {
   }
 }
 
+let tab = "dev";
+function showTab(t) {
+  tab = t;
+  $("tab-dev").style.display = t === "dev" ? "" : "none";
+  $("tab-btrfs").style.display = t === "btrfs" ? "" : "none";
+  for (const b of document.querySelectorAll(".tab")) b.className = "tab" + (b.dataset.tab === t ? " active" : "");
+  if (t === "btrfs") tickBtrfs();
+}
+
+const optBytes = v => v === null || v === undefined ? "–" : bytes(v);
+const optNum = v => v === null || v === undefined ? "–" : num(v);
+
+function renderBtrfs(b) {
+  if (!b.mounted) {
+    $("b-cards").innerHTML = card("Filesystem", "not mounted", `no mounted btrfs on ${esc(b.device)}`);
+    $("b-spaces").innerHTML = "";
+  } else {
+    const c = b.commits, errs = Object.values(b.errors).reduce((a, x) => a + x, 0);
+    const bal = b.balance.running
+      ? `balance: ${num(b.balance.completed)} of ${num(b.balance.expected)} block groups done (${num(b.balance.considered)} considered)`
+      : "no balance running";
+    $("b-cards").innerHTML =
+      card("Filesystem", esc(b.mountpoint),
+           `${b.read_only ? '<span class="bad">read-only</span>' : "read-write"} · ${esc(b.device)} · label ${esc(b.label || "–")}<br>` +
+           `fsid ${esc(b.fsid)} · generation ${optNum(b.generation)} · node ${optBytes(b.nodesize)} · sector ${optBytes(b.sectorsize)}`) +
+      card("Transaction commits", optNum(c.commits),
+           `last ${optNum(c.last_commit_ms)} ms · max ${optNum(c.max_commit_ms)} ms · ` +
+           `average ${c.commits ? num(c.total_commit_ms / c.commits) : "–"} ms` + (c.cur_commit_ms ? ` · committing now ${num(c.cur_commit_ms)} ms` : "")) +
+      card("Device errors", `<span class="${errs ? "bad" : ""}">${num(errs)}</span>`,
+           Object.entries(b.errors).map(([k, v]) => `${esc(k.replace("_errs", ""))} ${num(v)}`).join(" · ")) +
+      card("Exclusive operation", esc(b.exclusive_operation || "–"), bal) +
+      card("Global reserve", optBytes(b.global_rsv_reserved), `of ${optBytes(b.global_rsv_size)} · reclaim threshold ${optNum(b.bg_reclaim_threshold)}%`);
+    table("b-spaces", ["", "allocated", "used", "zone unusable", "pinned", "reserved", "may use", "read-only", "on disk", "reclaimed (count / bytes)", "reclaim threshold / dynamic / periodic"],
+      b.spaces.map(x => [esc(x.kind), optBytes(x.total_bytes), optBytes(x.bytes_used), optBytes(x.bytes_zone_unusable),
+        optBytes(x.bytes_pinned), optBytes(x.bytes_reserved), optBytes(x.bytes_may_use), optBytes(x.bytes_readonly),
+        `${optBytes(x.disk_used)} of ${optBytes(x.disk_total)}`, `${optNum(x.reclaim_count)} / ${optBytes(x.reclaim_bytes)}` + (x.reclaim_errors ? ` · <span class="bad">${num(x.reclaim_errors)} errors</span>` : ""),
+        `${optNum(x.bg_reclaim_threshold)}% / ${optNum(x.dynamic_reclaim)} / ${optNum(x.periodic_reclaim)}`]));
+  }
+  const l = b.last;
+  $("b-action").innerHTML = b.running
+    ? `${esc(b.running)} is running, ${num(b.running_secs)} s`
+    : l ? `last: ${esc(l.name)} <span class="${l.ok ? "" : "bad"}">${l.ok ? "done" : "failed"}</span> in ${num(l.secs)} s — ${esc(l.message)}` : "";
+}
+
+async function tickBtrfs() {
+  try {
+    const r = await fetch("btrfs.json", { cache: "no-store" });
+    if (!r.ok) throw new Error(r.status);
+    renderBtrfs(await r.json());
+  } catch (e) {
+    $("b-cards").innerHTML = card("Filesystem", "–", `cannot read btrfs.json: ${esc(e.message)}`);
+  }
+}
+
+async function fsAct(name) {
+  try {
+    const r = await fetch(name, { method: "POST" });
+    const j = await r.json();
+    $("b-action").textContent = j.error ? `${name}: ${j.error}` : `${name} started`;
+  } catch (e) {
+    $("b-action").textContent = `${name} failed: ${e.message}`;
+  }
+  tickBtrfs();
+}
+
 async function tick() {
   try {
     const r = await fetch("stats.json", { cache: "no-store" });
@@ -273,6 +368,7 @@ async function tick() {
     const s = await r.json();
     const now = performance.now();
     render(s, prev, (now - prevTime) / 1000);
+    if (tab === "btrfs") tickBtrfs();
     prev = s; prevTime = now;
     $("status").className = "live";
     $("status").textContent = "live, every 1 s";

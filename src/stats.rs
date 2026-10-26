@@ -513,11 +513,12 @@ impl Stats {
 }
 
 /// Serves the statistics page on 127.0.0.1:`port` in a background thread.
-/// Serves the page, `/stats.json` and the actions `POST /<name>`: `action`
-/// gets the name and answers with a JSON body, or `None` for an unknown one.
+/// Serves the page, `GET /<name>.json` and the actions `POST /<name>`:
+/// `json` and `action` get the name and answer with a JSON body, or `None`
+/// for an unknown one.
 pub fn serve_http(
     port: u16,
-    snapshot: impl Fn() -> Snapshot + Send + 'static,
+    json: impl Fn(&str) -> Option<String> + Send + 'static,
     action: impl Fn(&str) -> Option<String> + Send + 'static,
 ) -> anyhow::Result<()> {
     let server = tiny_http::Server::http(("127.0.0.1", port))
@@ -534,13 +535,13 @@ pub fn serve_http(
                         Some(json) => (200, json, "application/json"),
                         None => (404, "no such action\n".into(), "text/plain; charset=utf-8"),
                     },
-                    "/compact" | "/flush" => {
+                    "/compact" | "/flush" | "/balance" | "/syncfs" => {
                         (405, "use POST\n".into(), "text/plain; charset=utf-8")
                     }
                     "/" | "/index.html" => (200, PAGE.to_string(), "text/html; charset=utf-8"),
-                    "/stats.json" => match serde_json::to_string(&snapshot()) {
-                        Ok(json) => (200, json, "application/json"),
-                        Err(e) => (500, e.to_string(), "text/plain; charset=utf-8"),
+                    p if p.ends_with(".json") => match json(p.trim_start_matches('/')) {
+                        Some(body) => (200, body, "application/json"),
+                        None => (404, "not found\n".into(), "text/plain; charset=utf-8"),
                     },
                     _ => (404, "not found\n".into(), "text/plain; charset=utf-8"),
                 };
@@ -631,9 +632,14 @@ mod tests {
         let port = 39470;
         serve_http(
             port,
-            || Snapshot {
-                disk: "t/".into(),
-                ..Default::default()
+            |name| {
+                (name == "stats.json").then(|| {
+                    serde_json::to_string(&Snapshot {
+                        disk: "t/".into(),
+                        ..Default::default()
+                    })
+                    .unwrap()
+                })
             },
             |name| (name == "compact").then(|| "{\"queued\":3}".to_string()),
         )
@@ -656,6 +662,7 @@ mod tests {
         let json = get("/stats.json");
         assert!(json.contains("\"disk\":\"t/\""));
         assert!(get("/nope").starts_with("HTTP/1.1 404"));
+        assert!(get("/nope.json").starts_with("HTTP/1.1 404"));
         assert!(get("/compact").starts_with("HTTP/1.1 405"));
         let posted = send("POST", "/compact");
         assert!(posted.starts_with("HTTP/1.1 200") && posted.ends_with("{\"queued\":3}"));
