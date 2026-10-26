@@ -1,2 +1,3 @@
 /creds.json
+/creds[0-9]*.json
 /target
