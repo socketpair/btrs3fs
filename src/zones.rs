@@ -114,10 +114,12 @@ struct Stored {
 
 /// Picks the objects serving a zone from the `(start, size)` the store lists
 /// (SPEC.md §5): from offset 0 on, each step takes the object covering the
-/// current end that reaches furthest. Objects within the covered part are
-/// leftovers of a concatenation (returned to delete); an object beyond a gap
-/// is an error — it cannot happen unless data was lost.
-fn cover(mut found: Vec<(u64, u64)>) -> Result<(Vec<Stored>, Vec<u64>), String> {
+/// current end that reaches furthest. The rest are returned to delete:
+/// objects within the covered part are leftovers of a concatenation, objects
+/// past a gap leftovers of an interrupted RESET (DeleteObjects is not atomic;
+/// listings are strongly consistent, so nothing else leaves a gap) — kept,
+/// they would join the zone once it grew up to them.
+fn cover(mut found: Vec<(u64, u64)>) -> (Vec<Stored>, Vec<u64>) {
     found.sort_unstable();
     let mut chosen: Vec<Stored> = Vec::new();
     let mut end = 0;
@@ -133,15 +135,12 @@ fn cover(mut found: Vec<(u64, u64)>) -> Result<(Vec<Stored>, Vec<u64>), String> 
         });
         end = start + size;
     }
-    if let Some(&(start, _)) = found.iter().find(|&&(start, _)| start > end) {
-        return Err(format!("object at {start} lies after a gap at {end}"));
-    }
     let leftovers = found
         .iter()
         .filter(|&&(start, _)| !chosen.iter().any(|c| c.start == start))
         .map(|&(start, _)| start)
         .collect();
-    Ok((chosen, leftovers))
+    (chosen, leftovers)
 }
 
 /// Zones waiting for concatenation: urgent (FULL) ones first.
@@ -269,9 +268,18 @@ impl Engine {
         let mut zones = Vec::with_capacity(nr_zones);
         for (i, (objects, &finished)) in found.into_iter().zip(&finished).enumerate() {
             let start = i as u64 * cfg.zone_size;
-            let (objects, garbage) = cover(objects)
-                .map_err(|e| anyhow::anyhow!("zone {i} at {start:#x}: {e}; refusing to guess"))?;
-            leftovers.extend(garbage.into_iter().map(|g| layout.segment_key(start, g)));
+            let (objects, garbage) = cover(objects);
+            let end = objects.last().map_or(0, |o| o.to);
+            for g in garbage {
+                let key = layout.segment_key(start, g);
+                if g >= end {
+                    warn!(
+                        "zone {i}: {key} lies past the zone's data at {end:#x}, \
+                         left by an interrupted RESET; deleting it"
+                    );
+                }
+                leftovers.push(key);
+            }
             let size = objects.last().map_or(0, |o| o.to);
             let (cond, wp) = if finished || size == cfg.zone_size {
                 full += 1;
@@ -1326,15 +1334,15 @@ mod tests {
             ["t/0000000000000000-00000000", "t/0000000000000000-00003000"]
         );
 
-        // An object after a gap means lost data: refuse to start.
-        put("t/0000000000100000-00002000", blk(5, 1)).await;
-        let mut cfg = DiskConfig::new(8 * ZS, ZS);
-        cfg.append = AppendMode::Segments;
-        let err = Engine::open(&cfg, Layout::new("t").unwrap(), store)
-            .await
-            .err()
-            .unwrap();
-        assert!(err.to_string().contains("gap"), "{err}");
+        // Past a gap: left by an interrupted RESET, deleted.
+        put("t/0000000000100000-00000000", blk(5, 1)).await;
+        put("t/0000000000100000-00002000", blk(6, 1)).await;
+        let e = segments_engine(store.clone()).await;
+        assert_eq!(e.report(1, 1)[0].wp, ZS + B);
+        assert_eq!(
+            keys(&store, "t/0000000000100000").await,
+            ["t/0000000000100000-00000000"]
+        );
     }
 
     #[tokio::test]
