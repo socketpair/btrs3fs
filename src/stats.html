@@ -42,6 +42,9 @@
   .tab { font: inherit; font-size: 13px; padding: 4px 12px; color: var(--muted); background: none;
          border: 1px solid var(--line); border-radius: 4px; cursor: pointer; }
   .tab.active { color: var(--text); border-color: var(--accent); }
+  .kv { width: 100%; border-collapse: collapse; }
+  .kv td { padding: 1px 0; }
+  .kv td:last-child { text-align: right; padding-left: 12px; color: var(--text); }
   .meter { height: 6px; border-radius: 3px; background: var(--line); margin-top: 8px; overflow: hidden; }
   .meter > div { height: 100%; background: var(--accent); width: 0; }
   .chart svg { width: 100%; height: 90px; display: block; margin-top: 6px; }
@@ -150,6 +153,9 @@ function duration(s) {
   return (d ? d + "d " : "") + (d || h ? h + "h " : "") + m + "m " + (s % 60) + "s";
 }
 
+/* Label and number per line, numbers aligned on the right. */
+const kv = rows => `<table class="kv">${rows.map(([k, v]) => `<tr><td>${k}</td><td>${num(v)}</td></tr>`).join("")}</table>`;
+
 function card(label, value, detail, meter) {
   return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div>` +
     (detail ? `<div class="detail">${detail}</div>` : "") +
@@ -201,6 +207,7 @@ function render(s, p, dt) {
   const d = k => fresh ? 0 : Math.max(0, s[k] - p[k]) / dt;
   const dsum = k => fresh ? 0 : Math.max(0, s[k].sum - p[k].sum) / dt;
   const uploads = s.uploads_put + s.uploads_patch;
+  const z = s.zones;
 
   $("title").innerHTML = `${esc(s.disk)} on ${esc(s.device)} · up ${duration(s.uptime_secs)}`;
   document.title = `btrs3fs ${s.device}`;
@@ -215,9 +222,13 @@ function render(s, p, dt) {
          `<br><button class="btn" onclick="act('flush')">Upload buffered data</button>`,
          s.dirty_bytes / s.dirty_hard_limit * 100) +
     card("Uploads in parallel", `${s.uploads_in_flight}`, `max ${s.uploads_in_flight_max} · kernel requests ${s.requests_in_flight} (max ${s.requests_in_flight_max})`) +
-    card("Zones", `${s.zones.open} open`, `${s.zones.closed} closed · ${s.zones.full} full · ${s.zones.empty} empty<br>` +
-         `${s.zones.partial} partly filled · ${s.zones.fragmented} fragmented (${num(s.zones.objects)} objects, at most ${s.zones.max_objects} in a zone)` +
-         (s.append === "SEGMENTS" ? `<br><button class="btn" onclick="act('compact')">Concatenate fragmented zones</button>` : "")) +
+    card("Zones in use", `${num(z.open + z.closed + z.full)} of ${num(z.open + z.closed + z.full + z.empty)}`,
+         kv([["open", z.open], ["closed", z.closed], ["full", z.full], ["empty", z.empty],
+             ["partly filled (data, but less than a zone)", z.partial],
+             ["fragmented (more than one S3 object)", z.fragmented],
+             ["S3 objects of all zones", z.objects],
+             ["most S3 objects in one zone", z.max_objects]]) +
+         (s.append === "SEGMENTS" ? `<button class="btn" onclick="act('compact')">Concatenate fragmented zones</button>` : "")) +
     card("Problems", `<span class="${s.upload_errors + s.req_errors ? "bad" : ""}">${num(s.upload_errors + s.req_errors)}</span>`,
          `failed uploads ${num(s.upload_errors)} · I/O errors ${num(s.req_errors)} · S3 retries ${num(s.retries)}` +
          (errRate ? ` · <span class="bad">${num(errRate)}/s</span>` : ""));
