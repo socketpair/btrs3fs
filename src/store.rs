@@ -16,6 +16,9 @@ pub enum StoreError {
     NotFound(String),
     #[error("invalid range for object {key}: {detail}")]
     InvalidRange { key: String, detail: String },
+    /// The S3 service does not implement the request (HTTP 405 or 501).
+    #[error("{0}")]
+    Unsupported(String),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

@@ -325,7 +325,9 @@ fn open_s3_disk(
     let cfg = rt
         .block_on(load_config(&s3, &layout))?
         .with_context(|| format!("disk {} not found, create it first", layout.config_key()))?;
-    let s3 = s3.with_retry(RetryPolicy::from_config(&cfg));
+    let s3 = s3
+        .with_retry(RetryPolicy::from_config(&cfg))
+        .with_append(cfg.append);
     Ok((cfg, layout, Store::S3(s3)))
 }
 
@@ -854,10 +856,13 @@ fn cmd_create(a: CreateArgs) -> anyhow::Result<i32> {
                 existing.len()
             );
         }
+        cfg.append = s3.detect_append(&layout.dir()).await?;
+        info!("appending to zone objects with {:?}", cfg.append);
         let json = Bytes::from(cfg.to_json());
         s3.put(&layout.config_key(), Body::new(vec![json])).await?;
         Ok(())
     })?;
+    let s3 = s3.with_append(cfg.append);
     info!(
         "created {}: {} bytes, {} zones of {} bytes",
         layout.config_key(),

@@ -6,8 +6,8 @@
 //! so they are streamed from the zone chunks without hashing or concatenation.
 
 use crate::config::{
-    Creds, DEFAULT_RETRY_BACKOFF, DEFAULT_RETRY_INITIAL_DELAY_MS, DEFAULT_RETRY_TIMEOUT_SECS,
-    DiskConfig,
+    AppendMode, Creds, DEFAULT_RETRY_BACKOFF, DEFAULT_RETRY_INITIAL_DELAY_MS,
+    DEFAULT_RETRY_TIMEOUT_SECS, DiskConfig,
 };
 use crate::store::{Body, ObjectInfo, StoreError, StoreResult};
 use anyhow::{Context, anyhow};
@@ -86,6 +86,7 @@ pub struct S3Store {
     region: String,
     credentials: Credentials,
     retry: RetryPolicy,
+    append: AppendMode,
 }
 
 /// TCP keepalive probes on idle connections: notices connections silently
@@ -140,7 +141,16 @@ impl S3Store {
                 "btrs3fs",
             ),
             retry,
+            append: AppendMode::Patch,
         })
+    }
+
+    /// Same client and connection pool with another way to append (from disk.json).
+    pub fn with_append(&self, append: AppendMode) -> Self {
+        Self {
+            append,
+            ..self.clone()
+        }
     }
 
     /// Same client and connection pool with another retry policy.
@@ -175,7 +185,14 @@ impl S3Store {
                     chunks.into_iter().map(Ok::<Bytes, std::io::Error>),
                 ))
             }
-            None => reqwest::Body::from(Bytes::new()),
+            None => {
+                // Some S3 services (Selectel) refuse a POST or PUT without
+                // Content-Length (411), even with nothing to send.
+                if matches!(method, reqwest::Method::POST | reqwest::Method::PUT) {
+                    req = req.header(http::header::CONTENT_LENGTH, 0);
+                }
+                reqwest::Body::from(Bytes::new())
+            }
         };
         let mut req = req.body(reqwest_body).expect("request parts are valid");
         self.sign(&mut req);
@@ -259,7 +276,33 @@ impl S3Store {
         .await
     }
 
+    /// Writes `body` at `offset` of an existing object, `offset` = its size.
     pub async fn patch(&self, key: &str, offset: u64, body: Body) -> StoreResult<()> {
+        match self.append {
+            AppendMode::Patch => self.patch_request(key, offset, body).await,
+            AppendMode::Multipart => self.append_multipart(key, offset, body).await,
+        }
+    }
+
+    /// Which way of appending this bucket accepts (SPEC.md §5): PATCH on a
+    /// probe object under `dir`; HTTP 405/501 means none, so multipart.
+    pub async fn detect_append(&self, dir: &str) -> StoreResult<AppendMode> {
+        let key = format!("{}/append-probe", dir.trim_end_matches('/'));
+        let block = Bytes::from(vec![0u8; crate::config::BLOCK_SIZE as usize]);
+        self.put(&key, Body::new(vec![block.clone()])).await?;
+        let patched = self
+            .patch_request(&key, block.len() as u64, Body::new(vec![block]))
+            .await;
+        self.delete(&key).await?;
+        match patched {
+            Ok(()) => Ok(AppendMode::Patch),
+            Err(StoreError::Unsupported(_)) => Ok(AppendMode::Multipart),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Yandex PATCH: `Content-Range: bytes a-b/*`.
+    async fn patch_request(&self, key: &str, offset: u64, body: Body) -> StoreResult<()> {
         let url = self.object_url(key);
         let range = format!("bytes {}-{}/*", offset, offset + body.len() - 1);
         self.with_retries(&format!("PATCH {key} {range}"), || async {
@@ -268,6 +311,134 @@ impl S3Store {
                 .send(reqwest::Method::PATCH, &url, &headers, Some(&body))
                 .await?;
             check(resp, key).await.map(drop)
+        })
+        .await
+    }
+
+    /// Append without PATCH: a multipart upload whose part 1 is the object's
+    /// first `offset` bytes copied on the server (UploadPartCopy) and part 2
+    /// the new data; completing it replaces the object. Copying exactly
+    /// `[0, offset)` makes a repeat after a lost answer give the same object,
+    /// as PATCH with an explicit offset does (SPEC.md §5). Where parts must be
+    /// at least 5 MiB (AWS) and the object is smaller, the start is read back
+    /// and the whole object written with one PUT instead.
+    async fn append_multipart(&self, key: &str, offset: u64, body: Body) -> StoreResult<()> {
+        if offset == 0 {
+            return self.put(key, body).await;
+        }
+        let url = self.object_url(key);
+        let upload_id = self.create_multipart(key, &url).await?;
+        let completed = self
+            .multipart_parts(key, &url, &upload_id, offset, &body)
+            .await;
+        if !matches!(completed, Ok(true)) {
+            // Best effort: an upload left behind only costs storage until it expires.
+            if let Err(e) = self.abort_multipart(key, &url, &upload_id).await {
+                warn!("cannot abort multipart upload of {key}: {e}");
+            }
+        }
+        if !completed? {
+            let start = self.get_range(key, 0, offset).await?;
+            let mut chunks = vec![start];
+            chunks.extend(body.chunks);
+            self.put(key, Body::new(chunks)).await?;
+        }
+        Ok(())
+    }
+
+    /// CreateMultipartUpload: the upload id.
+    async fn create_multipart(&self, key: &str, url: &str) -> StoreResult<String> {
+        let url = format!("{url}?uploads");
+        self.with_retries(&format!("POST {key}?uploads"), || async {
+            let resp = self.send(reqwest::Method::POST, &url, &[], None).await?;
+            let xml = check(resp, key).await?.text().await?;
+            let r: InitiateResult = quick_xml::de::from_str(&xml).map_err(|e| {
+                Attempt::Fatal(anyhow!("cannot parse multipart upload answer: {e}").into())
+            })?;
+            Ok(r.upload_id)
+        })
+        .await
+    }
+
+    /// Parts 1 (server copy of `[0, offset)`) and 2 (`body`), then
+    /// CompleteMultipartUpload. `false`: the service wants larger parts.
+    async fn multipart_parts(
+        &self,
+        key: &str,
+        url: &str,
+        upload_id: &str,
+        offset: u64,
+        body: &Body,
+    ) -> StoreResult<bool> {
+        let id = encode_query(upload_id);
+        let part_url = |n: u32| format!("{url}?partNumber={n}&uploadId={id}");
+
+        let copy_url = part_url(1);
+        let copy_headers = [
+            (
+                "x-amz-copy-source",
+                format!("/{}/{}", self.bucket, encode_path(key)),
+            ),
+            ("x-amz-copy-source-range", format!("bytes=0-{}", offset - 1)),
+        ];
+        let etag1 = self
+            .with_retries(&format!("COPY {key} part"), || async {
+                let resp = self
+                    .send(reqwest::Method::PUT, &copy_url, &copy_headers, None)
+                    .await?;
+                let xml = check(resp, key).await?.text().await?;
+                body_error(&xml, key)?;
+                let r: CopyPartResult = quick_xml::de::from_str(&xml).map_err(|e| {
+                    Attempt::Fatal(anyhow!("cannot parse copy part answer: {e}").into())
+                })?;
+                Ok(r.e_tag)
+            })
+            .await?;
+
+        let data_url = part_url(2);
+        let etag2 = self
+            .with_retries(&format!("PUT {key} part"), || async {
+                let resp = self
+                    .send(reqwest::Method::PUT, &data_url, &[], Some(body))
+                    .await?;
+                let resp = check(resp, key).await?;
+                resp.headers()
+                    .get(http::header::ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+                    .ok_or_else(|| Attempt::Fatal(anyhow!("{key}: part without ETag").into()))
+            })
+            .await?;
+
+        let done_url = format!("{url}?uploadId={id}");
+        let xml = Body::new(vec![Bytes::from(complete_xml(&[etag1, etag2]))]);
+        self.with_retries(&format!("COMPLETE {key}"), || async {
+            let headers = [("content-type", "application/xml".to_string())];
+            let resp = self
+                .send(reqwest::Method::POST, &done_url, &headers, Some(&xml))
+                .await?;
+            let answer = check(resp, key).await?.text().await?;
+            match body_error(&answer, key) {
+                Err(Attempt::Fatal(StoreError::Other(e)))
+                    if e.to_string().contains("EntityTooSmall") =>
+                {
+                    Ok(false)
+                }
+                Err(e) => Err(e),
+                Ok(()) => Ok(true),
+            }
+        })
+        .await
+    }
+
+    async fn abort_multipart(&self, key: &str, url: &str, upload_id: &str) -> StoreResult<()> {
+        let url = format!("{url}?uploadId={}", encode_query(upload_id));
+        self.with_retries(&format!("ABORT {key}"), || async {
+            let resp = self.send(reqwest::Method::DELETE, &url, &[], None).await?;
+            match check(resp, key).await {
+                Ok(_) | Err(Attempt::Fatal(StoreError::NotFound(_))) => Ok(()),
+                Err(e) => Err(e),
+            }
         })
         .await
     }
@@ -465,12 +636,62 @@ async fn check(resp: reqwest::Response, key: &str) -> Result<reqwest::Response, 
             key: key.to_string(),
             detail,
         }),
+        StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED => {
+            Attempt::Fatal(StoreError::Unsupported(format!("{key}: {detail}")))
+        }
         StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT => {
             Attempt::Retry(anyhow!(detail))
         }
         s if s.is_server_error() => Attempt::Retry(anyhow!(detail)),
         _ => Attempt::Fatal(anyhow!("{key}: {detail}").into()),
     })
+}
+
+/// UploadPartCopy and CompleteMultipartUpload may answer 200 with an
+/// `<Error>` body (S3 starts the answer before the work ends).
+fn body_error(xml: &str, key: &str) -> Result<(), Attempt> {
+    if !xml.contains("<Error>") {
+        return Ok(());
+    }
+    let summary = s3_error_summary(xml);
+    let err = anyhow!("{key}: {summary}");
+    Err(
+        if ["InternalError", "ServiceUnavailable", "SlowDown"]
+            .iter()
+            .any(|c| summary.starts_with(c))
+        {
+            Attempt::Retry(err)
+        } else {
+            Attempt::Fatal(err.into())
+        },
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct InitiateResult {
+    upload_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct CopyPartResult {
+    #[serde(rename = "ETag")]
+    e_tag: String,
+}
+
+/// CompleteMultipartUpload body: parts numbered from 1 in order.
+fn complete_xml(etags: &[String]) -> String {
+    let mut xml = String::from("<CompleteMultipartUpload>");
+    for (i, etag) in etags.iter().enumerate() {
+        xml.push_str(&format!(
+            "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+            i + 1,
+            quick_xml::escape::escape(etag.as_str())
+        ));
+    }
+    xml.push_str("</CompleteMultipartUpload>");
+    xml
 }
 
 /// Keys in one DeleteObjects request: the S3 API maximum.
@@ -557,6 +778,34 @@ mod tests {
         let empty = r#"<ListBucketResult><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>"#;
         let r: ListResult = quick_xml::de::from_str(empty).unwrap();
         assert!(r.contents.is_empty() && !r.is_truncated);
+    }
+
+    #[test]
+    fn multipart_bodies() {
+        assert_eq!(
+            complete_xml(&["\"a1\"".into(), "\"b2\"".into()]),
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>1</PartNumber><ETag>&quot;a1&quot;</ETag></Part>\
+             <Part><PartNumber>2</PartNumber><ETag>&quot;b2&quot;</ETag></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let r: InitiateResult = quick_xml::de::from_str(
+            "<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key>\
+             <UploadId>2~abc</UploadId></InitiateMultipartUploadResult>",
+        )
+        .unwrap();
+        assert_eq!(r.upload_id, "2~abc");
+        let c: CopyPartResult = quick_xml::de::from_str(
+            "<CopyPartResult><LastModified>x</LastModified><ETag>\"e\"</ETag></CopyPartResult>",
+        )
+        .unwrap();
+        assert_eq!(c.e_tag, "\"e\"");
+        // 200 with an error body: retried for transient codes, fatal otherwise.
+        assert!(body_error("<CompleteMultipartUploadResult/>", "k").is_ok());
+        let slow = "<Error><Code>SlowDown</Code><Message>m</Message></Error>";
+        assert!(matches!(body_error(slow, "k"), Err(Attempt::Retry(_))));
+        let small = "<Error><Code>EntityTooSmall</Code><Message>m</Message></Error>";
+        assert!(matches!(body_error(small, "k"), Err(Attempt::Fatal(_))));
     }
 
     #[test]

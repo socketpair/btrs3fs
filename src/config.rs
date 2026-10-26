@@ -74,6 +74,19 @@ pub const DEFAULT_QUEUES: u16 = 4;
 /// concurrency than the kernel sends to one disk in practice.
 pub const DEFAULT_QUEUE_DEPTH: u16 = 128;
 
+/// How zone objects grow (SPEC.md §5). `create` picks it from what the bucket
+/// accepts; disks created before the field existed use PATCH.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AppendMode {
+    /// Yandex Object Storage PATCH with `Content-Range`: one request.
+    #[default]
+    Patch,
+    /// Standard S3: a multipart upload copying the object on the server and
+    /// adding the new bytes, completed over the old object: four requests.
+    Multipart,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DiskConfig {
@@ -93,6 +106,8 @@ pub struct DiskConfig {
     pub retry_backoff_factor: f64,
     pub nr_queues: u16,
     pub queue_depth: u16,
+    #[serde(default)]
+    pub append: AppendMode,
 }
 
 impl DiskConfig {
@@ -112,6 +127,7 @@ impl DiskConfig {
             retry_backoff_factor: DEFAULT_RETRY_BACKOFF,
             nr_queues: DEFAULT_QUEUES,
             queue_depth: DEFAULT_QUEUE_DEPTH,
+            append: AppendMode::Patch,
         }
     }
 
@@ -281,6 +297,17 @@ mod tests {
         json["max_open_zones"] = 1024.into();
         json["max_active_zones"] = 1024.into();
         DiskConfig::from_json(json.to_string().as_bytes()).unwrap(); // still accepted
+    }
+
+    #[test]
+    fn append_mode() {
+        let mut cfg = DiskConfig::new(1 << 30, 16 << 20);
+        cfg.append = AppendMode::Multipart;
+        let mut json: serde_json::Value = serde_json::from_slice(&cfg.to_json()).unwrap();
+        assert_eq!(json["append"], "multipart");
+        json.as_object_mut().unwrap().remove("append"); // disks created before the field
+        let old = DiskConfig::from_json(json.to_string().as_bytes()).unwrap();
+        assert_eq!(old.append, AppendMode::Patch);
     }
 
     #[test]
