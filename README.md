@@ -1,7 +1,8 @@
 # btrs3fs
 
 Диск в S3-бакете с файловой системой btrfs: зонированное блочное устройство Linux (ublk),
-**одна зона — один объект** в Yandex Object Storage, btrfs в zoned-режиме поверх.
+**одна зона — один объект** в S3 (Yandex Object Storage, Selectel и другие), btrfs в zoned-режиме
+поверх.
 
 ```bash
 sudo btrs3fs create --creds creds.json --prefix disks/data --size 10G
