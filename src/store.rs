@@ -46,15 +46,9 @@ impl Body {
     }
 }
 
-/// Object tag marking a zone closed by FINISH (SPEC.md §3.3). The key carries
-/// the project name so it cannot clash with labels people set by hand.
-pub const FINISHED_TAG: (&str, &str) = ("btrs3fs-zone", "finished");
-
 pub struct ObjectInfo {
     pub key: String,
     pub size: u64,
-    /// Whether the object carries `FINISHED_TAG`, if the listing told us.
-    pub finished: Option<bool>,
 }
 
 pub enum Store {
@@ -124,28 +118,11 @@ impl Store {
             Store::S3(s) => s.list(prefix).await,
         }
     }
-
-    /// Tags an existing object with `FINISHED_TAG` (data is not rewritten).
-    pub async fn mark_finished(&self, key: &str) -> StoreResult<()> {
-        match self {
-            Store::Mem(m) => m.mark_finished(key),
-            Store::S3(s) => s.mark_finished(key).await,
-        }
-    }
-
-    /// Whether an existing object carries `FINISHED_TAG`.
-    pub async fn is_finished(&self, key: &str) -> StoreResult<bool> {
-        match self {
-            Store::Mem(m) => m.is_finished(key),
-            Store::S3(s) => s.is_finished(key).await,
-        }
-    }
 }
 
 #[derive(Default)]
 struct MemObject {
     data: Vec<u8>,
-    finished: bool,
 }
 
 /// In-memory store for tests and `run --memory`.
@@ -188,10 +165,8 @@ impl MemStore {
 
     fn put(&self, key: &str, body: Body) -> StoreResult<()> {
         self.check_fail()?;
-        // Like S3: a new object replaces the old one together with its tags.
         let obj = MemObject {
             data: body.to_vec(),
-            finished: false,
         };
         self.objects.lock().unwrap().insert(key.to_string(), obj);
         Ok(())
@@ -253,28 +228,8 @@ impl MemStore {
             .map(|(k, v)| ObjectInfo {
                 key: k.clone(),
                 size: v.data.len() as u64,
-                finished: Some(v.finished),
             })
             .collect())
-    }
-
-    fn mark_finished(&self, key: &str) -> StoreResult<()> {
-        self.check_fail()?;
-        let mut objects = self.objects.lock().unwrap();
-        let obj = objects
-            .get_mut(key)
-            .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
-        obj.finished = true;
-        Ok(())
-    }
-
-    fn is_finished(&self, key: &str) -> StoreResult<bool> {
-        self.check_fail()?;
-        let objects = self.objects.lock().unwrap();
-        let obj = objects
-            .get(key)
-            .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
-        Ok(obj.finished)
     }
 }
 
@@ -315,6 +270,13 @@ impl Layout {
         format!("{}/{zone_offset:016x}", self.prefix)
     }
 
+    /// Empty object marking a zone closed by FINISH: `<zone key>.finished`,
+    /// next to the zone object (SPEC.md §3.3). A marker rather than an object
+    /// tag: not every S3 keeps tags, and the listing shows it for free.
+    pub fn finished_key(&self, zone_offset: u64) -> String {
+        format!("{}{FINISHED_SUFFIX}", self.zone_key(zone_offset))
+    }
+
     /// Byte offset of the zone if `key` is a zone object of this disk.
     pub fn parse_zone_key(&self, key: &str) -> Option<u64> {
         let name = key.strip_prefix(&self.prefix)?.strip_prefix('/')?;
@@ -324,7 +286,14 @@ impl Layout {
         }
         u64::from_str_radix(name, 16).ok()
     }
+
+    /// Byte offset of the zone if `key` is a FINISH marker of this disk.
+    pub fn parse_finished_key(&self, key: &str) -> Option<u64> {
+        self.parse_zone_key(key.strip_suffix(FINISHED_SUFFIX)?)
+    }
 }
+
+const FINISHED_SUFFIX: &str = ".finished";
 
 #[cfg(test)]
 mod tests {
@@ -355,20 +324,6 @@ mod tests {
     }
 
     #[test]
-    fn mem_finished_tag() {
-        let m = MemStore::default();
-        assert!(m.mark_finished("k").is_err()); // no object
-        m.put("k", body(b"aa")).unwrap();
-        assert!(!m.is_finished("k").unwrap());
-        m.mark_finished("k").unwrap();
-        m.patch("k", 2, body(b"bb")).unwrap(); // PATCH keeps tags
-        assert!(m.is_finished("k").unwrap());
-        assert_eq!(m.list("k").unwrap()[0].finished, Some(true));
-        m.put("k", body(b"cc")).unwrap(); // PUT replaces the object and its tags
-        assert!(!m.is_finished("k").unwrap());
-    }
-
-    #[test]
     fn layout_keys() {
         let l = Layout::new("disks/test/").unwrap();
         assert_eq!(l.zone_key(32 << 20), "disks/test/0000000002000000");
@@ -378,6 +333,19 @@ mod tests {
         );
         assert_eq!(l.parse_zone_key("disks/test/disk.json"), None);
         assert_eq!(l.parse_zone_key("disks/test2/0000000002000000"), None);
+        assert_eq!(
+            l.finished_key(32 << 20),
+            "disks/test/0000000002000000.finished"
+        );
+        assert_eq!(
+            l.parse_finished_key("disks/test/0000000002000000.finished"),
+            Some(32 << 20)
+        );
+        assert_eq!(l.parse_finished_key("disks/test/0000000002000000"), None);
+        assert_eq!(
+            l.parse_zone_key("disks/test/0000000002000000.finished"),
+            None
+        );
         assert!(Layout::new("/").is_err());
     }
 }

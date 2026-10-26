@@ -14,7 +14,7 @@
 use crate::config::{BLOCK_SIZE, DiskConfig};
 use crate::readahead::{ReadAhead, ReadCache};
 use crate::stats::{Reason, STATS, ZoneCounts};
-use crate::store::{Body, Layout, Store, StoreError, StoreResult};
+use crate::store::{Body, Layout, Store, StoreError};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use log::{debug, info, warn};
@@ -24,10 +24,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, Semaphore};
 
-/// S3 requests run at once without a link to tune for: tag lookups at start,
-/// and uploads of the temporary `create` device and tests. Judgement call:
-/// enough to keep a link busy with zone-sized bodies, few enough not to hit
-/// S3 request rate limits. With a link, uploads follow it (SPEC.md §6.1).
+/// S3 requests run at once without a link to tune for: uploads of the
+/// temporary `create` device and tests. Judgement call: enough to keep a link
+/// busy with zone-sized bodies, few enough not to hit S3 request rate limits. With a link, uploads follow it (SPEC.md §6.1).
 const S3_PARALLELISM: usize = 16;
 
 /// Shared zero-filled buffer for reads past the write pointer; a larger read
@@ -100,8 +99,10 @@ struct ZoneState {
     flushed: u64,
     /// Data `[flushed, data_end)`, one chunk per write request.
     chunks: VecDeque<Bytes>,
-    /// The zone object exists in the store (an empty one for a finished empty zone).
+    /// The zone object exists in the store.
     object: bool,
+    /// The FINISH marker `<zone>.finished` exists in the store (SPEC.md §3.3).
+    marker: bool,
     /// Bumped on every RESET; part of the read-ahead cache key.
     generation: u64,
 }
@@ -145,13 +146,26 @@ pub struct Engine {
 
 impl Engine {
     /// Restores zone state from the objects present in the store: the object
-    /// size is the write pointer, the finished tag marks zones closed by FINISH.
+    /// size is the write pointer, a `<zone>.finished` marker a zone closed by
+    /// FINISH.
     pub async fn open(cfg: &DiskConfig, layout: Layout, store: Arc<Store>) -> anyhow::Result<Self> {
         let nr_zones = cfg.nr_zones() as usize;
-        // Per zone: object size and whether it is finished (None: not listed).
-        let mut objects: Vec<Option<(u64, Option<bool>)>> = vec![None; nr_zones];
+        // Per zone: object size (None: no object) and whether a FINISH marker exists.
+        let mut sizes: Vec<Option<u64>> = vec![None; nr_zones];
+        let mut finished = vec![false; nr_zones];
         let config_key = layout.config_key();
+        let zone_index = |offset: u64, key: &str| -> anyhow::Result<usize> {
+            anyhow::ensure!(
+                offset.is_multiple_of(cfg.zone_size) && offset < cfg.disk_size,
+                "object {key} does not match any zone"
+            );
+            Ok((offset / cfg.zone_size) as usize)
+        };
         for obj in store.list(&layout.dir()).await? {
+            if let Some(offset) = layout.parse_finished_key(&obj.key) {
+                finished[zone_index(offset, &obj.key)?] = true;
+                continue;
+            }
             let Some(offset) = layout.parse_zone_key(&obj.key) else {
                 if obj.key != config_key {
                     warn!("ignoring unexpected object {}", obj.key);
@@ -159,44 +173,21 @@ impl Engine {
                 continue;
             };
             anyhow::ensure!(
-                offset % cfg.zone_size == 0 && offset < cfg.disk_size,
-                "object {} does not match any zone",
-                obj.key
-            );
-            anyhow::ensure!(
                 obj.size <= cfg.zone_size && obj.size % BLOCK_SIZE == 0,
                 "object {} has invalid size {}",
                 obj.key,
                 obj.size
             );
-            objects[(offset / cfg.zone_size) as usize] = Some((obj.size, obj.finished));
-        }
-
-        // Standard S3 does not list tags: ask for them where they matter.
-        let unknown: Vec<usize> = (0..nr_zones)
-            .filter(|&i| matches!(objects[i], Some((size, None)) if size < cfg.zone_size))
-            .collect();
-        let results: Vec<(usize, StoreResult<bool>)> = futures_util::stream::iter(unknown)
-            .map(|i| {
-                let key = layout.zone_key(i as u64 * cfg.zone_size);
-                let store = &store;
-                async move { (i, store.is_finished(&key).await) }
-            })
-            .buffer_unordered(S3_PARALLELISM)
-            .collect()
-            .await;
-        for (i, finished) in results {
-            if let Some((_, f)) = &mut objects[i] {
-                *f = Some(finished?);
-            }
+            sizes[zone_index(offset, &obj.key)?] = Some(obj.size);
         }
 
         let (mut full, mut empty, mut closed) = (0, 0, 0);
-        let zones = objects
+        let zones = sizes
             .iter()
+            .zip(&finished)
             .enumerate()
-            .map(|(i, obj)| {
-                let (size, finished) = obj.map_or((0, false), |(s, f)| (s, f == Some(true)));
+            .map(|(i, (&object, &finished))| {
+                let size = object.unwrap_or(0);
                 let (cond, wp) = if finished || size == cfg.zone_size {
                     full += 1;
                     (Cond::Full, cfg.zone_size)
@@ -215,7 +206,8 @@ impl Engine {
                         data_end: size,
                         flushed: size,
                         chunks: VecDeque::new(),
-                        object: obj.is_some(),
+                        object: object.is_some(),
+                        marker: finished,
                         generation: 0,
                     }),
                     upload: tokio::sync::Mutex::new(()),
@@ -584,9 +576,9 @@ impl Engine {
         }
     }
 
-    /// FINISH: stores the zone data, tags the zone object as finished
-    /// (creating an empty object if there is none) and makes the zone FULL.
-    /// Persisting it keeps finished zones FULL after a restart (SPEC.md §3.3).
+    /// FINISH: stores the zone data, puts the empty marker `<zone>.finished`
+    /// and makes the zone FULL. Persisting it keeps finished zones FULL after a
+    /// restart (SPEC.md §3.3).
     pub async fn finish_zone(&self, offset: u64) -> ZResult<()> {
         let (zi, _) = self.locate(offset)?;
         let zone = &self.zones[zi];
@@ -595,21 +587,19 @@ impl Engine {
             return Ok(());
         }
         self.flush_locked(zi, Reason::Finish).await?;
-        let key = self.layout.zone_key(zone.start);
-        if !zone.state.lock().unwrap().object {
-            self.store.put(&key, Body::default()).await?;
-            zone.state.lock().unwrap().object = true;
-        }
-        self.store.mark_finished(&key).await?;
+        self.store
+            .put(&self.layout.finished_key(zone.start), Body::default())
+            .await?;
 
         let mut st = zone.state.lock().unwrap();
+        st.marker = true;
         st.cond = Cond::Full;
         st.wp = self.zone_size;
         debug!("zone {zi} finished");
         Ok(())
     }
 
-    /// RESET: deletes the zone object, drops buffered data.
+    /// RESET: deletes the zone object and its FINISH marker, drops buffered data.
     pub async fn reset_zone(&self, offset: u64) -> ZResult<()> {
         let (zi, _) = self.locate(offset)?;
         self.reset_index(zi).await
@@ -620,24 +610,38 @@ impl Engine {
         // Holding `upload` keeps a concurrent flush from re-creating the object
         // between the delete and the state change.
         let _upload = zone.upload.lock().await;
-        let had_object = {
+        let keys = {
             let st = zone.state.lock().unwrap();
-            if st.cond == Cond::Empty && st.data_end == 0 && !st.object {
+            if st.cond == Cond::Empty && st.data_end == 0 && !st.object && !st.marker {
                 return Ok(());
             }
-            st.object
+            self.stored_keys(zone, &st)
         };
         // Delete first: if it fails the zone keeps its state and stays consistent.
-        if had_object {
-            self.store.delete(&self.layout.zone_key(zone.start)).await?;
+        match keys.as_slice() {
+            [] => {}
+            [key] => self.store.delete(key).await?,
+            _ => self.store.delete_many(&keys).await?,
         }
         self.clear_locked(zi);
         debug!("zone {zi} reset");
         Ok(())
     }
 
+    /// Objects of the zone in the store: the zone object and the FINISH marker.
+    fn stored_keys(&self, zone: &Zone, st: &ZoneState) -> Vec<String> {
+        let mut keys = Vec::new();
+        if st.object {
+            keys.push(self.layout.zone_key(zone.start));
+        }
+        if st.marker {
+            keys.push(self.layout.finished_key(zone.start));
+        }
+        keys
+    }
+
     /// Makes the zone EMPTY and drops its buffer; the caller holds `upload`
-    /// and has deleted the zone object.
+    /// and has deleted the zone's objects.
     fn clear_locked(&self, zi: usize) {
         let (dropped, had_object) = {
             let mut st = self.zones[zi].state.lock().unwrap();
@@ -650,6 +654,7 @@ impl Engine {
             st.flushed = 0;
             st.chunks.clear();
             st.object = false;
+            st.marker = false;
             (dropped, had_object)
         };
         // Only stored data is cached.
@@ -672,9 +677,7 @@ impl Engine {
         let mut keys = Vec::new();
         for zone in &self.zones {
             guards.push(zone.upload.lock().await);
-            if zone.state.lock().unwrap().object {
-                keys.push(self.layout.zone_key(zone.start));
-            }
+            keys.extend(self.stored_keys(zone, &zone.state.lock().unwrap()));
         }
         // On failure no zone changes state, as with a failed single DELETE,
         // though some objects may be gone: their zones then fail I/O until the
@@ -921,33 +924,41 @@ mod tests {
         e.flush_all(Reason::Explicit).await.unwrap();
         e.write(2 * B, blk(8, 1), false).unwrap();
 
-        // FINISH stores buffered data and tags the object.
+        // FINISH stores buffered data and puts the marker next to the zone.
         e.finish_zone(0).await.unwrap();
         let z = &e.report(0, 1)[0];
         assert_eq!((z.cond, z.wp), (Cond::Full, ZS));
         assert_eq!(e.dirty_bytes(), 0);
-        assert!(store.is_finished("t/0000000000000000").await.unwrap());
+        let marker = "t/0000000000000000.finished";
+        assert!(store.get(marker).await.unwrap().unwrap().is_empty());
         let data = read(&e, 0, 4 * B).await; // stored data, then zeros
         assert_eq!(&data[2 * B as usize..3 * B as usize], &blk(8, 1)[..]);
         assert!(data[3 * B as usize..].iter().all(|&b| b == 0));
 
-        e.reset_zone(0).await.unwrap();
+        e.reset_zone(0).await.unwrap(); // object and marker go together
         assert_eq!(e.report(0, 1)[0].cond, Cond::Empty);
         assert!(store.get("t/0000000000000000").await.unwrap().is_none());
+        assert!(store.get(marker).await.unwrap().is_none());
         assert!(read(&e, 0, 2 * B).await.iter().all(|&b| b == 0));
 
         e.write(0, blk(9, 1), false).unwrap(); // fresh object after reset: PUT
         e.flush_all(Reason::Explicit).await.unwrap();
         let obj = store.get("t/0000000000000000").await.unwrap().unwrap();
         assert_eq!(obj.len() as u64, B);
-        assert!(!store.is_finished("t/0000000000000000").await.unwrap());
+        assert!(store.get(marker).await.unwrap().is_none());
 
-        // FINISH of an empty zone creates an empty tagged object; RESET removes it.
+        // FINISH of an empty zone puts only the marker; RESET removes it.
         e.finish_zone(ZS).await.unwrap();
-        let obj = store.get("t/0000000000100000").await.unwrap().unwrap();
-        assert!(obj.is_empty() && store.is_finished("t/0000000000100000").await.unwrap());
-        e.reset_zone(ZS).await.unwrap();
         assert!(store.get("t/0000000000100000").await.unwrap().is_none());
+        assert!(
+            store
+                .get("t/0000000000100000.finished")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        e.reset_zone(ZS).await.unwrap();
+        assert!(store.list("t/0000000000100000").await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1005,7 +1016,7 @@ mod tests {
         e.flush_all(Reason::Explicit).await.unwrap();
         e.write(2 * B, blk(3, 1), false).unwrap(); // stored data plus a buffer
         e.write(2 * ZS, blk(4, 1), false).unwrap(); // buffer only
-        e.finish_zone(3 * ZS).await.unwrap(); // empty tagged object
+        e.finish_zone(3 * ZS).await.unwrap(); // marker only
         e.reset_all().await.unwrap();
         assert!(e.report(0, 8).iter().all(|z| z.cond == Cond::Empty));
         assert_eq!(e.dirty_bytes(), 0);
