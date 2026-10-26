@@ -778,13 +778,18 @@ async fn check(resp: reqwest::Response, key: &str) -> Result<reqwest::Response, 
         return Ok(resp);
     }
     let body = resp.text().await.unwrap_or_default();
-    let detail = format!("HTTP {status}: {}", s3_error_summary(&body));
-    Err(match status {
+    Err(classify(status, &body, key))
+}
+
+/// A failed answer as a retryable or a fatal error, from its status and body.
+fn classify(status: StatusCode, body: &str, key: &str) -> Attempt {
+    let detail = format!("HTTP {status}: {}", s3_error_summary(body));
+    match status {
         StatusCode::NOT_FOUND => Attempt::Fatal(StoreError::NotFound(key.to_string())),
         // 409 OperationAborted: an earlier request to the key (one we gave up
         // on) is still in progress on the server; it says to try again
         // (Selectel, SPEC.md §11).
-        StatusCode::CONFLICT if xml_tag(&body, "Code").as_deref() == Some("OperationAborted") => {
+        StatusCode::CONFLICT if xml_tag(body, "Code").as_deref() == Some("OperationAborted") => {
             Attempt::Retry(anyhow!(detail))
         }
         // 409: Ceph RGW append at a position that is not the object's size.
@@ -800,9 +805,16 @@ async fn check(resp: reqwest::Response, key: &str) -> Result<reqwest::Response, 
         StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT => {
             Attempt::Retry(anyhow!(detail))
         }
+        // 400 without an S3 error code comes from a balancer or proxy in
+        // front of S3, not from S3 judging the request: Selectel answered so
+        // to requests cut off when the route changed (SPEC.md §11). Our
+        // requests are repeatable, so it is retried like a network error.
+        StatusCode::BAD_REQUEST if xml_tag(body, "Code").is_none() => {
+            Attempt::Retry(anyhow!(detail))
+        }
         s if s.is_server_error() => Attempt::Retry(anyhow!(detail)),
         _ => Attempt::Fatal(anyhow!("{key}: {detail}").into()),
-    })
+    }
 }
 
 /// UploadPartCopy and CompleteMultipartUpload may answer 200 with an
@@ -1043,6 +1055,25 @@ mod tests {
                     operation is currently in progress against this resource. Try again.</Message></Error>";
         assert_eq!(xml_tag(busy, "Code").as_deref(), Some("OperationAborted"));
         assert_eq!(xml_tag("<html>408</html>", "Code"), None);
+    }
+
+    #[test]
+    fn answers_retried_or_fatal() {
+        let retried = |status: u16, body: &str| {
+            let status = StatusCode::from_u16(status).unwrap();
+            matches!(classify(status, body, "k"), Attempt::Retry(_))
+        };
+        let html_400 = "<html><body><h1>400 Bad request</h1>Your browser sent an invalid request.</body></html>";
+        assert!(retried(400, html_400)); // balancer, not S3
+        assert!(!retried(400, "<Error><Code>InvalidArgument</Code></Error>"));
+        assert!(retried(409, "<Error><Code>OperationAborted</Code></Error>"));
+        assert!(!retried(
+            409,
+            "<Error><Code>PositionNotEqualToLength</Code></Error>"
+        ));
+        assert!(retried(408, "<html>408 Request Time-out</html>"));
+        assert!(retried(503, ""));
+        assert!(!retried(403, "<Error><Code>AccessDenied</Code></Error>"));
     }
 
     #[test]
