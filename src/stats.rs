@@ -326,6 +326,8 @@ pub struct Stats {
     pub compact_aborted: Counter,
     pub compact_errors: Counter,
     pub compacting: InFlight,
+    /// Zones queued for concatenation, by `CompactWhy`.
+    pub compact_queued_by: [Counter; 4],
     pub compact_time_ms: Histogram,
     pub segments_per_compaction: Histogram,
     pub read_from_ram: Counter,
@@ -378,6 +380,7 @@ pub static STATS: Stats = Stats {
     compact_aborted: Counter::new(),
     compact_errors: Counter::new(),
     compacting: InFlight::new(),
+    compact_queued_by: [const { Counter::new() }; 4],
     compact_time_ms: Histogram::new(Scale::Millis),
     segments_per_compaction: Histogram::new(Scale::Count),
     read_from_ram: Counter::new(),
@@ -406,6 +409,10 @@ pub static STATS: Stats = Stats {
 };
 
 impl Stats {
+    pub fn compact_why(&self, why: crate::zones::CompactWhy) -> &Counter {
+        &self.compact_queued_by[why as usize]
+    }
+
     pub fn reason(&self, r: Reason) -> &Counter {
         &self.upload_reason[r as usize]
     }
@@ -444,6 +451,10 @@ pub struct ZoneCounts {
     pub partial: u64,
     /// Zones served by more than one object (SEGMENTS, not concatenated yet).
     pub fragmented: u64,
+    /// Zones with data by what they hold; unknown: no request since start.
+    pub data_zones: u64,
+    pub meta_zones: u64,
+    pub unknown_zones: u64,
     /// Objects of all zones, and the most in one zone.
     pub objects: u64,
     pub max_objects: u64,
@@ -498,6 +509,11 @@ pub struct Snapshot {
     pub compact_errors: u64,
     pub compacting: u64,
     pub compacting_max: u64,
+    /// Zones queued for concatenation: FULL, many segments, idle, button.
+    pub compact_queued_full: u64,
+    pub compact_queued_many: u64,
+    pub compact_queued_idle: u64,
+    pub compact_queued_button: u64,
     pub compact_time_ms: Hist,
     pub segments_per_compaction: Hist,
     pub read_from_ram: u64,
@@ -650,6 +666,10 @@ impl Stats {
             compact_errors: self.compact_errors.get(),
             compacting: self.compacting.current.load(Relaxed),
             compacting_max: self.compacting.max.load(Relaxed),
+            compact_queued_full: self.compact_queued_by[0].get(),
+            compact_queued_many: self.compact_queued_by[1].get(),
+            compact_queued_idle: self.compact_queued_by[2].get(),
+            compact_queued_button: self.compact_queued_by[3].get(),
             compact_time_ms: self.compact_time_ms.snapshot(),
             segments_per_compaction: self.segments_per_compaction.snapshot(),
             read_from_ram: self.read_from_ram.get(),

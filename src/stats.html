@@ -108,7 +108,10 @@
   .legend i.ram { outline: 2px solid var(--bad); outline-offset: -2px; background: var(--z-open); }
   .legend i.frag { background: var(--z-full); }
   .legend i.frag::after { content: ""; position: absolute; left: 3px; top: 3px; width: 5px; height: 5px; border-radius: 50%; background: var(--surface); }
-  #zmap-wrap { position: relative; margin-top: 12px; }
+  .filter { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin-top: 12px; }
+  .filter .btn { padding: 3px 10px; font-size: 13px; }
+  .filter .btn[aria-checked="true"] { border-color: var(--flow); color: var(--flow); font-weight: 600; }
+  #zmap-wrap { position: relative; margin-top: 10px; }
   #zmap { display: block; width: 100%; cursor: crosshair; }
   #ztip { position: absolute; pointer-events: none; background: var(--ink); color: var(--surface); font-size: 12px;
           padding: 6px 8px; border-radius: 4px; white-space: nowrap; display: none; z-index: 2; }
@@ -187,13 +190,19 @@
   <div class="panel">
     <div class="strip" id="zstrip"></div>
     <div class="legend" id="zlegend"></div>
+    <div class="filter" role="radiogroup" aria-label="Show zones">
+      <button class="btn" role="radio" aria-checked="true" data-kind="">All zones</button>
+      <button class="btn" role="radio" aria-checked="false" data-kind="d">Data</button>
+      <button class="btn" role="radio" aria-checked="false" data-kind="m">Metadata</button>
+      <span class="note" id="zkinds"></span>
+    </div>
     <div id="zmap-wrap"><canvas id="zmap" height="10" aria-label="Map of all zones"></canvas><div id="ztip"></div></div>
     <div class="actions">
       <button class="btn" data-act="flush">Upload buffered data</button>
       <button class="btn" data-act="compact" id="btn-compact">Concatenate fragmented zones</button>
     </div>
     <p class="note">One cell per zone in disk order, left to right; partly written zones fill from the bottom.
-      Hover a cell for its details. “Upload buffered data” stores everything held in RAM now but does not commit
+      Hover a cell for its details; the switch above dims all zones but data or metadata ones. “Upload buffered data” stores everything held in RAM now but does not commit
       btrfs — use “Commit the filesystem” on the btrfs tab for that. “Concatenate fragmented zones” merges the S3
       objects of every zone that has more than one.</p>
   </div>
@@ -371,7 +380,13 @@ function legend(z, map) {
       item("frag", "", `fragmented: ${num(z.fragmented)}, at most ${num(z.max_objects)} S3 objects in one`) : "");
 }
 
-let zmap = null, zgeom = null;
+let zmap = null, zgeom = null, zkind = "";
+const KIND = { d: "data", m: "metadata", u: "kind not known yet" };
+for (const b of document.querySelectorAll("[data-kind]")) b.onclick = () => {
+  zkind = b.dataset.kind;
+  for (const o of document.querySelectorAll("[data-kind]")) o.setAttribute("aria-checked", String(o === b));
+  drawZones();
+};
 async function tickZones() {
   try {
     const r = await fetch("zones.json", { cache: "no-store" });
@@ -398,6 +413,8 @@ function drawZones() {
   const zoneBlocks = zmap.zone_size / zmap.block_size;
   for (let i = 0; i < n; i++) {
     const x = (i % cols) * (cell + gap), y = Math.floor(i / cols) * (cell + gap), k = zmap.cond[i];
+    // The kind filter dims the other zones instead of adding marks to every cell.
+    g.globalAlpha = zkind && zmap.kind[i] !== zkind && k !== "e" ? 0.35 : 1;
     g.fillStyle = col.e;
     g.fillRect(x, y, cell, cell);
     // Open and closed zones fill from the bottom by how much they hold.
@@ -412,6 +429,7 @@ function drawZones() {
       g.fillStyle = dot; g.beginPath(); g.arc(x + cell / 2, y + cell / 2, cell / 5, 0, 7); g.fill();
     }
   }
+  g.globalAlpha = 1;
   zgeom = { cell, gap, cols, n };
 }
 $("zmap").addEventListener("mousemove", ev => {
@@ -423,7 +441,8 @@ $("zmap").addEventListener("mousemove", ev => {
   const i = Math.floor(cy / step) * zgeom.cols + colNo;
   if (cx < 0 || colNo >= zgeom.cols || i < 0 || i >= zgeom.n) { tip.style.display = "none"; return; }
   const b = zmap.block_size;
-  tip.innerHTML = `zone ${num(i)} at ${bytes(i * zmap.zone_size)} · ${ZONE[zmap.cond[i]][0]}<br>` +
+  tip.innerHTML = `zone ${num(i)} at ${bytes(i * zmap.zone_size)} · ${ZONE[zmap.cond[i]][0]}` +
+    (zmap.cond[i] === "e" ? "" : ` · ${KIND[zmap.kind[i]]}`) + `<br>` +
     `${bytes(zmap.used[i] * b)} of ${bytes(zmap.zone_size)} written · ${num(zmap.objects[i])} S3 object${zmap.objects[i] === 1 ? "" : "s"}` +
     (zmap.buffered[i] ? ` · ${bytes(zmap.buffered[i] * b)} in RAM` : "");
   tip.style.display = "block";
@@ -447,6 +466,9 @@ function concatLine(s) {
 function renderZones(s) {
   $("zstrip").innerHTML = stripSpans(s.zones);
   $("zlegend").innerHTML = legend(s.zones, true) + concatLine(s);
+  const z = s.zones;
+  $("zkinds").textContent = `${num(z.data_zones)} data zones · ${num(z.meta_zones)} metadata zones` +
+    (z.unknown_zones ? ` · ${num(z.unknown_zones)} not known yet (no request since the start)` : "");
   $("btn-compact").hidden = s.append !== "SEGMENTS";
 }
 
@@ -497,6 +519,8 @@ function renderDetails(s) {
       ["errors", num(s.req_errors), s.req_errors > 0]])) +
     (seg ? panel("Concatenation", kv([["fragmented zones now", num(s.zones.fragmented)],
       ["waiting / of them full", `${num(s.zones.compact_queued)} / ${num(s.zones.compact_urgent)}`],
+      ["queued because full", num(s.compact_queued_full)], ["queued for many segments", num(s.compact_queued_many)],
+      ["queued as idle", num(s.compact_queued_idle)], ["queued by the button", num(s.compact_queued_button)],
       ["running now / max", `${num(s.compacting)} / ${num(s.compacting_max)}`], ["completed", per("compactions")],
       ["segments merged", per("compacted_segments")], ["copied on the server", bytes(s.compacted_bytes)],
       ["dropped (zone changed meanwhile)", num(s.compact_aborted)], ["failed", num(s.compact_errors), s.compact_errors > 0]])) : "");

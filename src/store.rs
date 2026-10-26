@@ -362,6 +362,18 @@ impl Layout {
         format!("{}{FINISHED_SUFFIX}", self.zone_key(zone_offset))
     }
 
+    /// Empty object marking a metadata zone of a SEGMENTS disk:
+    /// `<zone key>.meta`, so its concatenation policy survives a restart
+    /// (SPEC.md §5).
+    pub fn meta_key(&self, zone_offset: u64) -> String {
+        format!("{}{META_SUFFIX}", self.zone_key(zone_offset))
+    }
+
+    /// Byte offset of the zone if `key` is a metadata marker of this disk.
+    pub fn parse_meta_key(&self, key: &str) -> Option<u64> {
+        self.parse_zone_key(key.strip_suffix(META_SUFFIX)?)
+    }
+
     /// Byte offset of the zone if `key` is a zone object of this disk.
     pub fn parse_zone_key(&self, key: &str) -> Option<u64> {
         let name = key.strip_prefix(&self.prefix)?.strip_prefix('/')?;
@@ -402,6 +414,7 @@ impl Layout {
 }
 
 const FINISHED_SUFFIX: &str = ".finished";
+const META_SUFFIX: &str = ".meta";
 
 #[cfg(test)]
 mod tests {

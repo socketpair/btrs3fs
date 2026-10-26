@@ -34,11 +34,56 @@ const S3_PARALLELISM: usize = 16;
 /// memory, at most 32 iovecs for the largest (32 MiB) request.
 static ZEROS: [u8; 1 << 20] = [0; 1 << 20];
 
-/// Segments of an open zone that trigger its concatenation on a SEGMENTS disk
-/// (SPEC.md §5); FULL zones are concatenated at once. Judgement call: a cold
-/// read of the zone then costs at most this many GETs. TODO (SPEC.md §13):
-/// derive it or take it from disk.json.
-const COMPACT_SEGMENTS: usize = 16;
+/// When to concatenate a zone (SPEC.md §5). Judgement calls agreed with the
+/// user. Segments: more than `COMPACT_READ_FACTOR` × (zone / GET part) — a
+/// sequential read of the zone then pays at most ~1/4 extra GETs — within
+/// the bounds; metadata zones `COMPACT_META_FACTOR` times as many, since
+/// their reads are 16 KiB nodes that never span segments.
+const COMPACT_READ_FACTOR: u64 = 4;
+const COMPACT_SEGMENTS_MIN: usize = 8;
+const COMPACT_SEGMENTS_MAX: usize = 1024;
+const COMPACT_META_FACTOR: usize = 4;
+/// Count-triggered concatenation waits until at least 1/this of what is
+/// already concatenated was added: no copying a whole zone for a crumb.
+const COMPACT_GROWTH: u64 = 8;
+/// Idle: no write for k × the zone's average write interval, within bounds.
+const IDLE_DATA: (f64, u64, u64) = (4.0, 30, 600);
+const IDLE_META: (f64, u64, u64) = (8.0, 300, 3600);
+/// Weight of a new interval in the zone's average (EWMA).
+const IDLE_EWMA_WEIGHT: f64 = 0.2;
+/// How often the compactor looks for idle fragmented zones.
+const IDLE_SCAN: Duration = Duration::from_secs(5);
+
+/// Seconds since boot, sleep included (`CLOCK_BOOTTIME`): a laptop that
+/// slept leaves its zones idle for that long too.
+fn boottime() -> f64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: plain syscall filling a timespec we own.
+    unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
+    ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
+}
+
+/// What a zone holds, as its requests tell (SPEC.md §5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// No request since the daemon started.
+    Unknown,
+    Data,
+    /// btrfs metadata: a request flagged META, or a plain WRITE.
+    Meta,
+}
+
+/// Why a zone was queued for concatenation.
+#[derive(Clone, Copy, Debug)]
+pub enum CompactWhy {
+    Full,
+    ManySegments,
+    Idle,
+    Button,
+}
 
 /// Concatenations running at once. They copy on the server, so this only
 /// bounds the S3 request rate. Judgement call.
@@ -89,6 +134,8 @@ pub struct ZoneMap {
     pub block_size: u64,
     /// One letter per zone: `e`mpty, `o`pen, `c`losed, `f`ull.
     pub cond: String,
+    /// One letter per zone: `d`ata, `m`etadata, `u`nknown (no request since start).
+    pub kind: String,
     /// Blocks holding data (stored or in RAM).
     pub used: Vec<u32>,
     /// S3 objects serving the zone.
@@ -189,9 +236,30 @@ struct ZoneState {
     marker: bool,
     /// Bumped on every RESET; part of the read-ahead cache key.
     generation: u64,
+    kind: Kind,
+    /// The metadata marker `<zone>.meta` exists in the store (SEGMENTS only).
+    meta_marker: bool,
+    /// Last write (`boottime()`); the daemon start for zones not written since.
+    last_write: f64,
+    /// Average interval between writes, seconds; `None` before the second write.
+    write_interval: Option<f64>,
+    /// A write since the daemon started (`last_write` is a write, not the start).
+    written: bool,
 }
 
 impl ZoneState {
+    fn note_write(&mut self, now: f64) {
+        if self.written {
+            let gap = (now - self.last_write).max(0.0);
+            self.write_interval = Some(match self.write_interval {
+                Some(avg) => avg + IDLE_EWMA_WEIGHT * (gap - avg),
+                None => gap,
+            });
+        }
+        self.last_write = now;
+        self.written = true;
+    }
+
     fn buffered(&self) -> u64 {
         self.data_end - self.flushed
     }
@@ -231,6 +299,8 @@ pub struct Engine {
     compact_queue: Mutex<CompactQueue>,
     /// Wakes the compactor.
     compact_kick: Notify,
+    /// A zone became metadata and needs its marker at once.
+    meta_pending: std::sync::atomic::AtomicBool,
 }
 
 impl Engine {
@@ -238,11 +308,13 @@ impl Engine {
     /// size is the write pointer, a `<zone>.finished` marker a zone closed by
     /// FINISH.
     pub async fn open(cfg: &DiskConfig, layout: Layout, store: Arc<Store>) -> anyhow::Result<Self> {
+        let started = boottime();
         let nr_zones = cfg.nr_zones() as usize;
         let segments = cfg.append == AppendMode::Segments;
         // Per zone: (start, size) of its objects and whether a FINISH marker exists.
         let mut found: Vec<Vec<(u64, u64)>> = vec![Vec::new(); nr_zones];
         let mut finished = vec![false; nr_zones];
+        let mut meta = vec![false; nr_zones];
         let config_key = layout.config_key();
         let zone_index = |offset: u64, key: &str| -> anyhow::Result<usize> {
             anyhow::ensure!(
@@ -254,6 +326,10 @@ impl Engine {
         for obj in store.list(&layout.dir()).await? {
             if let Some(offset) = layout.parse_finished_key(&obj.key) {
                 finished[zone_index(offset, &obj.key)?] = true;
+                continue;
+            }
+            if let Some(offset) = layout.parse_meta_key(&obj.key) {
+                meta[zone_index(offset, &obj.key)?] = true;
                 continue;
             }
             let parsed = if segments {
@@ -296,6 +372,11 @@ impl Engine {
                 leftovers.push(key);
             }
             let size = objects.last().map_or(0, |o| o.to);
+            // A metadata marker without data is left by an interrupted RESET.
+            let is_meta = meta[i] && size > 0;
+            if meta[i] && !is_meta {
+                leftovers.push(layout.meta_key(start));
+            }
             let (cond, wp) = if finished || size == cfg.zone_size {
                 full += 1;
                 (Cond::Full, cfg.zone_size)
@@ -317,6 +398,11 @@ impl Engine {
                     objects,
                     marker: finished,
                     generation: 0,
+                    kind: if is_meta { Kind::Meta } else { Kind::Unknown },
+                    meta_marker: is_meta,
+                    last_write: started,
+                    write_interval: None,
+                    written: false,
                 }),
                 upload: tokio::sync::Mutex::new(()),
             });
@@ -354,13 +440,14 @@ impl Engine {
                 queued: vec![false; nr_zones],
             }),
             compact_kick: Notify::new(),
+            meta_pending: std::sync::atomic::AtomicBool::new(false),
         };
         // Zones restored with several segments: concatenate them.
         for (zi, zone) in engine.zones.iter().enumerate() {
             let st = zone.state.lock().unwrap();
-            if let Some(urgent) = engine.compaction_due(&st) {
+            if let Some((urgent, why)) = engine.compaction_due(&st) {
                 drop(st);
-                engine.queue_compaction(zi, urgent);
+                engine.queue_compaction(zi, urgent, why);
             }
         }
         info!("restored {nr_zones} zones: {closed} closed, {full} full, {empty} empty");
@@ -408,18 +495,26 @@ impl Engine {
 
     /// WRITE (at the write pointer) or ZONE_APPEND (anywhere in the zone, `offset`
     /// is the zone start). Returns the absolute offset the data was written at.
-    /// Counts the data as buffered without waiting for room (tests, `create`).
+    /// Counts the data as buffered without waiting for room, as file data
+    /// (tests).
     #[cfg(test)]
     pub fn write(&self, offset: u64, data: Bytes, append: bool) -> ZResult<u64> {
         let len = data.len() as u64;
         self.dirty.fetch_add(len, Ordering::SeqCst);
-        self.write_reserved(offset, data, append)
+        self.write_reserved(offset, data, append, false)
             .inspect_err(|_| self.unreserve(len))
     }
 
     /// `write` for data whose room `reserve` has taken: on error the caller
-    /// gives the room back with `unreserve`.
-    pub fn write_reserved(&self, offset: u64, data: Bytes, append: bool) -> ZResult<u64> {
+    /// gives the room back with `unreserve`. `meta`: the request carries
+    /// btrfs metadata (META flag or a plain WRITE).
+    pub fn write_reserved(
+        &self,
+        offset: u64,
+        data: Bytes,
+        append: bool,
+        meta: bool,
+    ) -> ZResult<u64> {
         let len = data.len() as u64;
         if len == 0 || !len.is_multiple_of(BLOCK_SIZE) {
             return invalid(format!(
@@ -458,11 +553,21 @@ impl Engine {
         st.chunks.push_back(data);
         st.wp += len;
         st.data_end += len;
+        st.note_write(boottime());
+        let became_meta = meta && st.kind != Kind::Meta;
+        if meta {
+            st.kind = Kind::Meta;
+        } else if st.kind == Kind::Unknown {
+            st.kind = Kind::Data;
+        }
         let full = st.wp == self.zone_size;
         if full {
             st.cond = Cond::Full;
         }
         drop(st);
+        if became_meta {
+            self.mark_meta_soon();
+        }
 
         if full || self.dirty_bytes() > self.dirty_limit {
             self.kick.notify_one();
@@ -739,8 +844,8 @@ impl Engine {
             }
             self.compaction_due(&st)
         };
-        if let Some(urgent) = compaction {
-            self.queue_compaction(zi, urgent);
+        if let Some((urgent, why)) = compaction {
+            self.queue_compaction(zi, urgent, why);
         }
         self.dirty.fetch_sub(len, Ordering::SeqCst);
         self.room.notify_waiters();
@@ -818,8 +923,8 @@ impl Engine {
             st.wp = self.zone_size;
             self.compaction_due(&st)
         };
-        if let Some(urgent) = compaction {
-            self.queue_compaction(zi, urgent);
+        if let Some((urgent, why)) = compaction {
+            self.queue_compaction(zi, urgent, why);
         }
         debug!("zone {zi} finished");
         Ok(())
@@ -838,7 +943,12 @@ impl Engine {
         let _upload = zone.upload.lock().await;
         let keys = {
             let st = zone.state.lock().unwrap();
-            if st.cond == Cond::Empty && st.data_end == 0 && st.objects.is_empty() && !st.marker {
+            if st.cond == Cond::Empty
+                && st.data_end == 0
+                && st.objects.is_empty()
+                && !st.marker
+                && !st.meta_marker
+            {
                 return Ok(());
             }
             self.stored_keys(zone, &st)
@@ -889,6 +999,11 @@ impl Engine {
             st.chunks.clear();
             st.objects.clear();
             st.marker = false;
+            st.kind = Kind::Unknown;
+            st.meta_marker = false;
+            st.last_write = boottime();
+            st.write_interval = None;
+            st.written = false;
             (dropped, had_object)
         };
         // Only stored data is cached.
@@ -1058,17 +1173,91 @@ impl Engine {
             .map(|((_, b), i, reason)| (i, b, reason))
     }
 
-    /// Whether a SEGMENTS zone needs concatenation, and how soon: at once
-    /// (`true`) when FULL, in turn when it has many segments.
-    fn compaction_due(&self, st: &ZoneState) -> Option<bool> {
-        if !self.segments || st.objects.len() < 2 {
-            None
-        } else if st.cond == Cond::Full {
-            Some(true)
-        } else if st.objects.len() > COMPACT_SEGMENTS {
-            Some(false)
+    /// Segments above which a zone is concatenated (SPEC.md §5).
+    fn segment_limit(&self, kind: Kind) -> usize {
+        let data = (COMPACT_READ_FACTOR * self.zone_size / self.get_part)
+            .clamp(COMPACT_SEGMENTS_MIN as u64, COMPACT_SEGMENTS_MAX as u64)
+            as usize;
+        if kind == Kind::Meta {
+            data * COMPACT_META_FACTOR
         } else {
-            None
+            data
+        }
+    }
+
+    /// Whether a SEGMENTS zone needs concatenation now, how soon (`true`:
+    /// at once) and why. Idleness is checked by `idle_due`.
+    fn compaction_due(&self, st: &ZoneState) -> Option<(bool, CompactWhy)> {
+        if !self.segments || st.objects.len() < 2 {
+            return None;
+        }
+        let meta = st.kind == Kind::Meta;
+        if st.cond == Cond::Full && !meta {
+            return Some((true, CompactWhy::Full));
+        }
+        // What the first object, the last concatenation, already covers.
+        let base = st.objects[0].to;
+        let grown = (st.flushed - base) * COMPACT_GROWTH >= base;
+        (st.objects.len() > self.segment_limit(st.kind) && grown)
+            .then_some((false, CompactWhy::ManySegments))
+    }
+
+    /// Whether a fragmented zone has been left alone long enough (SPEC.md §5).
+    fn idle_due(&self, st: &ZoneState, now: f64) -> bool {
+        if !self.segments || st.objects.len() < 2 {
+            return false;
+        }
+        let (k, min, max) = if st.kind == Kind::Meta {
+            IDLE_META
+        } else {
+            IDLE_DATA
+        };
+        let wait = st
+            .write_interval
+            .map_or(min as f64, |avg| (k * avg).clamp(min as f64, max as f64));
+        now - st.last_write >= wait
+    }
+
+    /// Puts `<zone>.meta` for metadata zones not marked yet (SEGMENTS; the
+    /// compactor calls it periodically). Under the zone's `upload` lock, so a
+    /// RESET, which deletes everything under the zone prefix, cannot run
+    /// between the check and the PUT and leave a marker on an empty zone.
+    async fn store_meta_markers(&self) {
+        if !self.segments {
+            return;
+        }
+        for zi in 0..self.zones.len() {
+            let zone = &self.zones[zi];
+            let unmarked = |st: &ZoneState| st.kind == Kind::Meta && !st.meta_marker;
+            if !unmarked(&zone.state.lock().unwrap()) {
+                continue;
+            }
+            let _upload = zone.upload.lock().await;
+            if !unmarked(&zone.state.lock().unwrap()) {
+                continue;
+            }
+            match self
+                .store
+                .put(&self.layout.meta_key(zone.start), Body::default())
+                .await
+            {
+                Ok(()) => zone.state.lock().unwrap().meta_marker = true,
+                Err(e) => {
+                    warn!("cannot mark zone {zi} as metadata: {e}");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Queues the idle fragmented zones (the compactor calls it periodically).
+    fn queue_idle(&self) {
+        let now = boottime();
+        for zi in 0..self.zones.len() {
+            let idle = self.idle_due(&self.zones[zi].state.lock().unwrap(), now);
+            if idle {
+                self.queue_compaction(zi, false, CompactWhy::Idle);
+            }
         }
     }
 
@@ -1083,18 +1272,20 @@ impl Engine {
             .filter(|&i| self.zones[i].state.lock().unwrap().objects.len() > 1)
             .collect();
         for &zi in &fragmented {
-            self.queue_compaction(zi, true);
+            self.queue_compaction(zi, true, CompactWhy::Button);
         }
         fragmented.len()
     }
 
-    fn queue_compaction(&self, zi: usize, urgent: bool) {
+    fn queue_compaction(&self, zi: usize, urgent: bool, why: CompactWhy) {
         let mut q = self.compact_queue.lock().unwrap();
         if q.queued[zi] {
             if !urgent || q.urgent.contains(&zi) {
                 return;
             }
             q.normal.retain(|&z| z != zi);
+        } else {
+            STATS.compact_why(why).inc();
         }
         q.queued[zi] = true;
         if urgent {
@@ -1126,7 +1317,14 @@ impl Engine {
         }
         let mut running = futures_util::stream::FuturesUnordered::new();
         let mut busy = vec![false; self.zones.len()];
+        // One timer for the loop: a sleep made anew each turn would never
+        // fire while concatenations keep finishing.
+        let mut scan = tokio::time::interval(IDLE_SCAN);
+        scan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            if self.meta_pending.swap(false, Ordering::SeqCst) {
+                self.store_meta_markers().await;
+            }
             while running.len() < COMPACT_PARALLELISM {
                 let Some(zi) = self.next_compaction(&busy) else {
                     break;
@@ -1136,10 +1334,20 @@ impl Engine {
                 running.push(async move { (zi, engine.compact_zone(zi).await) });
             }
             if running.is_empty() {
-                self.compact_kick.notified().await;
+                tokio::select! {
+                    _ = self.compact_kick.notified() => {}
+                    _ = scan.tick() => {
+                        self.store_meta_markers().await;
+                        self.queue_idle();
+                    }
+                }
                 continue;
             }
             tokio::select! {
+                _ = scan.tick() => {
+                    self.store_meta_markers().await;
+                    self.queue_idle();
+                }
                 Some((zi, res)) = running.next() => {
                     busy[zi] = false;
                     if let Err(e) = res {
@@ -1254,6 +1462,29 @@ impl Engine {
         self.dirty_limit
     }
 
+    /// A read flagged META marks its zone as metadata (zones restored at
+    /// start learn their kind so).
+    pub fn note_meta(&self, offset: u64) {
+        if let Ok((zi, _)) = self.locate(offset) {
+            let mut st = self.zones[zi].state.lock().unwrap();
+            // Only zones holding data are marked; an empty one learns from its writes.
+            if st.kind != Kind::Meta && st.data_end > 0 {
+                st.kind = Kind::Meta;
+                drop(st);
+                self.mark_meta_soon();
+            }
+        }
+    }
+
+    /// Has the compactor put the `.meta` marker of a zone that just became
+    /// metadata, without waiting for its periodic scan.
+    fn mark_meta_soon(&self) {
+        if self.segments {
+            self.meta_pending.store(true, Ordering::SeqCst);
+            self.compact_kick.notify_one();
+        }
+    }
+
     /// Uploads allowed at once.
     pub fn uploads_limit(&self) -> usize {
         self.uploads
@@ -1266,6 +1497,7 @@ impl Engine {
             zone_size: self.zone_size,
             block_size: BLOCK_SIZE,
             cond: String::with_capacity(n),
+            kind: String::with_capacity(n),
             used: Vec::with_capacity(n),
             objects: Vec::with_capacity(n),
             buffered: Vec::with_capacity(n),
@@ -1277,6 +1509,11 @@ impl Engine {
                 Cond::ImpOpen | Cond::ExpOpen => 'o',
                 Cond::Closed => 'c',
                 Cond::Full => 'f',
+            });
+            m.kind.push(match st.kind {
+                Kind::Unknown => 'u',
+                Kind::Data => 'd',
+                Kind::Meta => 'm',
             });
             m.used.push((st.data_end / BLOCK_SIZE) as u32);
             m.objects.push(st.objects.len() as u32);
@@ -1300,6 +1537,13 @@ impl Engine {
             }
             if st.data_end > 0 && st.data_end < self.zone_size {
                 c.partial += 1;
+            }
+            if st.data_end > 0 {
+                match st.kind {
+                    Kind::Data => c.data_zones += 1,
+                    Kind::Meta => c.meta_zones += 1,
+                    Kind::Unknown => c.unknown_zones += 1,
+                }
             }
             let objects = st.objects.len() as u64;
             if objects > 1 {
@@ -1439,6 +1683,95 @@ mod tests {
         assert_eq!(e.next_compaction(&[false; 8]), None);
         // A disk without segments has nothing to concatenate.
         assert_eq!(engine_with(mem()).await.compact_all(), 0);
+    }
+
+    #[tokio::test]
+    async fn compaction_rules_for_data_and_metadata() {
+        // Zone 1 MiB, no GET part: data limit 8 segments, metadata 32.
+        let e = segments_engine(mem()).await;
+        let none = &[false; 8];
+        let meta_write = |zone: u64| {
+            let wp = e.report(zone as usize, 1)[0].wp;
+            e.dirty.fetch_add(B, Ordering::SeqCst);
+            e.write_reserved(wp, blk(7, 1), false, true).unwrap();
+        };
+        // Data: 9 segments of growing size pass both the limit and the growth guard.
+        segment_writes(&e, 1, 1, 9).await;
+        assert_eq!(e.next_compaction(none), Some(1));
+        // Metadata: 9 segments are fine, 33 are many.
+        for _ in 0..9 {
+            meta_write(2);
+            e.flush_zone(2, Reason::Explicit).await.unwrap();
+        }
+        assert_eq!(e.next_compaction(none), None);
+        for _ in 0..24 {
+            meta_write(2);
+            e.flush_zone(2, Reason::Explicit).await.unwrap();
+        }
+        assert_eq!(e.next_compaction(none), Some(2));
+        assert_eq!(e.zones[2].state.lock().unwrap().kind, Kind::Meta);
+        e.note_meta(4 * ZS); // empty zone: learns from its writes
+        assert_eq!(e.zones[4].state.lock().unwrap().kind, Kind::Unknown);
+        segment_writes(&e, 3, 1, 1).await;
+        assert_eq!(e.zones[3].state.lock().unwrap().kind, Kind::Data);
+        e.note_meta(3 * ZS); // a META read of a data-looking zone
+        assert_eq!(e.zones[3].state.lock().unwrap().kind, Kind::Meta);
+    }
+
+    #[tokio::test]
+    async fn meta_marker_survives_restart_and_goes_with_reset() {
+        let store = mem();
+        let e = segments_engine(store.clone()).await;
+        e.dirty.fetch_add(B, Ordering::SeqCst);
+        e.write_reserved(2 * ZS, blk(1, 1), false, true).unwrap();
+        e.flush_zone(2, Reason::Explicit).await.unwrap();
+        assert!(e.meta_pending.load(Ordering::SeqCst));
+        e.store_meta_markers().await;
+        let marker = "t/0000000000200000.meta";
+        assert!(store.get(marker).await.unwrap().is_some());
+        drop(e);
+
+        let e = segments_engine(store.clone()).await; // restart
+        {
+            let st = e.zones[2].state.lock().unwrap();
+            assert_eq!((st.kind, st.meta_marker), (Kind::Meta, true));
+        }
+        e.reset_zone(2 * ZS).await.unwrap();
+        assert!(store.get(marker).await.unwrap().is_none());
+        assert_eq!(e.zones[2].state.lock().unwrap().kind, Kind::Unknown);
+
+        // A marker left without data (interrupted RESET) is deleted at start.
+        store
+            .put(marker, crate::store::Body::default())
+            .await
+            .unwrap();
+        let e = segments_engine(store.clone()).await;
+        assert_eq!(e.zones[2].state.lock().unwrap().kind, Kind::Unknown);
+        assert!(store.get(marker).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn idle_zones_are_concatenated_late_for_metadata() {
+        let e = segments_engine(mem()).await;
+        segment_writes(&e, 1, 1, 2).await;
+        let now = boottime();
+        {
+            let mut st = e.zones[1].state.lock().unwrap();
+            assert!(!e.idle_due(&st, now)); // just written
+            st.write_interval = Some(1.0); // 4 × 1 s is below the 30 s floor
+            assert!(!e.idle_due(&st, st.last_write + 29.0));
+            assert!(e.idle_due(&st, st.last_write + 30.0));
+            st.write_interval = Some(60.0); // 4 × 60 s
+            assert!(!e.idle_due(&st, st.last_write + 239.0));
+            assert!(e.idle_due(&st, st.last_write + 240.0));
+            st.kind = Kind::Meta; // 8 × 60 s
+            assert!(!e.idle_due(&st, st.last_write + 479.0));
+            assert!(e.idle_due(&st, st.last_write + 480.0));
+            st.write_interval = Some(3600.0); // capped at an hour
+            assert!(e.idle_due(&st, st.last_write + 3600.0));
+        }
+        e.queue_idle();
+        assert_eq!(e.next_compaction(&[false; 8]), None); // not idle yet by the clock
     }
 
     #[tokio::test]

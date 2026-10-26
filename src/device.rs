@@ -366,6 +366,9 @@ async fn handle_io(q: &UblkQueue, tag: u16, ctx: &Ctx, efd: &Arc<OwnedFd>) -> ZR
             STATS.req_read.inc();
             STATS.req_read_bytes.add(len);
             STATS.req_read_size.record(len);
+            if iod.op_flags & sys::UBLK_IO_F_META != 0 {
+                engine.note_meta(offset);
+            }
             let pieces = engine.read_plan(offset, len)?;
             let bufs = if pieces.iter().any(|p| matches!(p, Piece::Store { .. })) {
                 let e = engine.clone();
@@ -395,8 +398,10 @@ async fn handle_io(q: &UblkQueue, tag: u16, ctx: &Ctx, efd: &Arc<OwnedFd>) -> ZR
                 on_tokio(ctx, efd, async move { e.reserve(len).await }).await?;
             }
             let append = op == sys::UBLK_IO_OP_ZONE_APPEND;
+            // btrfs writes metadata with plain WRITE and flags it META (SPEC.md §5).
+            let meta = !append || iod.op_flags & sys::UBLK_IO_F_META != 0;
             let at = copy_from_request(cdev, copy_pos, len)
-                .and_then(|data| engine.write_reserved(offset, data, append))
+                .and_then(|data| engine.write_reserved(offset, data, append, meta))
                 .inspect_err(|_| engine.unreserve(len))?;
             if iod.op_flags & sys::UBLK_IO_F_FUA != 0 {
                 STATS.req_fua.inc();
