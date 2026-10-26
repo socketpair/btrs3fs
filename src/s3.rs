@@ -9,7 +9,7 @@ use crate::config::{
     AppendMode, Creds, DEFAULT_RETRY_BACKOFF, DEFAULT_RETRY_INITIAL_DELAY_MS,
     DEFAULT_RETRY_TIMEOUT_SECS, DiskConfig,
 };
-use crate::store::{Body, ObjectInfo, StoreError, StoreResult};
+use crate::store::{Body, ConcatPart, ObjectInfo, StoreError, StoreResult};
 use anyhow::{Context, anyhow};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
@@ -284,7 +284,9 @@ impl S3Store {
             (AppendMode::PutAppend, _) => self.rgw_append(key, offset, body).await,
             (_, 0) => self.put(key, body).await,
             (AppendMode::Patch, _) => self.patch_request(key, offset, body).await,
-            (AppendMode::Multipart, _) => self.append_multipart(key, offset, body).await,
+            (AppendMode::Segments, _) => {
+                Err(anyhow!("{key}: a SEGMENTS disk writes new objects, it never appends").into())
+            }
         }
     }
 
@@ -294,11 +296,12 @@ impl S3Store {
         self.patch_request(key, offset, body).await
     }
 
-    /// Which way of appending this bucket accepts (SPEC.md §5), tried on
-    /// probe objects under `dir`: PATCH; else Ceph RGW Append Object, which
-    /// must answer 200 with the right `x-rgw-next-append-position` twice (a
-    /// service that ignores `?append` overwrites the object and sends no such
-    /// header — Selectel does); else multipart.
+    /// How zone objects can grow in this bucket (SPEC.md §5), tried on probe
+    /// objects under `dir`: PATCH; else Ceph RGW Append Object, which must
+    /// answer 200 with the right `x-rgw-next-append-position` twice (a service
+    /// that ignores `?append` overwrites the object and sends no such header —
+    /// Selectel does); else segments, if the bucket concatenates small parts on
+    /// the server. Without any of these btrs3fs cannot use the bucket.
     pub async fn detect_append(&self, dir: &str) -> StoreResult<AppendMode> {
         let dir = dir.trim_end_matches('/');
         let block = Bytes::from(vec![0u8; crate::config::BLOCK_SIZE as usize]);
@@ -325,12 +328,37 @@ impl S3Store {
         .await;
         self.delete(&key).await?;
         match appended {
-            Ok(true) => Ok(AppendMode::PutAppend),
-            Ok(false) => Ok(AppendMode::Multipart),
-            Err(e) => {
-                debug!("no Append Object: {e}");
-                Ok(AppendMode::Multipart)
-            }
+            Ok(true) => return Ok(AppendMode::PutAppend),
+            Ok(false) => {}
+            Err(e) => debug!("no Append Object: {e}"),
+        }
+
+        let (a, b, c) = (
+            format!("{dir}/append-probe-a"),
+            format!("{dir}/append-probe-b"),
+            format!("{dir}/append-probe-c"),
+        );
+        let first = Bytes::from(vec![0x11u8; block.len()]);
+        let second = Bytes::from(vec![0x22u8; block.len()]);
+        self.put(&a, Body::new(vec![first.clone()])).await?;
+        self.put(&b, Body::new(vec![second.clone()])).await?;
+        let concatenated = async {
+            let pending = self
+                .begin_concat(&c, &[(a.clone(), 0, len), (b.clone(), 0, len)])
+                .await?;
+            self.finish_concat(pending).await?;
+            Ok::<_, StoreError>(self.get(&c).await? == [first, second].concat())
+        }
+        .await;
+        self.delete_many(&[a, b, c]).await?;
+        match concatenated {
+            Ok(true) => Ok(AppendMode::Segments),
+            Ok(false) => Err(anyhow!("server-side concatenation gave wrong data").into()),
+            Err(e) => Err(anyhow!(
+                "this S3 can neither append (PATCH, Append Object) nor concatenate small \
+                 parts on the server ({e}); btrs3fs cannot use it"
+            )
+            .into()),
         }
     }
 
@@ -403,37 +431,6 @@ impl S3Store {
         .await
     }
 
-    /// Append without PATCH: a multipart upload whose part 1 is the object's
-    /// first `offset` bytes copied on the server (UploadPartCopy) and part 2
-    /// the new data; completing it replaces the object. Copying exactly
-    /// `[0, offset)` makes a repeat after a lost answer give the same object,
-    /// as PATCH with an explicit offset does (SPEC.md §5). Where parts must be
-    /// at least 5 MiB (AWS) and the object is smaller, the start is read back
-    /// and the whole object written with one PUT instead.
-    async fn append_multipart(&self, key: &str, offset: u64, body: Body) -> StoreResult<()> {
-        if offset == 0 {
-            return self.put(key, body).await;
-        }
-        let url = self.object_url(key);
-        let upload_id = self.create_multipart(key, &url).await?;
-        let completed = self
-            .multipart_parts(key, &url, &upload_id, offset, &body)
-            .await;
-        if !matches!(completed, Ok(true)) {
-            // Best effort: an upload left behind only costs storage until it expires.
-            if let Err(e) = self.abort_multipart(key, &url, &upload_id).await {
-                warn!("cannot abort multipart upload of {key}: {e}");
-            }
-        }
-        if !completed? {
-            let start = self.get_range(key, 0, offset).await?;
-            let mut chunks = vec![start];
-            chunks.extend(body.chunks);
-            self.put(key, Body::new(chunks)).await?;
-        }
-        Ok(())
-    }
-
     /// CreateMultipartUpload: the upload id.
     async fn create_multipart(&self, key: &str, url: &str) -> StoreResult<String> {
         let url = format!("{url}?uploads");
@@ -448,75 +445,139 @@ impl S3Store {
         .await
     }
 
-    /// Parts 1 (server copy of `[0, offset)`) and 2 (`body`), then
-    /// CompleteMultipartUpload. `false`: the service wants larger parts.
-    async fn multipart_parts(
+    /// Concatenation on the server (SPEC.md §5): a multipart upload to `dst`
+    /// whose parts are copies of `parts` (UploadPartCopy with a range), up to
+    /// `COPY_PARALLELISM` at once. The object appears on `finish_concat`.
+    pub async fn begin_concat(
         &self,
-        key: &str,
-        url: &str,
-        upload_id: &str,
-        offset: u64,
-        body: &Body,
-    ) -> StoreResult<bool> {
-        let id = encode_query(upload_id);
-        let part_url = |n: u32| format!("{url}?partNumber={n}&uploadId={id}");
-
-        let copy_url = part_url(1);
-        let copy_headers = [
-            (
-                "x-amz-copy-source",
-                format!("/{}/{}", self.bucket, encode_path(key)),
-            ),
-            ("x-amz-copy-source-range", format!("bytes=0-{}", offset - 1)),
-        ];
-        let etag1 = self
-            .with_retries(&format!("COPY {key} part"), || async {
-                let resp = self
-                    .send(reqwest::Method::PUT, &copy_url, &copy_headers, None)
-                    .await?;
-                let xml = check(resp, key).await?.text().await?;
-                body_error(&xml, key)?;
-                let r: CopyPartResult = quick_xml::de::from_str(&xml).map_err(|e| {
-                    Attempt::Fatal(anyhow!("cannot parse copy part answer: {e}").into())
-                })?;
-                Ok(r.e_tag)
-            })
-            .await?;
-
-        let data_url = part_url(2);
-        let etag2 = self
-            .with_retries(&format!("PUT {key} part"), || async {
-                let resp = self
-                    .send(reqwest::Method::PUT, &data_url, &[], Some(body))
-                    .await?;
-                let resp = check(resp, key).await?;
-                resp.headers()
-                    .get(http::header::ETAG)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string)
-                    .ok_or_else(|| Attempt::Fatal(anyhow!("{key}: part without ETag").into()))
-            })
-            .await?;
-
-        let done_url = format!("{url}?uploadId={id}");
-        let xml = Body::new(vec![Bytes::from(complete_xml(&[etag1, etag2]))]);
-        self.with_retries(&format!("COMPLETE {key}"), || async {
-            let headers = [("content-type", "application/xml".to_string())];
-            let resp = self
-                .send(reqwest::Method::POST, &done_url, &headers, Some(&xml))
-                .await?;
-            let answer = check(resp, key).await?.text().await?;
-            match body_error(&answer, key) {
-                Err(Attempt::Fatal(StoreError::Other(e)))
-                    if e.to_string().contains("EntityTooSmall") =>
-                {
-                    Ok(false)
+        dst: &str,
+        parts: &[ConcatPart],
+    ) -> StoreResult<PendingConcat> {
+        let url = self.object_url(dst);
+        let upload_id = self.create_multipart(dst, &url).await?;
+        let id = encode_query(&upload_id);
+        let copies: Vec<_> = parts
+            .iter()
+            .enumerate()
+            .map(|(i, (src, offset, len))| {
+                let part_url = format!("{url}?partNumber={}&uploadId={id}", i + 1);
+                let headers = [
+                    (
+                        "x-amz-copy-source",
+                        format!("/{}/{}", self.bucket, encode_path(src)),
+                    ),
+                    (
+                        "x-amz-copy-source-range",
+                        format!("bytes={offset}-{}", offset + len - 1),
+                    ),
+                ];
+                async move {
+                    self.with_retries(&format!("COPY {src} into {dst}"), || async {
+                        let resp = self
+                            .send(reqwest::Method::PUT, &part_url, &headers, None)
+                            .await?;
+                        let xml = check(resp, src).await?.text().await?;
+                        body_error(&xml, dst)?;
+                        let r: CopyPartResult = quick_xml::de::from_str(&xml).map_err(|e| {
+                            Attempt::Fatal(anyhow!("cannot parse copy part answer: {e}").into())
+                        })?;
+                        Ok(r.e_tag)
+                    })
+                    .await
                 }
-                Err(e) => Err(e),
-                Ok(()) => Ok(true),
+            })
+            .collect();
+        let etags: Vec<StoreResult<String>> = futures_util::stream::iter(copies)
+            .buffered(COPY_PARALLELISM)
+            .collect()
+            .await;
+        let pending = PendingConcat {
+            dst: dst.to_string(),
+            upload_id,
+            etags: Vec::new(),
+            size: parts.iter().map(|p| p.2).sum(),
+        };
+        match etags.into_iter().collect::<StoreResult<Vec<String>>>() {
+            Ok(etags) => Ok(PendingConcat { etags, ..pending }),
+            Err(e) => {
+                self.abort_concat(pending).await;
+                Err(e)
             }
-        })
-        .await
+        }
+    }
+
+    /// CompleteMultipartUpload: the concatenated object replaces `dst`. A
+    /// repeat after a lost answer finds no upload (404): it completed if `dst`
+    /// has the concatenated size.
+    pub async fn finish_concat(&self, p: PendingConcat) -> StoreResult<()> {
+        let url = format!(
+            "{}?uploadId={}",
+            self.object_url(&p.dst),
+            encode_query(&p.upload_id)
+        );
+        let xml = Body::new(vec![Bytes::from(complete_xml(&p.etags))]);
+        let done = self
+            .with_retries(&format!("COMPLETE {}", p.dst), || async {
+                let headers = [("content-type", "application/xml".to_string())];
+                let resp = self
+                    .send(reqwest::Method::POST, &url, &headers, Some(&xml))
+                    .await?;
+                let answer = check(resp, &p.dst).await?.text().await?;
+                body_error(&answer, &p.dst)
+            })
+            .await;
+        match done {
+            Err(StoreError::NotFound(_)) if self.head_size(&p.dst).await? == p.size => Ok(()),
+            other => other,
+        }
+    }
+
+    /// AbortMultipartUpload (best effort: a leftover only costs storage and
+    /// is aborted at the next start).
+    pub async fn abort_concat(&self, p: PendingConcat) {
+        let url = self.object_url(&p.dst);
+        if let Err(e) = self.abort_multipart(&p.dst, &url, &p.upload_id).await {
+            warn!("cannot abort concatenation into {}: {e}", p.dst);
+        }
+    }
+
+    /// Aborts the multipart uploads under `prefix` (ListMultipartUploads),
+    /// which only a crashed concatenation leaves; how many.
+    pub async fn abort_stale_concats(&self, prefix: &str) -> StoreResult<usize> {
+        let mut markers: Option<(String, String)> = None;
+        let mut aborted = 0;
+        loop {
+            let mut url = format!("{}?uploads&prefix={}", self.base, encode_query(prefix));
+            if let Some((key, id)) = &markers {
+                url.push_str(&format!(
+                    "&key-marker={}&upload-id-marker={}",
+                    encode_query(key),
+                    encode_query(id)
+                ));
+            }
+            let page: UploadsResult = self
+                .with_retries(&format!("LIST UPLOADS {prefix}"), || async {
+                    let resp = self.send(reqwest::Method::GET, &url, &[], None).await?;
+                    let xml = check(resp, prefix).await?.text().await?;
+                    quick_xml::de::from_str(&xml).map_err(|e| {
+                        Attempt::Fatal(anyhow!("cannot parse multipart uploads list: {e}").into())
+                    })
+                })
+                .await?;
+            for u in &page.uploads {
+                self.abort_multipart(&u.key, &self.object_url(&u.key), &u.upload_id)
+                    .await?;
+                aborted += 1;
+            }
+            match (
+                page.is_truncated,
+                page.next_key_marker,
+                page.next_upload_id_marker,
+            ) {
+                (true, Some(k), Some(i)) => markers = Some((k, i)),
+                _ => return Ok(aborted),
+            }
+        }
     }
 
     async fn abort_multipart(&self, key: &str, url: &str, upload_id: &str) -> StoreResult<()> {
@@ -756,6 +817,37 @@ fn body_error(xml: &str, key: &str) -> Result<(), Attempt> {
             Attempt::Fatal(err.into())
         },
     )
+}
+
+/// Server-side concatenation in progress: parts copied, not completed.
+pub struct PendingConcat {
+    dst: String,
+    upload_id: String,
+    etags: Vec<String>,
+    /// Bytes of the concatenated object.
+    size: u64,
+}
+
+/// Parts of one concatenation copied at once: the copies run on the server,
+/// so this only bounds requests in flight. Judgement call, as S3_PARALLELISM.
+const COPY_PARALLELISM: usize = 16;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct UploadsResult {
+    #[serde(rename = "Upload", default)]
+    uploads: Vec<UploadEntry>,
+    #[serde(default)]
+    is_truncated: bool,
+    next_key_marker: Option<String>,
+    next_upload_id_marker: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct UploadEntry {
+    key: String,
+    upload_id: String,
 }
 
 #[derive(Deserialize)]

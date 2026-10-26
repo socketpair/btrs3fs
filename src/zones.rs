@@ -11,10 +11,10 @@
 //! Locking: `Zone::upload` (async, at most one upload per zone) is taken before
 //! `Zone::state` (sync, never held across `.await`).
 
-use crate::config::{BLOCK_SIZE, DiskConfig};
+use crate::config::{AppendMode, BLOCK_SIZE, DiskConfig};
 use crate::readahead::{ReadAhead, ReadCache};
 use crate::stats::{Reason, STATS, ZoneCounts};
-use crate::store::{Body, Layout, Store, StoreError};
+use crate::store::{Body, Layout, PendingConcat, Store, StoreError};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use log::{debug, info, warn};
@@ -33,6 +33,16 @@ const S3_PARALLELISM: usize = 16;
 /// is served as several 1 MiB pieces. Size is a judgement call: 1 MiB of static
 /// memory, at most 32 iovecs for the largest (32 MiB) request.
 static ZEROS: [u8; 1 << 20] = [0; 1 << 20];
+
+/// Segments of an open zone that trigger its concatenation on a SEGMENTS disk
+/// (SPEC.md §5); FULL zones are concatenated at once. Judgement call: a cold
+/// read of the zone then costs at most this many GETs. TODO (SPEC.md §13):
+/// derive it or take it from disk.json.
+const COMPACT_SEGMENTS: usize = 16;
+
+/// Concatenations running at once. They copy on the server, so this only
+/// bounds the S3 request rate. Judgement call.
+const COMPACT_PARALLELISM: usize = 4;
 
 /// Pause of the background flusher after a failed upload. The upload itself
 /// already retried for retry_timeout_seconds; this only avoids a busy loop
@@ -77,8 +87,11 @@ pub struct ZoneInfo {
 pub enum Piece {
     Store {
         key: String,
+        /// Offset in the object.
         offset: u64,
         len: u64,
+        /// Offset in the zone the piece starts at.
+        zone_offset: u64,
         /// Zone index and generation, for the read-ahead cache key.
         zone: usize,
         generation: u64,
@@ -87,6 +100,62 @@ pub enum Piece {
     },
     Mem(Bytes),
     Zero(u64),
+}
+
+/// A store object serving `[from, to)` of its zone. It begins at `start`
+/// (in its key on a SEGMENTS disk), before `from` when an earlier object
+/// already serves that part.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stored {
+    start: u64,
+    from: u64,
+    to: u64,
+}
+
+/// Picks the objects serving a zone from the `(start, size)` the store lists
+/// (SPEC.md §5): from offset 0 on, each step takes the object covering the
+/// current end that reaches furthest. Objects within the covered part are
+/// leftovers of a concatenation (returned to delete); an object beyond a gap
+/// is an error — it cannot happen unless data was lost.
+fn cover(mut found: Vec<(u64, u64)>) -> Result<(Vec<Stored>, Vec<u64>), String> {
+    found.sort_unstable();
+    let mut chosen: Vec<Stored> = Vec::new();
+    let mut end = 0;
+    while let Some(&(start, size)) = found
+        .iter()
+        .filter(|&&(start, size)| start <= end && start + size > end)
+        .max_by_key(|&&(start, size)| start + size)
+    {
+        chosen.push(Stored {
+            start,
+            from: end,
+            to: start + size,
+        });
+        end = start + size;
+    }
+    if let Some(&(start, _)) = found.iter().find(|&&(start, _)| start > end) {
+        return Err(format!("object at {start} lies after a gap at {end}"));
+    }
+    let leftovers = found
+        .iter()
+        .filter(|&&(start, _)| !chosen.iter().any(|c| c.start == start))
+        .map(|&(start, _)| start)
+        .collect();
+    Ok((chosen, leftovers))
+}
+
+/// Zones waiting for concatenation: urgent (FULL) ones first.
+struct CompactQueue {
+    urgent: VecDeque<usize>,
+    normal: VecDeque<usize>,
+    queued: Vec<bool>,
+}
+
+/// A concatenation whose parts are copied, waiting to complete.
+struct CompactJob {
+    generation: u64,
+    parts: Vec<Stored>,
+    pending: PendingConcat,
 }
 
 struct ZoneState {
@@ -99,8 +168,9 @@ struct ZoneState {
     flushed: u64,
     /// Data `[flushed, data_end)`, one chunk per write request.
     chunks: VecDeque<Bytes>,
-    /// The zone object exists in the store.
-    object: bool,
+    /// Objects holding `[0, flushed)`, by offset: one zone object, or the
+    /// segments of a SEGMENTS disk (SPEC.md §5).
+    objects: Vec<Stored>,
     /// The FINISH marker `<zone>.finished` exists in the store (SPEC.md §3.3).
     marker: bool,
     /// Bumped on every RESET; part of the read-ahead cache key.
@@ -142,6 +212,11 @@ pub struct Engine {
     /// Store reads larger than this go out as parallel GETs of this size
     /// (SPEC.md §6.2).
     get_part: u64,
+    /// A SEGMENTS disk: every upload is a new object (SPEC.md §5).
+    segments: bool,
+    compact_queue: Mutex<CompactQueue>,
+    /// Wakes the compactor.
+    compact_kick: Notify,
 }
 
 impl Engine {
@@ -150,8 +225,9 @@ impl Engine {
     /// FINISH.
     pub async fn open(cfg: &DiskConfig, layout: Layout, store: Arc<Store>) -> anyhow::Result<Self> {
         let nr_zones = cfg.nr_zones() as usize;
-        // Per zone: object size (None: no object) and whether a FINISH marker exists.
-        let mut sizes: Vec<Option<u64>> = vec![None; nr_zones];
+        let segments = cfg.append == AppendMode::Segments;
+        // Per zone: (start, size) of its objects and whether a FINISH marker exists.
+        let mut found: Vec<Vec<(u64, u64)>> = vec![Vec::new(); nr_zones];
         let mut finished = vec![false; nr_zones];
         let config_key = layout.config_key();
         let zone_index = |offset: u64, key: &str| -> anyhow::Result<usize> {
@@ -166,54 +242,73 @@ impl Engine {
                 finished[zone_index(offset, &obj.key)?] = true;
                 continue;
             }
-            let Some(offset) = layout.parse_zone_key(&obj.key) else {
+            let parsed = if segments {
+                layout.parse_segment_key(&obj.key)
+            } else {
+                layout.parse_zone_key(&obj.key).map(|zone| (zone, 0))
+            };
+            let Some((zone, start)) = parsed else {
                 if obj.key != config_key {
                     warn!("ignoring unexpected object {}", obj.key);
                 }
                 continue;
             };
             anyhow::ensure!(
-                obj.size <= cfg.zone_size && obj.size % BLOCK_SIZE == 0,
+                start + obj.size <= cfg.zone_size
+                    && start.is_multiple_of(BLOCK_SIZE)
+                    && obj.size.is_multiple_of(BLOCK_SIZE),
                 "object {} has invalid size {}",
                 obj.key,
                 obj.size
             );
-            sizes[zone_index(offset, &obj.key)?] = Some(obj.size);
+            found[zone_index(zone, &obj.key)?].push((start, obj.size));
         }
 
+        let mut leftovers = Vec::new();
         let (mut full, mut empty, mut closed) = (0, 0, 0);
-        let zones = sizes
-            .iter()
-            .zip(&finished)
-            .enumerate()
-            .map(|(i, (&object, &finished))| {
-                let size = object.unwrap_or(0);
-                let (cond, wp) = if finished || size == cfg.zone_size {
-                    full += 1;
-                    (Cond::Full, cfg.zone_size)
-                } else if size == 0 {
-                    empty += 1;
-                    (Cond::Empty, 0)
-                } else {
-                    closed += 1;
-                    (Cond::Closed, size)
-                };
-                Zone {
-                    start: i as u64 * cfg.zone_size,
-                    state: Mutex::new(ZoneState {
-                        cond,
-                        wp,
-                        data_end: size,
-                        flushed: size,
-                        chunks: VecDeque::new(),
-                        object: object.is_some(),
-                        marker: finished,
-                        generation: 0,
-                    }),
-                    upload: tokio::sync::Mutex::new(()),
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut zones = Vec::with_capacity(nr_zones);
+        for (i, (objects, &finished)) in found.into_iter().zip(&finished).enumerate() {
+            let start = i as u64 * cfg.zone_size;
+            let (objects, garbage) = cover(objects)
+                .map_err(|e| anyhow::anyhow!("zone {i} at {start:#x}: {e}; refusing to guess"))?;
+            leftovers.extend(garbage.into_iter().map(|g| layout.segment_key(start, g)));
+            let size = objects.last().map_or(0, |o| o.to);
+            let (cond, wp) = if finished || size == cfg.zone_size {
+                full += 1;
+                (Cond::Full, cfg.zone_size)
+            } else if size == 0 {
+                empty += 1;
+                (Cond::Empty, 0)
+            } else {
+                closed += 1;
+                (Cond::Closed, size)
+            };
+            zones.push(Zone {
+                start,
+                state: Mutex::new(ZoneState {
+                    cond,
+                    wp,
+                    data_end: size,
+                    flushed: size,
+                    chunks: VecDeque::new(),
+                    objects,
+                    marker: finished,
+                    generation: 0,
+                }),
+                upload: tokio::sync::Mutex::new(()),
+            });
+        }
+        if segments {
+            // Leftovers of interrupted concatenations (SPEC.md §5).
+            if !leftovers.is_empty() {
+                store.delete_many(&leftovers).await?;
+                info!("deleted {} segments already concatenated", leftovers.len());
+            }
+            let aborted = store.abort_stale_concats(&layout.dir()).await?;
+            if aborted > 0 {
+                info!("aborted {aborted} unfinished concatenations");
+            }
+        }
 
         let engine = Self {
             zone_size: cfg.zone_size,
@@ -229,7 +324,22 @@ impl Engine {
             uploads: S3_PARALLELISM,
             upload_slots: Semaphore::new(S3_PARALLELISM),
             get_part: u64::MAX,
+            segments,
+            compact_queue: Mutex::new(CompactQueue {
+                urgent: VecDeque::new(),
+                normal: VecDeque::new(),
+                queued: vec![false; nr_zones],
+            }),
+            compact_kick: Notify::new(),
         };
+        // Zones restored with several segments: concatenate them.
+        for (zi, zone) in engine.zones.iter().enumerate() {
+            let st = zone.state.lock().unwrap();
+            if let Some(urgent) = engine.compaction_due(&st) {
+                drop(st);
+                engine.queue_compaction(zi, urgent);
+            }
+        }
         info!("restored {nr_zones} zones: {closed} closed, {full} full, {empty} empty");
         Ok(engine)
     }
@@ -339,17 +449,23 @@ impl Engine {
         let mut pieces = Vec::new();
         let mut pos = rel;
 
-        if pos < end && pos < st.flushed {
-            let n = end.min(st.flushed) - pos;
+        // Stored data: a piece per object it spans.
+        let stop = end.min(st.flushed);
+        for o in &st.objects {
+            if o.to <= pos || o.from >= stop {
+                continue;
+            }
+            let to = stop.min(o.to);
             pieces.push(Piece::Store {
-                key: self.layout.zone_key(zone.start),
-                offset: pos,
-                len: n,
+                key: self.object_key(zone.start, o),
+                offset: pos - o.start,
+                len: to - pos,
+                zone_offset: pos,
                 zone: zi,
                 generation: st.generation,
                 flushed: st.flushed,
             });
-            pos += n;
+            pos = to;
         }
 
         let mem_end = end.min(st.data_end);
@@ -383,6 +499,7 @@ impl Engine {
                     key,
                     offset,
                     len,
+                    zone_offset,
                     zone,
                     generation,
                     flushed,
@@ -390,12 +507,18 @@ impl Engine {
                     // Only small reads, and only windows wholly stored: they never change.
                     Some(c)
                         if len < c.window()
-                            && (offset + len).next_multiple_of(c.window()) <= flushed =>
+                            && (zone_offset + len).next_multiple_of(c.window()) <= flushed =>
                     {
-                        self.read_windows(c, &key, (zone, generation), offset, len, &mut out)
+                        self.read_windows(c, (zone, generation), zone_offset, len, &mut out)
                             .await?
                     }
-                    _ => out.extend(self.get_parts(&key, offset, len).await?),
+                    _ => match self.get_parts(&key, offset, len).await {
+                        // A segment concatenated and deleted meanwhile: plan anew.
+                        Err(ZoneError::Store(StoreError::NotFound(_))) if self.segments => {
+                            out.extend(self.read_stored(zone, zone_offset, len).await?)
+                        }
+                        got => out.extend(got?),
+                    },
                 },
                 Piece::Mem(b) => {
                     STATS.read_from_ram.add(b.len() as u64);
@@ -419,6 +542,41 @@ impl Engine {
         futures_util::future::try_join_all(parts).await
     }
 
+    /// `[from, from + len)` of a zone's stored data, planned from its objects
+    /// as they are now.
+    async fn read_stored(&self, zi: usize, from: u64, len: u64) -> ZResult<Vec<Bytes>> {
+        let zone = &self.zones[zi];
+        let parts: Vec<(String, u64, u64)> = {
+            let st = zone.state.lock().unwrap();
+            let end = from + len;
+            if end > st.flushed {
+                return invalid(format!("zone {zi} was reset during a read"));
+            }
+            st.objects
+                .iter()
+                .filter(|o| o.to > from && o.from < end)
+                .map(|o| {
+                    let (a, b) = (from.max(o.from), end.min(o.to));
+                    (self.object_key(zone.start, o), a - o.start, b - a)
+                })
+                .collect()
+        };
+        let mut out = Vec::new();
+        for (key, offset, n) in parts {
+            out.extend(self.get_parts(&key, offset, n).await?);
+        }
+        Ok(out)
+    }
+
+    /// Key of a stored object of the zone starting at `zone_start`.
+    fn object_key(&self, zone_start: u64, o: &Stored) -> String {
+        if self.segments {
+            self.layout.segment_key(zone_start, o.start)
+        } else {
+            self.layout.zone_key(zone_start)
+        }
+    }
+
     /// One GET, counted in the statistics.
     async fn get(&self, key: &str, offset: u64, len: u64) -> ZResult<Bytes> {
         let started = Instant::now();
@@ -437,7 +595,6 @@ impl Engine {
     async fn read_windows(
         &self,
         cache: &ReadCache,
-        key: &str,
         (zone, generation): (usize, u64),
         offset: u64,
         len: u64,
@@ -452,7 +609,13 @@ impl Engine {
             let data = slot
                 .get_or_try_init(|| {
                     fetched = true;
-                    self.get(key, start, w)
+                    async move {
+                        let parts = self.read_stored(zone, start, w).await?;
+                        Ok::<_, ZoneError>(match parts.as_slice() {
+                            [one] => one.clone(),
+                            _ => Bytes::from(parts.concat()),
+                        })
+                    }
                 })
                 .await?;
             let (from, to) = (offset.max(start) - start, end.min(start + w) - start);
@@ -487,13 +650,18 @@ impl Engine {
         let nr_chunks = chunks.len();
         let body = Body::new(chunks);
         let len = body.len();
-        let key = self.layout.zone_key(zone.start);
         let started = Instant::now();
         let uploaded = {
             // Never closed, so acquiring cannot fail.
             let _slot = self.upload_slots.acquire().await.unwrap();
             let _in_flight = STATS.uploads.enter();
-            self.store.append(&key, from, body).await
+            if self.segments {
+                let key = self.layout.segment_key(zone.start, from);
+                self.store.put(&key, body).await
+            } else {
+                let key = self.layout.zone_key(zone.start);
+                self.store.append(&key, from, body).await
+            }
         };
         if let Err(e) = uploaded {
             STATS.upload_errors.inc();
@@ -511,12 +679,25 @@ impl Engine {
         STATS.reason(reason).inc();
         debug!("zone {zi}: uploaded {len} bytes at {from} ({reason:?})");
 
-        {
+        let compaction = {
             let mut st = zone.state.lock().unwrap();
             // Only the holder of `upload` removes chunks, so the front ones are ours.
             st.chunks.drain(..nr_chunks);
             st.flushed = from + len;
-            st.object = true;
+            let stored = Stored {
+                start: if self.segments { from } else { 0 },
+                from,
+                to: from + len,
+            };
+            if self.segments || st.objects.is_empty() {
+                st.objects.push(stored);
+            } else {
+                st.objects[0].to = stored.to;
+            }
+            self.compaction_due(&st)
+        };
+        if let Some(urgent) = compaction {
+            self.queue_compaction(zi, urgent);
         }
         self.dirty.fetch_sub(len, Ordering::SeqCst);
         self.room.notify_waiters();
@@ -587,10 +768,16 @@ impl Engine {
             .put(&self.layout.finished_key(zone.start), Body::default())
             .await?;
 
-        let mut st = zone.state.lock().unwrap();
-        st.marker = true;
-        st.cond = Cond::Full;
-        st.wp = self.zone_size;
+        let compaction = {
+            let mut st = zone.state.lock().unwrap();
+            st.marker = true;
+            st.cond = Cond::Full;
+            st.wp = self.zone_size;
+            self.compaction_due(&st)
+        };
+        if let Some(urgent) = compaction {
+            self.queue_compaction(zi, urgent);
+        }
         debug!("zone {zi} finished");
         Ok(())
     }
@@ -608,10 +795,17 @@ impl Engine {
         let _upload = zone.upload.lock().await;
         let keys = {
             let st = zone.state.lock().unwrap();
-            if st.cond == Cond::Empty && st.data_end == 0 && !st.object && !st.marker {
+            if st.cond == Cond::Empty && st.data_end == 0 && st.objects.is_empty() && !st.marker {
                 return Ok(());
             }
             self.stored_keys(zone, &st)
+        };
+        // Segments: everything under the zone's prefix, leftovers included.
+        let keys = if self.segments {
+            let listed = self.store.list(&self.layout.zone_key(zone.start)).await?;
+            listed.into_iter().map(|o| o.key).collect()
+        } else {
+            keys
         };
         // Delete first: if it fails the zone keeps its state and stays consistent.
         match keys.as_slice() {
@@ -624,12 +818,13 @@ impl Engine {
         Ok(())
     }
 
-    /// Objects of the zone in the store: the zone object and the FINISH marker.
+    /// Objects of the zone in the store: its data objects and the FINISH marker.
     fn stored_keys(&self, zone: &Zone, st: &ZoneState) -> Vec<String> {
-        let mut keys = Vec::new();
-        if st.object {
-            keys.push(self.layout.zone_key(zone.start));
-        }
+        let mut keys: Vec<String> = st
+            .objects
+            .iter()
+            .map(|o| self.object_key(zone.start, o))
+            .collect();
         if st.marker {
             keys.push(self.layout.finished_key(zone.start));
         }
@@ -641,7 +836,7 @@ impl Engine {
     fn clear_locked(&self, zi: usize) {
         let (dropped, had_object) = {
             let mut st = self.zones[zi].state.lock().unwrap();
-            let had_object = st.object;
+            let had_object = !st.objects.is_empty();
             st.generation += 1;
             let dropped = st.buffered();
             st.cond = Cond::Empty;
@@ -649,7 +844,7 @@ impl Engine {
             st.data_end = 0;
             st.flushed = 0;
             st.chunks.clear();
-            st.object = false;
+            st.objects.clear();
             st.marker = false;
             (dropped, had_object)
         };
@@ -674,6 +869,16 @@ impl Engine {
         for zone in &self.zones {
             guards.push(zone.upload.lock().await);
             keys.extend(self.stored_keys(zone, &zone.state.lock().unwrap()));
+        }
+        if self.segments {
+            // Everything of the disk but its config, leftovers included.
+            let config_key = self.layout.config_key();
+            let listed = self.store.list(&self.layout.dir()).await?;
+            keys = listed
+                .into_iter()
+                .map(|o| o.key)
+                .filter(|k| *k != config_key)
+                .collect();
         }
         // On failure no zone changes state, as with a failed single DELETE,
         // though some objects may be gone: their zones then fail I/O until the
@@ -791,6 +996,166 @@ impl Engine {
             .map(|((_, b), i, reason)| (i, b, reason))
     }
 
+    /// Whether a SEGMENTS zone needs concatenation, and how soon: at once
+    /// (`true`) when FULL, in turn when it has many segments.
+    fn compaction_due(&self, st: &ZoneState) -> Option<bool> {
+        if !self.segments || st.objects.len() < 2 {
+            None
+        } else if st.cond == Cond::Full {
+            Some(true)
+        } else if st.objects.len() > COMPACT_SEGMENTS {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    fn queue_compaction(&self, zi: usize, urgent: bool) {
+        let mut q = self.compact_queue.lock().unwrap();
+        if q.queued[zi] {
+            if !urgent || q.urgent.contains(&zi) {
+                return;
+            }
+            q.normal.retain(|&z| z != zi);
+        }
+        q.queued[zi] = true;
+        if urgent {
+            q.urgent.push_back(zi);
+        } else {
+            q.normal.push_back(zi);
+        }
+        drop(q);
+        self.compact_kick.notify_one();
+    }
+
+    /// Next queued zone not being concatenated already.
+    fn next_compaction(&self, busy: &[bool]) -> Option<usize> {
+        let mut q = self.compact_queue.lock().unwrap();
+        let pick = |list: &mut VecDeque<usize>| {
+            let i = list.iter().position(|&z| !busy[z])?;
+            list.remove(i)
+        };
+        let zi = pick(&mut q.urgent).or_else(|| pick(&mut q.normal))?;
+        q.queued[zi] = false;
+        Some(zi)
+    }
+
+    /// Concatenates segments of SEGMENTS zones on the server (SPEC.md §5), up
+    /// to `COMPACT_PARALLELISM` zones at once, never one zone twice at once.
+    pub async fn compactor(self: Arc<Self>) {
+        if !self.segments {
+            return;
+        }
+        let mut running = futures_util::stream::FuturesUnordered::new();
+        let mut busy = vec![false; self.zones.len()];
+        loop {
+            while running.len() < COMPACT_PARALLELISM {
+                let Some(zi) = self.next_compaction(&busy) else {
+                    break;
+                };
+                busy[zi] = true;
+                let engine: &Engine = &self;
+                running.push(async move { (zi, engine.compact_zone(zi).await) });
+            }
+            if running.is_empty() {
+                self.compact_kick.notified().await;
+                continue;
+            }
+            tokio::select! {
+                Some((zi, res)) = running.next() => {
+                    busy[zi] = false;
+                    if let Err(e) = res {
+                        STATS.compact_errors.inc();
+                        warn!("concatenation of zone {zi} failed: {e}");
+                        tokio::time::sleep(BACKGROUND_RETRY_PAUSE).await;
+                    }
+                }
+                _ = self.compact_kick.notified() => {}
+            }
+        }
+    }
+
+    /// Concatenates the segments of a zone into its first object
+    /// `<zone>-00000000` and deletes the others.
+    async fn compact_zone(&self, zi: usize) -> ZResult<()> {
+        let Some(job) = self.compact_begin(zi).await? else {
+            return Ok(());
+        };
+        self.compact_end(zi, job).await
+    }
+
+    /// Takes the segments under the zone's `upload` lock, then copies them
+    /// on the server without it: flushes and RESET of the zone do not wait.
+    async fn compact_begin(&self, zi: usize) -> ZResult<Option<CompactJob>> {
+        let zone = &self.zones[zi];
+        let (generation, parts) = {
+            let _upload = zone.upload.lock().await;
+            let st = zone.state.lock().unwrap();
+            if st.objects.len() < 2 {
+                return Ok(None);
+            }
+            (st.generation, st.objects.clone())
+        };
+        let sources: Vec<_> = parts
+            .iter()
+            .map(|o| {
+                let key = self.layout.segment_key(zone.start, o.start);
+                (key, o.from - o.start, o.to - o.from)
+            })
+            .collect();
+        let base = self.layout.segment_key(zone.start, 0);
+        let pending = self.store.begin_concat(&base, &sources).await?;
+        Ok(Some(CompactJob {
+            generation,
+            parts,
+            pending,
+        }))
+    }
+
+    /// Completes the concatenation under the zone's `upload` lock, unless the
+    /// zone changed meanwhile: after a RESET (another generation) a new first
+    /// segment `-00000000` may hold new data, and completing would overwrite
+    /// it with old data; after another concatenation the parts are stale.
+    /// Then deletes the concatenated segments.
+    async fn compact_end(&self, zi: usize, job: CompactJob) -> ZResult<()> {
+        let zone = &self.zones[zi];
+        let end = job.parts.last().expect("at least two parts").to;
+        {
+            let _upload = zone.upload.lock().await;
+            let unchanged = {
+                let st = zone.state.lock().unwrap();
+                st.generation == job.generation && st.objects.starts_with(&job.parts)
+            };
+            if !unchanged {
+                self.store.abort_concat(job.pending).await;
+                debug!("zone {zi} changed during its concatenation; dropped it");
+                return Ok(());
+            }
+            self.store.finish_concat(job.pending).await?;
+            let mut st = zone.state.lock().unwrap();
+            let rest = st.objects.split_off(job.parts.len());
+            st.objects = std::iter::once(Stored {
+                start: 0,
+                from: 0,
+                to: end,
+            })
+            .chain(rest)
+            .collect();
+        }
+        let merged: Vec<String> = job
+            .parts
+            .iter()
+            .filter(|o| o.start != 0)
+            .map(|o| self.layout.segment_key(zone.start, o.start))
+            .collect();
+        // Readers still holding a deleted segment plan anew on 404.
+        self.store.delete_many(&merged).await?;
+        STATS.compactions.inc();
+        STATS.compacted_segments.add(job.parts.len() as u64);
+        debug!("zone {zi}: {} segments concatenated", job.parts.len());
+        Ok(())
+    }
+
     pub fn dirty_limit(&self) -> u64 {
         self.dirty_limit
     }
@@ -870,6 +1235,148 @@ mod tests {
     async fn read(e: &Engine, offset: u64, len: u64) -> Vec<u8> {
         let pieces = e.read_plan(offset, len).unwrap();
         e.fetch(pieces).await.unwrap().concat()
+    }
+
+    async fn segments_engine(store: Arc<Store>) -> Engine {
+        let mut cfg = DiskConfig::new(8 * ZS, ZS);
+        cfg.dirty_limit_bytes = 64 * B;
+        cfg.append = AppendMode::Segments;
+        Engine::open(&cfg, Layout::new("t").unwrap(), store)
+            .await
+            .unwrap()
+    }
+
+    async fn keys(store: &Store, prefix: &str) -> Vec<String> {
+        let listed = store.list(prefix).await.unwrap();
+        listed.into_iter().map(|o| o.key).collect()
+    }
+
+    /// Writes and flushes `n` single-block segments at the zone's pointer,
+    /// block i filled with `first + i`.
+    async fn segment_writes(e: &Engine, zone: u64, first: u8, n: u8) {
+        for i in 0..n {
+            let wp = e.report(zone as usize, 1)[0].wp;
+            e.write(wp, blk(first + i, 1), false).unwrap();
+            e.flush_zone(zone as usize, Reason::Explicit).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn segments_write_read_concatenate() {
+        let store = mem();
+        let e = segments_engine(store.clone()).await;
+        segment_writes(&e, 1, 1, 3).await;
+        assert_eq!(
+            keys(&store, "t/").await,
+            [
+                "t/0000000000100000-00000000",
+                "t/0000000000100000-00001000",
+                "t/0000000000100000-00002000"
+            ]
+        );
+        let want: Vec<u8> = [blk(1, 1), blk(2, 1), blk(3, 1)].concat();
+        assert_eq!(read(&e, ZS, 3 * B).await, want); // across segments
+
+        e.compact_zone(1).await.unwrap();
+        assert_eq!(keys(&store, "t/").await, ["t/0000000000100000-00000000"]);
+        assert_eq!(read(&e, ZS, 3 * B).await, want);
+        segment_writes(&e, 1, 4, 1).await; // a new segment after the base
+        assert_eq!(keys(&store, "t/").await.len(), 2);
+        assert_eq!(
+            &read(&e, ZS + 2 * B, 2 * B).await[B as usize..],
+            &blk(4, 1)[..]
+        );
+    }
+
+    #[tokio::test]
+    async fn segments_full_zone_is_urgent() {
+        let e = segments_engine(mem()).await;
+        segment_writes(&e, 2, 1, 2).await;
+        assert_eq!(e.next_compaction(&[false; 8]), None); // two segments: not yet
+        e.write(2 * ZS + 2 * B, blk(9, ZS / B - 2), false).unwrap(); // fills the zone
+        e.flush_zone(2, Reason::Explicit).await.unwrap();
+        assert_eq!(e.next_compaction(&[false; 8]), Some(2));
+    }
+
+    #[tokio::test]
+    async fn segments_restore_cover_and_leftovers() {
+        let store = mem();
+        let put = |k: &str, b: Bytes| {
+            let store = store.clone();
+            let k = k.to_string();
+            async move { store.put(&k, Body::new(vec![b])).await.unwrap() }
+        };
+        // A concatenated base of 3 blocks, a segment it covers (a leftover)
+        // and one after it.
+        put(
+            "t/0000000000000000-00000000",
+            [blk(1, 1), blk(2, 1), blk(3, 1)].concat().into(),
+        )
+        .await;
+        put("t/0000000000000000-00001000", blk(2, 1)).await;
+        put("t/0000000000000000-00003000", blk(4, 1)).await;
+        let e = segments_engine(store.clone()).await;
+        assert_eq!(e.report(0, 1)[0].wp, 4 * B);
+        assert_eq!(
+            read(&e, 0, 4 * B).await,
+            [blk(1, 1), blk(2, 1), blk(3, 1), blk(4, 1)].concat()
+        );
+        assert_eq!(
+            keys(&store, "t/").await,
+            ["t/0000000000000000-00000000", "t/0000000000000000-00003000"]
+        );
+
+        // An object after a gap means lost data: refuse to start.
+        put("t/0000000000100000-00002000", blk(5, 1)).await;
+        let mut cfg = DiskConfig::new(8 * ZS, ZS);
+        cfg.append = AppendMode::Segments;
+        let err = Engine::open(&cfg, Layout::new("t").unwrap(), store)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("gap"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn segments_concatenation_racing_reset() {
+        let store = mem();
+        let e = segments_engine(store.clone()).await;
+        segment_writes(&e, 0, 1, 3).await;
+        // Parts copied, then the zone is reset and written anew.
+        let job = e.compact_begin(0).await.unwrap().unwrap();
+        e.reset_zone(0).await.unwrap();
+        segment_writes(&e, 0, 7, 1).await; // new data in -00000000
+        e.compact_end(0, job).await.unwrap();
+        // The new first segment survived: the stale concatenation was dropped.
+        assert_eq!(keys(&store, "t/").await, ["t/0000000000000000-00000000"]);
+        assert_eq!(read(&e, 0, B).await, blk(7, 1).to_vec());
+        assert_eq!(e.report(0, 1)[0].wp, B);
+    }
+
+    #[tokio::test]
+    async fn segments_reset_by_prefix() {
+        let store = mem();
+        let e = segments_engine(store.clone()).await;
+        segment_writes(&e, 3, 1, 2).await;
+        e.finish_zone(3 * ZS).await.unwrap();
+        // A leftover the engine does not know about.
+        store
+            .put("t/0000000000300000-00008000", Body::default())
+            .await
+            .unwrap();
+        e.reset_zone(3 * ZS).await.unwrap();
+        assert!(keys(&store, "t/").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn segments_read_planned_before_concatenation() {
+        let store = mem();
+        let e = segments_engine(store.clone()).await;
+        segment_writes(&e, 0, 1, 3).await;
+        let pieces = e.read_plan(0, 3 * B).unwrap(); // three segment pieces
+        e.compact_zone(0).await.unwrap(); // deletes two of them
+        let got = e.fetch(pieces).await.unwrap().concat();
+        assert_eq!(got, [blk(1, 1), blk(2, 1), blk(3, 1)].concat());
     }
 
     #[tokio::test]

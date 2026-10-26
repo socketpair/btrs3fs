@@ -383,6 +383,7 @@ fn serve_disk(
     }
     let engine = Arc::new(engine);
     rt.spawn(engine.clone().background_flusher());
+    rt.spawn(engine.clone().compactor());
     let opts = device::DeviceOptions {
         dev_id,
         nr_queues: cfg.nr_queues,

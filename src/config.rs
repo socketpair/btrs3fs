@@ -85,10 +85,11 @@ pub enum AppendMode {
     /// Ceph RGW Append Object, `PUT ?append&position=N`: one request.
     #[serde(rename = "PUT_APPEND")]
     PutAppend,
-    /// Standard S3: a multipart upload copying the object on the server and
-    /// adding the new bytes, completed over the old object: four requests.
-    #[serde(rename = "MULTIPART", alias = "multipart")]
-    Multipart,
+    /// S3 without append: every upload is a new object `<zone>-<offset>`;
+    /// the segments of a zone are concatenated on the server in the
+    /// background (SPEC.md §5). Needs server-side copy of small parts.
+    #[serde(rename = "SEGMENTS")]
+    Segments,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -306,16 +307,14 @@ mod tests {
     #[test]
     fn append_mode() {
         let mut cfg = DiskConfig::new(1 << 30, 16 << 20);
-        cfg.append = AppendMode::Multipart;
+        cfg.append = AppendMode::Segments;
         let mut json: serde_json::Value = serde_json::from_slice(&cfg.to_json()).unwrap();
-        assert_eq!(json["append"], "MULTIPART");
-        json["append"] = "multipart".into(); // written so before the names were fixed
-        assert_eq!(
-            DiskConfig::from_json(json.to_string().as_bytes())
-                .unwrap()
-                .append,
-            AppendMode::Multipart
-        );
+        assert_eq!(json["append"], "SEGMENTS");
+        json["append"] = "patch".into(); // written so before the names were fixed
+        let old = DiskConfig::from_json(json.to_string().as_bytes()).unwrap();
+        assert_eq!(old.append, AppendMode::Patch);
+        json["append"] = "MULTIPART".into(); // removed mode
+        assert!(DiskConfig::from_json(json.to_string().as_bytes()).is_err());
         json.as_object_mut().unwrap().remove("append"); // disks created before the field
         let old = DiskConfig::from_json(json.to_string().as_bytes()).unwrap();
         assert_eq!(old.append, AppendMode::Patch);

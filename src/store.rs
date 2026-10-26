@@ -1,4 +1,5 @@
-//! Object storage abstraction: one object per zone plus `disk.json`.
+//! Object storage abstraction: zone objects (one per zone, or segments
+//! `<zone>-<offset>` on SEGMENTS disks) plus `disk.json`.
 //!
 //! `MemStore` mirrors the semantics observed on Yandex Object Storage
 //! (see SPEC.md §11): PATCH of a missing object fails with "not found",
@@ -53,6 +54,17 @@ pub struct ObjectInfo {
     pub key: String,
     pub size: u64,
 }
+
+/// A server-side concatenation whose parts are copied but which is not
+/// completed yet (SPEC.md §5): finishing makes the object appear, replacing
+/// any object of that key atomically; aborting leaves nothing.
+pub enum PendingConcat {
+    Mem { dst: String, data: Vec<u8> },
+    S3(crate::s3::PendingConcat),
+}
+
+/// A source range of a concatenation: (key, offset, length).
+pub type ConcatPart = (String, u64, u64);
 
 pub enum Store {
     Mem(MemStore),
@@ -121,6 +133,53 @@ impl Store {
         match self {
             Store::Mem(m) => m.list(prefix),
             Store::S3(s) => s.list(prefix).await,
+        }
+    }
+
+    /// Copies `parts` (ranges of existing objects) on the server into a new
+    /// object `dst` that appears only on `finish_concat`.
+    pub async fn begin_concat(
+        &self,
+        dst: &str,
+        parts: &[ConcatPart],
+    ) -> StoreResult<PendingConcat> {
+        match self {
+            Store::Mem(m) => {
+                let mut data = Vec::new();
+                for (key, offset, len) in parts {
+                    data.extend_from_slice(&m.get_range(key, *offset, *len)?);
+                }
+                Ok(PendingConcat::Mem {
+                    dst: dst.to_string(),
+                    data,
+                })
+            }
+            Store::S3(s) => Ok(PendingConcat::S3(s.begin_concat(dst, parts).await?)),
+        }
+    }
+
+    pub async fn finish_concat(&self, pending: PendingConcat) -> StoreResult<()> {
+        match (self, pending) {
+            (Store::Mem(m), PendingConcat::Mem { dst, data }) => {
+                m.put(&dst, Body::new(vec![Bytes::from(data)]))
+            }
+            (Store::S3(s), PendingConcat::S3(p)) => s.finish_concat(p).await,
+            _ => unreachable!("a concatenation belongs to its store"),
+        }
+    }
+
+    /// Drops a concatenation that must not complete (best effort).
+    pub async fn abort_concat(&self, pending: PendingConcat) {
+        if let (Store::S3(s), PendingConcat::S3(p)) = (self, pending) {
+            s.abort_concat(p).await;
+        }
+    }
+
+    /// Aborts concatenations under `prefix` a crash left unfinished; how many.
+    pub async fn abort_stale_concats(&self, prefix: &str) -> StoreResult<usize> {
+        match self {
+            Store::Mem(_) => Ok(0),
+            Store::S3(s) => s.abort_stale_concats(prefix).await,
         }
     }
 }
@@ -292,6 +351,29 @@ impl Layout {
         u64::from_str_radix(name, 16).ok()
     }
 
+    /// Segment of a SEGMENTS disk: `<zone key>-<offset in the zone>`, the
+    /// offset in 8 lowercase hex digits (a zone is at most 32 MiB). All objects
+    /// of a zone share the prefix `zone_key()` (SPEC.md §3.1).
+    pub fn segment_key(&self, zone_offset: u64, offset: u64) -> String {
+        format!("{}-{offset:08x}", self.zone_key(zone_offset))
+    }
+
+    /// (zone offset, offset in the zone) if `key` is a segment of this disk.
+    pub fn parse_segment_key(&self, key: &str) -> Option<(u64, u64)> {
+        let (zone, offset) = key.rsplit_once('-')?;
+        if offset.len() != 8
+            || !offset
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return None;
+        }
+        Some((
+            self.parse_zone_key(zone)?,
+            u64::from_str_radix(offset, 16).ok()?,
+        ))
+    }
+
     /// Byte offset of the zone if `key` is a FINISH marker of this disk.
     pub fn parse_finished_key(&self, key: &str) -> Option<u64> {
         self.parse_zone_key(key.strip_suffix(FINISHED_SUFFIX)?)
@@ -349,6 +431,23 @@ mod tests {
         assert_eq!(l.parse_finished_key("disks/test/0000000002000000"), None);
         assert_eq!(
             l.parse_zone_key("disks/test/0000000002000000.finished"),
+            None
+        );
+        assert_eq!(
+            l.segment_key(32 << 20, 0x340000),
+            "disks/test/0000000002000000-00340000"
+        );
+        assert_eq!(
+            l.parse_segment_key("disks/test/0000000002000000-00340000"),
+            Some((32 << 20, 0x340000))
+        );
+        assert_eq!(l.parse_segment_key("disks/test/0000000002000000"), None);
+        assert_eq!(
+            l.parse_segment_key("disks/test/0000000002000000-340000"),
+            None
+        );
+        assert_eq!(
+            l.parse_zone_key("disks/test/0000000002000000-00340000"),
             None
         );
         assert!(Layout::new("/").is_err());
