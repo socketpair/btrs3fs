@@ -414,6 +414,7 @@ fn serve_disk(
                     uptime_secs: started.elapsed().as_secs(),
                     dirty_bytes: stats_engine.dirty_bytes(),
                     dirty_limit: stats_engine.dirty_limit(),
+                    dirty_hard_limit: stats_engine.hard_limit(),
                     dirty_zones,
                     zones,
                 })

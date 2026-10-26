@@ -393,7 +393,18 @@ impl Engine {
 
     /// WRITE (at the write pointer) or ZONE_APPEND (anywhere in the zone, `offset`
     /// is the zone start). Returns the absolute offset the data was written at.
+    /// Counts the data as buffered without waiting for room (tests, `create`).
+    #[cfg(test)]
     pub fn write(&self, offset: u64, data: Bytes, append: bool) -> ZResult<u64> {
+        let len = data.len() as u64;
+        self.dirty.fetch_add(len, Ordering::SeqCst);
+        self.write_reserved(offset, data, append)
+            .inspect_err(|_| self.unreserve(len))
+    }
+
+    /// `write` for data whose room `reserve` has taken: on error the caller
+    /// gives the room back with `unreserve`.
+    pub fn write_reserved(&self, offset: u64, data: Bytes, append: bool) -> ZResult<u64> {
         let len = data.len() as u64;
         if len == 0 || !len.is_multiple_of(BLOCK_SIZE) {
             return invalid(format!(
@@ -438,8 +449,7 @@ impl Engine {
         }
         drop(st);
 
-        let dirty = self.dirty.fetch_add(len, Ordering::SeqCst) + len;
-        if full || dirty > self.dirty_limit {
+        if full || self.dirty_bytes() > self.dirty_limit {
             self.kick.notify_one();
         }
         Ok(zone.start + pos)
@@ -922,22 +932,41 @@ impl Engine {
         self.dirty.load(Ordering::SeqCst)
     }
 
-    /// Writes must wait when buffered data reaches twice the soft limit.
-    pub fn over_hard_limit(&self) -> bool {
-        self.dirty_bytes() >= 2 * self.dirty_limit
+    /// Buffered data writes may not take beyond: twice the soft limit.
+    pub fn hard_limit(&self) -> u64 {
+        2 * self.dirty_limit
     }
 
-    pub async fn wait_for_room(&self) {
+    /// Takes `len` bytes of buffer room for a write if it stays within the
+    /// hard limit, or if nothing is buffered (a single request larger than
+    /// the room must pass too). Atomic: concurrent writes cannot all pass on
+    /// the same free room (SPEC.md §5).
+    pub fn try_reserve(&self, len: u64) -> bool {
+        self.dirty
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                (cur == 0 || cur + len <= self.hard_limit()).then_some(cur + len)
+            })
+            .is_ok()
+    }
+
+    /// `try_reserve`, waiting for uploads to free room.
+    pub async fn reserve(&self, len: u64) {
         loop {
             let notified = self.room.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if !self.over_hard_limit() {
+            if self.try_reserve(len) {
                 return;
             }
             self.kick.notify_one();
             notified.await;
         }
+    }
+
+    /// Gives back room taken for a write that failed.
+    pub fn unreserve(&self, len: u64) {
+        self.dirty.fetch_sub(len, Ordering::SeqCst);
+        self.room.notify_waiters();
     }
 
     /// Uploads FULL and CLOSED zones at once, and any zones while buffered
@@ -1943,7 +1972,38 @@ mod tests {
         })
         .await
         .unwrap();
-        e.wait_for_room().await;
+        e.reserve(B).await;
+        e.unreserve(B);
+    }
+
+    #[tokio::test]
+    async fn writers_never_pass_the_hard_limit() {
+        // Soft limit 64 blocks, hard 128.
+        let e = Arc::new(engine_with(mem()).await);
+        assert!(e.try_reserve(120 * B));
+        assert!(e.try_reserve(8 * B)); // exactly at the hard limit
+        assert!(!e.try_reserve(B));
+        // Waiting writers: room for only two of them once 16 blocks are freed.
+        let waiters: Vec<_> = (0..5)
+            .map(|_| {
+                let e = e.clone();
+                tokio::spawn(async move { e.reserve(8 * B).await })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        e.unreserve(16 * B);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(waiters.iter().filter(|w| w.is_finished()).count(), 2);
+        assert_eq!(e.dirty_bytes(), 128 * B);
+        // Nothing buffered: a request larger than the whole room still passes.
+        e.unreserve(128 * B);
+        for w in waiters {
+            w.abort();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let rest = e.dirty_bytes();
+        e.unreserve(rest);
+        assert!(e.try_reserve(1000 * B));
     }
 
     #[tokio::test]

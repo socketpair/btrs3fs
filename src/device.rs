@@ -383,13 +383,16 @@ async fn handle_io(q: &UblkQueue, tag: u16, ctx: &Ctx, efd: &Arc<OwnedFd>) -> ZR
                 STATS.req_write.inc();
                 STATS.req_write_bytes.add(len);
             }
-            let data = copy_from_request(cdev, copy_pos, len)?;
-            if engine.over_hard_limit() {
+            // Room first, then the copy: a request waiting for room holds no
+            // data (SPEC.md §5).
+            if !engine.try_reserve(len) {
                 let e = engine.clone();
-                on_tokio(ctx, efd, async move { e.wait_for_room().await }).await?;
+                on_tokio(ctx, efd, async move { e.reserve(len).await }).await?;
             }
             let append = op == sys::UBLK_IO_OP_ZONE_APPEND;
-            let at = engine.write(offset, data, append)?;
+            let at = copy_from_request(cdev, copy_pos, len)
+                .and_then(|data| engine.write_reserved(offset, data, append))
+                .inspect_err(|_| engine.unreserve(len))?;
             if iod.op_flags & sys::UBLK_IO_F_FUA != 0 {
                 STATS.req_fua.inc();
                 let (zi, _) = engine.locate(at)?;

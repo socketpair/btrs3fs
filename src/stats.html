@@ -173,8 +173,8 @@ function render(s, p, dt) {
   $("cards").innerHTML =
     card("Upload to S3", rate(upRate), `${num(upPerSec)} uploads/s · total ${bytes(s.upload_size.sum)}`) +
     card("Read from S3", rate(rdRate), `${num(d("gets"))} GET/s · total ${bytes(s.read_from_s3)}`) +
-    card("RAM buffers", bytes(s.dirty_bytes), `${s.dirty_zones} zones · limit ${bytes(s.dirty_limit)}`,
-         s.dirty_bytes / s.dirty_limit * 100) +
+    card("RAM buffers", bytes(s.dirty_bytes), `${s.dirty_zones} zones · background uploads above ${bytes(s.dirty_limit)} · writes wait at ${bytes(s.dirty_hard_limit)}`,
+         s.dirty_bytes / s.dirty_hard_limit * 100) +
     card("Uploads in parallel", `${s.uploads_in_flight}`, `max ${s.uploads_in_flight_max} · kernel requests ${s.requests_in_flight} (max ${s.requests_in_flight_max})`) +
     card("Zones", `${s.zones.open} open`, `${s.zones.closed} closed · ${s.zones.full} full · ${s.zones.empty} empty<br>` +
          `${s.zones.partial} partly filled · ${s.zones.fragmented} fragmented (${num(s.zones.objects)} objects, at most ${s.zones.max_objects} in a zone)`) +

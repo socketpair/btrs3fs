@@ -376,7 +376,9 @@ pub struct Snapshot {
     pub append: crate::config::AppendMode,
     pub uptime_secs: u64,
     pub dirty_bytes: u64,
+    /// Background uploads start above `dirty_limit`; writes wait at `dirty_hard_limit`.
     pub dirty_limit: u64,
+    pub dirty_hard_limit: u64,
     pub dirty_zones: u64,
     pub zones: ZoneCounts,
     pub upload_size: Hist,
@@ -437,6 +439,7 @@ pub struct DiskState {
     pub uptime_secs: u64,
     pub dirty_bytes: u64,
     pub dirty_limit: u64,
+    pub dirty_hard_limit: u64,
     pub dirty_zones: u64,
     pub zones: ZoneCounts,
 }
@@ -450,6 +453,7 @@ impl Stats {
             uptime_secs: d.uptime_secs,
             dirty_bytes: d.dirty_bytes,
             dirty_limit: d.dirty_limit,
+            dirty_hard_limit: d.dirty_hard_limit,
             dirty_zones: d.dirty_zones,
             zones: d.zones,
             upload_size: self.upload_size.snapshot(),
