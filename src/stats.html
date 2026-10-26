@@ -335,7 +335,7 @@ function renderOverview(s) {
   const z = s.zones, used = z.open + z.closed + z.full;
   $("zones-brief").innerHTML = `<div class="strip">${stripSpans(z)}</div><div class="legend">${legend(z, false)}</div>` +
     `<p class="note" style="margin-bottom:0">${num(used)} of ${num(used + z.empty)} zones hold data · ${num(z.partial)} partly filled · ` +
-    `${num(z.fragmented)} fragmented · <a href="#" data-goto="zones">open the zone map</a></p>`;
+    `${num(z.fragmented)} fragmented · <a href="#" data-goto="zones">open the zone map</a></p>` + concatLine(s);
   $("zones-brief").querySelector("[data-goto]").onclick = ev => { ev.preventDefault(); showTab("zones"); };
 }
 
@@ -433,9 +433,20 @@ $("zmap").addEventListener("mousemove", ev => {
 $("zmap").addEventListener("mouseleave", () => { $("ztip").style.display = "none"; });
 window.addEventListener("resize", drawZones);
 
+/* What concatenation does right now; SEGMENTS disks only. A fragmented open zone is normal:
+   every upload adds a segment, and the zone is concatenated once it has many. */
+function concatLine(s) {
+  if (s.append !== "SEGMENTS") return "";
+  const z = s.zones, d = delta;
+  const busy = s.compacting || z.compact_queued;
+  return `<p class="note" style="margin-bottom:0">Concatenation: ${busy ? `${num(s.compacting)} running, ${num(z.compact_queued)} waiting` : "idle"}` +
+    ` · ${num(d("compactions"))}/s, ${num(d("compacted_segments"))} segments/s merged · ${num(s.compactions)} done since start` +
+    (s.compact_errors ? ` · <span style="color:var(--bad)">${num(s.compact_errors)} failed</span>` : "") + `</p>`;
+}
+
 function renderZones(s) {
   $("zstrip").innerHTML = stripSpans(s.zones);
-  $("zlegend").innerHTML = legend(s.zones, true);
+  $("zlegend").innerHTML = legend(s.zones, true) + concatLine(s);
   $("btn-compact").hidden = s.append !== "SEGMENTS";
 }
 
