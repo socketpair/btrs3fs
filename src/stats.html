@@ -75,6 +75,8 @@
     <div class="card"><div class="label">Zones uploaded per FLUSH</div><table class="hist" id="h-zones"></table></div>
     <div class="card"><div class="label">GET size (Range)</div><table class="hist" id="h-getsize"></table></div>
     <div class="card"><div class="label">GET time</div><table class="hist" id="h-getlat"></table></div>
+    <div class="card segments"><div class="label">Concatenation time</div><table class="hist" id="h-cattime"></table></div>
+    <div class="card segments"><div class="label">Segments per concatenation</div><table class="hist" id="h-catsegs"></table></div>
   </div>
 
   <h2>Details</h2>
@@ -82,6 +84,7 @@
     <div class="card"><div class="label">Uploads to S3</div><table id="t-up"></table></div>
     <div class="card"><div class="label">Reads</div><table id="t-rd"></table></div>
     <div class="card"><div class="label">Kernel requests</div><table id="t-req"></table></div>
+    <div class="card segments"><div class="label">Concatenation of segments (SEGMENTS)</div><table id="t-cat"></table></div>
   </div>
   <p class="hint">Counters are totals since the device server started; “/s” columns are the last second.
      Raw data: <a href="stats.json">stats.json</a>.</p>
@@ -116,34 +119,19 @@ function card(label, value, detail, meter) {
     `</div>`;
 }
 
-/* Bucket i holds values in (bounds[i-1], bounds[i]]; the last one is open-ended. */
-function histRows(h, label) {
-  const total = h.counts.reduce((a, b) => a + b, 0);
-  if (!total) return `<tr><td>no data yet</td></tr>`;
-  const max = Math.max(...h.counts);
-  return h.counts.map((c, i) => {
-    if (!c) return "";
-    const lo = i ? h.bounds[i - 1] : null, hi = h.bounds[i];
-    const name = label(lo, hi);
-    return `<tr><td>${name}</td><td class="bar"><div class="b" style="width:${(c / max * 100).toFixed(1)}%"></div></td>` +
-      `<td>${num(c)}</td><td>${(c / total * 100).toFixed(1)}%</td></tr>`;
-  }).join("");
-}
-const leLabel = fmt => (lo, hi) => hi === undefined ? "&gt; " + fmt(lo) : "≤ " + fmt(hi);
-function rangeLabel(lo, hi) {
-  if (hi === undefined) return "&gt; " + lo;
-  const from = lo === null ? 0 : lo + 1;
-  return from === hi ? String(hi) : from + "–" + hi;
-}
-function quantile(h, q) {
-  const total = h.counts.reduce((a, b) => a + b, 0);
-  if (!total) return "–";
-  let seen = 0;
-  for (let i = 0; i < h.counts.length; i++) {
-    seen += h.counts[i];
-    if (seen >= Math.ceil(q * total)) return i < h.bounds.length ? "≤ " + h.bounds[i] + " ms" : "&gt; " + h.bounds[h.bounds.length - 1] + " ms";
-  }
-  return "–";
+/* The daemon sends ready buckets (lo, hi] and the summary; only the unit decides the format. */
+const ms = v => v >= 1000 ? (v / 1000) + " s" : v + " ms";
+const fmtOf = unit => ({ bytes: sizeLabel, ms: ms }[unit] || num);
+function histRows(h) {
+  if (!h.count) return `<tr><td>no data yet</td></tr>`;
+  const f = fmtOf(h.unit), max = Math.max(...h.buckets.map(b => b.count));
+  return h.buckets.map(b => {
+    const name = b.lo === null ? "≤ " + f(b.hi) : f(b.lo) + " – " + f(b.hi);
+    return `<tr><td>${name}</td><td class="bar"><div class="b" style="width:${(b.count / max * 100).toFixed(1)}%"></div></td>` +
+      `<td>${num(b.count)}</td><td>${(b.count / h.count * 100).toFixed(1)}%</td></tr>`;
+  }).join("") +
+    `<tr><td colspan="4">average ${h.unit === "bytes" ? bytes(h.avg) : h.unit === "ms" ? ms(Math.round(h.avg)) : num(h.avg)}` +
+    ` · p50 ≤ ${f(h.p50)} · p90 ≤ ${f(h.p90)} · p99 ≤ ${f(h.p99)}</td></tr>`;
 }
 
 function chart(id, title, data, fmt) {
@@ -188,7 +176,8 @@ function render(s, p, dt) {
     card("RAM buffers", bytes(s.dirty_bytes), `${s.dirty_zones} zones · limit ${bytes(s.dirty_limit)}`,
          s.dirty_bytes / s.dirty_limit * 100) +
     card("Uploads in parallel", `${s.uploads_in_flight}`, `max ${s.uploads_in_flight_max} · kernel requests ${s.requests_in_flight} (max ${s.requests_in_flight_max})`) +
-    card("Zones", `${s.zones.open} open`, `${s.zones.closed} closed · ${s.zones.full} full · ${s.zones.empty} empty`) +
+    card("Zones", `${s.zones.open} open`, `${s.zones.closed} closed · ${s.zones.full} full · ${s.zones.empty} empty<br>` +
+         `${s.zones.partial} partly filled · ${s.zones.fragmented} fragmented (${num(s.zones.objects)} objects, at most ${s.zones.max_objects} in a zone)`) +
     card("Problems", `<span class="${s.upload_errors + s.req_errors ? "bad" : ""}">${num(s.upload_errors + s.req_errors)}</span>`,
          `failed uploads ${num(s.upload_errors)} · I/O errors ${num(s.req_errors)} · S3 retries ${num(s.retries)}` +
          (errRate ? ` · <span class="bad">${num(errRate)}/s</span>` : ""));
@@ -199,19 +188,18 @@ function render(s, p, dt) {
   chart("ch-par", "Uploads in flight", series.par, v => num(v));
   chart("ch-dirty", "RAM buffers", series.dirty, bytes);
 
-  $("h-size").innerHTML = histRows(s.upload_size, leLabel(sizeLabel)) +
-    `<tr><td colspan="4">average ${uploads ? bytes(s.upload_size.sum / uploads) : "–"}</td></tr>`;
-  $("h-uplat").innerHTML = histRows(s.upload_latency_ms, leLabel(v => v + " ms")) +
-    `<tr><td colspan="4">p50 ${quantile(s.upload_latency_ms, .5)} · p90 ${quantile(s.upload_latency_ms, .9)} · p99 ${quantile(s.upload_latency_ms, .99)}</td></tr>`;
-  $("h-zones").innerHTML = histRows(s.zones_per_flush, rangeLabel);
-  $("h-getsize").innerHTML = histRows(s.get_size, leLabel(sizeLabel)) +
-    `<tr><td colspan="4">average ${s.gets ? bytes(s.get_size.sum / s.gets) : "–"}</td></tr>`;
-  $("h-getlat").innerHTML = histRows(s.get_latency_ms, leLabel(v => v + " ms")) +
-    `<tr><td colspan="4">p50 ${quantile(s.get_latency_ms, .5)} · p90 ${quantile(s.get_latency_ms, .9)} · p99 ${quantile(s.get_latency_ms, .99)}</td></tr>`;
+  $("h-size").innerHTML = histRows(s.upload_size);
+  $("h-uplat").innerHTML = histRows(s.upload_latency_ms);
+  $("h-zones").innerHTML = histRows(s.zones_per_flush);
+  $("h-getsize").innerHTML = histRows(s.get_size);
+  $("h-getlat").innerHTML = histRows(s.get_latency_ms);
+  $("h-cattime").innerHTML = histRows(s.compact_time_ms);
+  $("h-catsegs").innerHTML = histRows(s.segments_per_compaction);
+  for (const el of document.querySelectorAll(".segments")) el.style.display = s.append === "SEGMENTS" ? "" : "none";
 
   table("t-up", ["", "total", "/s"], [
     ["PUT (first write to a zone)", num(s.uploads_put), num(d("uploads_put"))],
-    ["PATCH (append)", num(s.uploads_patch), num(d("uploads_patch"))],
+    ["appends (PATCH, append, new segment)", num(s.uploads_patch), num(d("uploads_patch"))],
     ["reason: FLUSH", num(s.uploads_flush), num(d("uploads_flush"))],
     ["reason: FUA", num(s.uploads_fua), num(d("uploads_fua"))],
     ["reason: zone full", num(s.uploads_zone_full), num(d("uploads_zone_full"))],
@@ -227,10 +215,18 @@ function render(s, p, dt) {
     ["GET requests", num(s.gets), num(d("gets"))],
     ["from read-ahead cache", bytes(s.read_from_cache), rate(d("read_from_cache"))],
     ["read-ahead windows: hits / fetched", `${num(s.read_ahead_hits)} / ${num(s.read_ahead_misses)}`, `${num(d("read_ahead_hits"))} / ${num(d("read_ahead_misses"))}`],
-    ["concatenations (SEGMENTS) / segments merged", `${num(s.compactions)} / ${num(s.compacted_segments)}`, `${num(d("compactions"))} / ${num(d("compacted_segments"))}`],
-    ["failed concatenations", num(s.compact_errors), num(d("compact_errors"))],
     ["from RAM buffers", bytes(s.read_from_ram), rate(d("read_from_ram"))],
     ["zeros (past write pointer)", bytes(s.read_zeros), rate(d("read_zeros"))],
+  ]);
+  table("t-cat", ["", "total", "/s"], [
+    ["fragmented zones now", num(s.zones.fragmented), ""],
+    ["waiting / of them FULL", `${num(s.zones.compact_queued)} / ${num(s.zones.compact_urgent)}`, ""],
+    ["running now / max", `${num(s.compacting)} / ${num(s.compacting_max)}`, ""],
+    ["completed", num(s.compactions), num(d("compactions"))],
+    ["segments merged", num(s.compacted_segments), num(d("compacted_segments"))],
+    ["copied on the server", bytes(s.compacted_bytes), rate(d("compacted_bytes"))],
+    ["dropped (zone changed meanwhile)", num(s.compact_aborted), num(d("compact_aborted"))],
+    ["failed", num(s.compact_errors), num(d("compact_errors"))],
   ]);
   table("t-req", ["", "count", "/s", "bytes"], [
     ["READ", num(s.req_read), num(d("req_read")), bytes(s.req_read_bytes)],

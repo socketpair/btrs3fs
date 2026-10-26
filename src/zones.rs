@@ -1086,10 +1086,27 @@ impl Engine {
     /// Concatenates the segments of a zone into its first object
     /// `<zone>-00000000` and deletes the others.
     async fn compact_zone(&self, zi: usize) -> ZResult<()> {
+        let _in_flight = STATS.compacting.enter();
+        let started = Instant::now();
         let Some(job) = self.compact_begin(zi).await? else {
             return Ok(());
         };
-        self.compact_end(zi, job).await
+        let (segments, bytes) = (
+            job.parts.len() as u64,
+            job.parts.iter().map(|o| o.to - o.from).sum(),
+        );
+        if self.compact_end(zi, job).await? {
+            STATS.compactions.inc();
+            STATS.compacted_segments.add(segments);
+            STATS.compacted_bytes.add(bytes);
+            STATS.segments_per_compaction.record(segments);
+            STATS
+                .compact_time_ms
+                .record(started.elapsed().as_millis() as u64);
+        } else {
+            STATS.compact_aborted.inc();
+        }
+        Ok(())
     }
 
     /// Takes the segments under the zone's `upload` lock, then copies them
@@ -1124,8 +1141,8 @@ impl Engine {
     /// zone changed meanwhile: after a RESET (another generation) a new first
     /// segment `-00000000` may hold new data, and completing would overwrite
     /// it with old data; after another concatenation the parts are stale.
-    /// Then deletes the concatenated segments.
-    async fn compact_end(&self, zi: usize, job: CompactJob) -> ZResult<()> {
+    /// Then deletes the concatenated segments. Returns whether it completed.
+    async fn compact_end(&self, zi: usize, job: CompactJob) -> ZResult<bool> {
         let zone = &self.zones[zi];
         let end = job.parts.last().expect("at least two parts").to;
         {
@@ -1137,7 +1154,7 @@ impl Engine {
             if !unchanged {
                 self.store.abort_concat(job.pending).await;
                 debug!("zone {zi} changed during its concatenation; dropped it");
-                return Ok(());
+                return Ok(false);
             }
             self.store.finish_concat(job.pending).await?;
             let mut st = zone.state.lock().unwrap();
@@ -1158,17 +1175,16 @@ impl Engine {
             .collect();
         // Readers still holding a deleted segment plan anew on 404.
         self.store.delete_many(&merged).await?;
-        STATS.compactions.inc();
-        STATS.compacted_segments.add(job.parts.len() as u64);
         debug!("zone {zi}: {} segments concatenated", job.parts.len());
-        Ok(())
+        Ok(true)
     }
 
     pub fn dirty_limit(&self) -> u64 {
         self.dirty_limit
     }
 
-    /// Zone conditions and the number of zones with buffered data.
+    /// Zone conditions, filling, fragmentation and the concatenation queue
+    /// (SPEC.md §9.3), and the number of zones with buffered data.
     pub fn zone_summary(&self) -> (ZoneCounts, u64) {
         let mut c = ZoneCounts::default();
         let mut dirty = 0;
@@ -1180,10 +1196,22 @@ impl Engine {
                 Cond::Closed => c.closed += 1,
                 Cond::Full => c.full += 1,
             }
+            if st.data_end > 0 && st.data_end < self.zone_size {
+                c.partial += 1;
+            }
+            let objects = st.objects.len() as u64;
+            if objects > 1 {
+                c.fragmented += 1;
+            }
+            c.objects += objects;
+            c.max_objects = c.max_objects.max(objects);
             if st.buffered() > 0 {
                 dirty += 1;
             }
         }
+        let q = self.compact_queue.lock().unwrap();
+        c.compact_urgent = q.urgent.len() as u64;
+        c.compact_queued = c.compact_urgent + q.normal.len() as u64;
         (c, dirty)
     }
 

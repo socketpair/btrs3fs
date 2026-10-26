@@ -17,32 +17,72 @@ pub const BASE_PORT: u16 = 9470;
 
 const PAGE: &str = include_str!("stats.html");
 
-const KIB: u64 = 1 << 10;
-const MIB: u64 = 1 << 20;
+/// Bucket slots of a histogram: enough for every `u64` on every scale (bit
+/// length 0..=64 for powers of two; 1-2-5 steps up to 5·10^19).
+const SLOTS: usize = 65;
 
-/// Buckets of the upload and GET size histograms: ×4 steps from one block (4 KiB) to
-/// the largest zone (32 MiB, config::MAX_ZONE_SIZE) — an append is never
-/// smaller than a block nor larger than a zone.
-const SIZE_BOUNDS: &[u64] = &[
-    4 * KIB,
-    16 * KIB,
-    64 * KIB,
-    256 * KIB,
-    MIB,
-    4 * MIB,
-    16 * MIB,
-    32 * MIB, // largest zone
-];
-/// Buckets of S3 request time, ms: from in-datacenter latency (10 ms) up to
-/// the slow PATCHes measured on large appended objects (~30 s, SPEC.md §11).
-const LATENCY_BOUNDS_MS: &[u64] = &[10, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000];
+/// How a histogram cuts values into buckets (SPEC.md §9.3). The scale, not a
+/// list of bounds, decides: no upper bound is written down anywhere.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scale {
+    /// Bytes, powers of two from one block to the zone size (no request is
+    /// larger); every bucket of that range is shown.
+    Bytes,
+    /// Milliseconds, steps 1, 2, 5, 10, 20, 50, …; no upper bound.
+    #[serde(rename = "ms")]
+    Millis,
+    /// Counts: 0, then powers of two; no upper bound.
+    #[default]
+    Count,
+}
 
-/// Buckets of zones uploaded per FLUSH: 0 (nothing to do), then powers of two;
-/// up to 64 upload at once (tuning::UPLOADS_MAX), the rest queue up.
-const ZONES_BOUNDS: &[u64] = &[0, 1, 2, 4, 8, 16, 32, 64];
+impl Scale {
+    /// Upper bound of bucket `i` (the bucket holds values up to it).
+    fn bound(self, i: usize) -> u64 {
+        match self {
+            Scale::Bytes | Scale::Count => {
+                if i == 0 {
+                    0
+                } else {
+                    1u64.checked_shl(i as u32 - 1).unwrap_or(u64::MAX)
+                }
+            }
+            Scale::Millis => {
+                let step = [1u64, 2, 5][i % 3];
+                10u64
+                    .checked_pow((i / 3) as u32)
+                    .and_then(|d| d.checked_mul(step))
+                    .unwrap_or(u64::MAX)
+            }
+        }
+    }
 
-/// Room for the longest bounds list plus its open-ended last bucket.
-const MAX_BUCKETS: usize = 12;
+    /// Bucket of `value`: the first one whose bound is not below it.
+    fn bucket(self, value: u64) -> usize {
+        match self {
+            // Bit length of value - 1: 1 → 1, 2 → 2, 3..=4 → 3, …
+            Scale::Bytes | Scale::Count => {
+                if value == 0 {
+                    0
+                } else {
+                    (u64::BITS - (value - 1).leading_zeros()) as usize + 1
+                }
+            }
+            Scale::Millis => (0..SLOTS)
+                .find(|&i| value <= self.bound(i))
+                .unwrap_or(SLOTS - 1),
+        }
+    }
+}
+
+/// Largest request, for the range of `Scale::Bytes` histograms: the zone
+/// size of the disk, set once the disk is opened.
+static ZONE_SIZE: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_zone_size(bytes: u64) {
+    ZONE_SIZE.store(bytes, Relaxed);
+}
 
 pub struct Counter(AtomicU64);
 
@@ -64,42 +104,80 @@ impl Counter {
     }
 }
 
-/// Values distributed over fixed buckets: bucket i counts values `<= bounds[i]`
-/// (and above the previous bound); the last bucket counts larger values.
+/// Values counted in the buckets of a `Scale`.
 pub struct Histogram {
-    bounds: &'static [u64],
-    counts: [AtomicU64; MAX_BUCKETS],
+    scale: Scale,
+    counts: [AtomicU64; SLOTS],
     sum: AtomicU64,
 }
 
 impl Histogram {
-    const fn new(bounds: &'static [u64]) -> Self {
-        assert!(bounds.len() < MAX_BUCKETS);
+    const fn new(scale: Scale) -> Self {
         Self {
-            bounds,
-            counts: [const { AtomicU64::new(0) }; MAX_BUCKETS],
+            scale,
+            counts: [const { AtomicU64::new(0) }; SLOTS],
             sum: AtomicU64::new(0),
         }
     }
 
     pub fn record(&self, value: u64) {
-        let i = self
-            .bounds
-            .iter()
-            .position(|&b| value <= b)
-            .unwrap_or(self.bounds.len());
-        self.counts[i].fetch_add(1, Relaxed);
+        self.counts[self.scale.bucket(value)].fetch_add(1, Relaxed);
         self.sum.fetch_add(value, Relaxed);
     }
 
     fn snapshot(&self) -> Hist {
-        Hist {
-            bounds: self.bounds.to_vec(),
-            counts: self.counts[..=self.bounds.len()]
+        let counts: Vec<u64> = self.counts.iter().map(|c| c.load(Relaxed)).collect();
+        let used = || {
+            counts
                 .iter()
-                .map(|c| c.load(Relaxed))
+                .enumerate()
+                .filter(|&(_, &c)| c > 0)
+                .map(|(i, _)| i)
+        };
+        let (first, last) = match self.scale {
+            Scale::Bytes => {
+                let block = self.scale.bucket(crate::config::BLOCK_SIZE);
+                let zone = self.scale.bucket(ZONE_SIZE.load(Relaxed).max(1));
+                (
+                    used().min().map_or(block, |u| u.min(block)),
+                    used().max().map_or(zone, |u| u.max(zone)),
+                )
+            }
+            Scale::Millis | Scale::Count => match (used().min(), used().max()) {
+                (Some(a), Some(b)) => (a, b),
+                _ => (0, 0),
+            },
+        };
+        let total: u64 = counts.iter().sum();
+        let sum = self.sum.load(Relaxed);
+        // Upper bound of the bucket holding the q-th value.
+        let quantile = |q: f64| {
+            let rank = ((q * total as f64).ceil() as u64).max(1);
+            let mut seen = 0;
+            counts.iter().enumerate().find_map(|(i, &c)| {
+                seen += c;
+                (seen >= rank).then(|| self.scale.bound(i))
+            })
+        };
+        Hist {
+            unit: self.scale,
+            buckets: (first..=last)
+                .map(|i| Bucket {
+                    lo: if i == first {
+                        None
+                    } else {
+                        Some(self.scale.bound(i - 1))
+                    },
+                    hi: self.scale.bound(i),
+                    count: counts[i],
+                })
                 .collect(),
-            sum: self.sum.load(Relaxed),
+            count: total,
+            sum,
+            avg: (total > 0).then(|| sum as f64 / total as f64),
+            p50: (total > 0).then(|| quantile(0.5)).flatten(),
+            p90: (total > 0).then(|| quantile(0.9)).flatten(),
+            p99: (total > 0).then(|| quantile(0.99)).flatten(),
         }
     }
 }
@@ -176,7 +254,12 @@ pub struct Stats {
     pub read_ahead_misses: Counter,
     pub compactions: Counter,
     pub compacted_segments: Counter,
+    pub compacted_bytes: Counter,
+    pub compact_aborted: Counter,
     pub compact_errors: Counter,
+    pub compacting: InFlight,
+    pub compact_time_ms: Histogram,
+    pub segments_per_compaction: Histogram,
     pub read_from_ram: Counter,
     pub read_zeros: Counter,
     pub req_read: Counter,
@@ -195,25 +278,30 @@ pub struct Stats {
 }
 
 pub static STATS: Stats = Stats {
-    upload_size: Histogram::new(SIZE_BOUNDS),
-    upload_latency_ms: Histogram::new(LATENCY_BOUNDS_MS),
+    upload_size: Histogram::new(Scale::Bytes),
+    upload_latency_ms: Histogram::new(Scale::Millis),
     uploads_put: Counter::new(),
     uploads_patch: Counter::new(),
     upload_reason: [const { Counter::new() }; Reason::COUNT],
     uploads: InFlight::new(),
     upload_errors: Counter::new(),
     retries: Counter::new(),
-    zones_per_flush: Histogram::new(ZONES_BOUNDS),
+    zones_per_flush: Histogram::new(Scale::Count),
     gets: Counter::new(),
-    get_size: Histogram::new(SIZE_BOUNDS),
-    get_latency_ms: Histogram::new(LATENCY_BOUNDS_MS),
+    get_size: Histogram::new(Scale::Bytes),
+    get_latency_ms: Histogram::new(Scale::Millis),
     read_from_s3: Counter::new(),
     read_from_cache: Counter::new(),
     read_ahead_hits: Counter::new(),
     read_ahead_misses: Counter::new(),
     compactions: Counter::new(),
     compacted_segments: Counter::new(),
+    compacted_bytes: Counter::new(),
+    compact_aborted: Counter::new(),
     compact_errors: Counter::new(),
+    compacting: InFlight::new(),
+    compact_time_ms: Histogram::new(Scale::Millis),
+    segments_per_compaction: Histogram::new(Scale::Count),
     read_from_ram: Counter::new(),
     read_zeros: Counter::new(),
     req_read: Counter::new(),
@@ -237,11 +325,26 @@ impl Stats {
     }
 }
 
+/// One bucket: values in `(lo, hi]`; `lo` is absent for the first bucket shown.
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct Bucket {
+    pub lo: Option<u64>,
+    pub hi: u64,
+    pub count: u64,
+}
+
+/// A histogram ready to print: the page formats `lo`/`hi` by `unit` only.
 #[derive(Serialize, Clone, Debug, Default)]
 pub struct Hist {
-    pub bounds: Vec<u64>,
-    pub counts: Vec<u64>,
+    pub unit: Scale,
+    pub buckets: Vec<Bucket>,
+    pub count: u64,
     pub sum: u64,
+    pub avg: Option<f64>,
+    /// Upper bounds of the buckets holding the 50th, 90th and 99th percentile.
+    pub p50: Option<u64>,
+    pub p90: Option<u64>,
+    pub p99: Option<u64>,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -250,6 +353,17 @@ pub struct ZoneCounts {
     pub open: u64,
     pub closed: u64,
     pub full: u64,
+    /// Zones with data, but less than the zone: open, closed, or FULL after
+    /// an early FINISH.
+    pub partial: u64,
+    /// Zones served by more than one object (SEGMENTS, not concatenated yet).
+    pub fragmented: u64,
+    /// Objects of all zones, and the most in one zone.
+    pub objects: u64,
+    pub max_objects: u64,
+    /// Zones waiting for concatenation, of them FULL (urgent).
+    pub compact_queued: u64,
+    pub compact_urgent: u64,
 }
 
 /// `/stats.json`. Counters are totals since the server started; the page
@@ -258,6 +372,8 @@ pub struct ZoneCounts {
 pub struct Snapshot {
     pub disk: String,
     pub device: String,
+    /// How zone objects grow; concatenation exists only with `SEGMENTS`.
+    pub append: crate::config::AppendMode,
     pub uptime_secs: u64,
     pub dirty_bytes: u64,
     pub dirty_limit: u64,
@@ -288,7 +404,13 @@ pub struct Snapshot {
     pub read_ahead_misses: u64,
     pub compactions: u64,
     pub compacted_segments: u64,
+    pub compacted_bytes: u64,
+    pub compact_aborted: u64,
     pub compact_errors: u64,
+    pub compacting: u64,
+    pub compacting_max: u64,
+    pub compact_time_ms: Hist,
+    pub segments_per_compaction: Hist,
     pub read_from_ram: u64,
     pub read_zeros: u64,
     pub req_read: u64,
@@ -311,6 +433,7 @@ pub struct Snapshot {
 pub struct DiskState {
     pub disk: String,
     pub device: String,
+    pub append: crate::config::AppendMode,
     pub uptime_secs: u64,
     pub dirty_bytes: u64,
     pub dirty_limit: u64,
@@ -323,6 +446,7 @@ impl Stats {
         Snapshot {
             disk: d.disk,
             device: d.device,
+            append: d.append,
             uptime_secs: d.uptime_secs,
             dirty_bytes: d.dirty_bytes,
             dirty_limit: d.dirty_limit,
@@ -353,7 +477,13 @@ impl Stats {
             read_ahead_misses: self.read_ahead_misses.get(),
             compactions: self.compactions.get(),
             compacted_segments: self.compacted_segments.get(),
+            compacted_bytes: self.compacted_bytes.get(),
+            compact_aborted: self.compact_aborted.get(),
             compact_errors: self.compact_errors.get(),
+            compacting: self.compacting.current.load(Relaxed),
+            compacting_max: self.compacting.max.load(Relaxed),
+            compact_time_ms: self.compact_time_ms.snapshot(),
+            segments_per_compaction: self.segments_per_compaction.snapshot(),
             read_from_ram: self.read_from_ram.get(),
             read_zeros: self.read_zeros.get(),
             req_read: self.req_read.get(),
@@ -417,14 +547,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn histogram_buckets() {
-        static H: Histogram = Histogram::new(&[10, 100]);
-        for v in [1, 10, 11, 50, 100, 1000] {
-            H.record(v);
+    fn scales() {
+        let bounds = |sc: Scale| (0..8).map(|i| sc.bound(i)).collect::<Vec<_>>();
+        assert_eq!(bounds(Scale::Count), [0, 1, 2, 4, 8, 16, 32, 64]);
+        assert_eq!(bounds(Scale::Millis), [1, 2, 5, 10, 20, 50, 100, 200]);
+        for sc in [Scale::Bytes, Scale::Millis, Scale::Count] {
+            for v in [0, 1, 2, 3, 4, 5, 99, 4096, 4097, 1 << 40, u64::MAX] {
+                let b = sc.bucket(v);
+                assert!(v <= sc.bound(b), "{sc:?} {v}");
+                assert!(b == 0 || v > sc.bound(b - 1), "{sc:?} {v}");
+            }
         }
-        let s = H.snapshot();
-        assert_eq!(s.counts, vec![2, 3, 1]);
-        assert_eq!(s.sum, 1172);
+    }
+
+    #[test]
+    fn histogram_snapshot() {
+        static T: Histogram = Histogram::new(Scale::Millis);
+        for v in [3, 3, 3, 40, 900] {
+            T.record(v);
+        }
+        let s = T.snapshot();
+        // From the first to the last used bucket: 5, 10, 20, 50, …, 1000 ms.
+        assert_eq!(s.buckets.first().map(|b| (b.lo, b.hi)), Some((None, 5)));
+        assert_eq!(
+            s.buckets.last().map(|b| (b.lo, b.hi)),
+            Some((Some(500), 1000))
+        );
+        assert_eq!(
+            (s.count, s.sum, s.p50, s.p90, s.p99),
+            (5, 949, Some(5), Some(1000), Some(1000))
+        );
+
+        // Bytes: always from one block to the zone size, even when empty there.
+        static B: Histogram = Histogram::new(Scale::Bytes);
+        set_zone_size(16 << 20);
+        B.record(2 << 20);
+        let s = B.snapshot();
+        let his: Vec<u64> = s.buckets.iter().map(|b| b.hi).collect();
+        assert_eq!(his.first(), Some(&4096));
+        assert_eq!(his.last(), Some(&(16 << 20)));
+        assert_eq!(his.len(), 13);
+        assert_eq!(s.p50, Some(2 << 20));
+
+        let empty = Histogram::new(Scale::Count).snapshot();
+        assert_eq!((empty.count, empty.avg, empty.p50), (0, None, None));
     }
 
     #[test]

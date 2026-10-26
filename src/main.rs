@@ -395,6 +395,8 @@ fn serve_disk(
     // The statistics page starts once the device number is known.
     let started = Instant::now();
     let stats_engine = engine.clone();
+    let append = cfg.append;
+    stats::set_zone_size(cfg.zone_size);
     let on_ready: device::OnReady = Box::new(move |bdev| {
         let port = stats_opt.filter(|o| !o.no_stats).and_then(|o| {
             o.stats_port.or_else(|| {
@@ -408,6 +410,7 @@ fn serve_disk(
                 stats::STATS.snapshot(stats::DiskState {
                     disk: disk.clone(),
                     device: device.clone(),
+                    append,
                     uptime_secs: started.elapsed().as_secs(),
                     dirty_bytes: stats_engine.dirty_bytes(),
                     dirty_limit: stats_engine.dirty_limit(),
