@@ -82,11 +82,13 @@ impl Store {
         }
     }
 
-    /// Writes `body` at `offset` of an existing object; `offset` must not exceed its size.
-    pub async fn patch(&self, key: &str, offset: u64, body: Body) -> StoreResult<()> {
+    /// Grows a zone object: `offset` 0 creates it, else `body` goes at
+    /// `offset` = the object's size, the way the disk appends (SPEC.md §5).
+    pub async fn append(&self, key: &str, offset: u64, body: Body) -> StoreResult<()> {
         match self {
+            Store::Mem(m) if offset == 0 => m.put(key, body),
             Store::Mem(m) => m.patch(key, offset, body),
-            Store::S3(s) => s.patch(key, offset, body).await,
+            Store::S3(s) => s.append(key, offset, body).await,
         }
     }
 

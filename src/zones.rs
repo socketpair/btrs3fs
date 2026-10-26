@@ -493,11 +493,7 @@ impl Engine {
             // Never closed, so acquiring cannot fail.
             let _slot = self.upload_slots.acquire().await.unwrap();
             let _in_flight = STATS.uploads.enter();
-            if from == 0 {
-                self.store.put(&key, body).await
-            } else {
-                self.store.patch(&key, from, body).await
-            }
+            self.store.append(&key, from, body).await
         };
         if let Err(e) = uploaded {
             STATS.upload_errors.inc();

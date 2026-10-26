@@ -77,13 +77,17 @@ pub const DEFAULT_QUEUE_DEPTH: u16 = 128;
 /// How zone objects grow (SPEC.md §5). `create` picks it from what the bucket
 /// accepts; disks created before the field existed use PATCH.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
 pub enum AppendMode {
     /// Yandex Object Storage PATCH with `Content-Range`: one request.
     #[default]
+    #[serde(rename = "PATCH", alias = "patch")]
     Patch,
+    /// Ceph RGW Append Object, `PUT ?append&position=N`: one request.
+    #[serde(rename = "PUT_APPEND")]
+    PutAppend,
     /// Standard S3: a multipart upload copying the object on the server and
     /// adding the new bytes, completed over the old object: four requests.
+    #[serde(rename = "MULTIPART", alias = "multipart")]
     Multipart,
 }
 
@@ -304,7 +308,14 @@ mod tests {
         let mut cfg = DiskConfig::new(1 << 30, 16 << 20);
         cfg.append = AppendMode::Multipart;
         let mut json: serde_json::Value = serde_json::from_slice(&cfg.to_json()).unwrap();
-        assert_eq!(json["append"], "multipart");
+        assert_eq!(json["append"], "MULTIPART");
+        json["append"] = "multipart".into(); // written so before the names were fixed
+        assert_eq!(
+            DiskConfig::from_json(json.to_string().as_bytes())
+                .unwrap()
+                .append,
+            AppendMode::Multipart
+        );
         json.as_object_mut().unwrap().remove("append"); // disks created before the field
         let old = DiskConfig::from_json(json.to_string().as_bytes()).unwrap();
         assert_eq!(old.append, AppendMode::Patch);

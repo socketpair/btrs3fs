@@ -18,9 +18,9 @@ btrfs работает с ним в zoned-режиме. Устройство и 
   На более старом ядре btrs3fs не запускается и называет недостающие возможности ublk.
 - root для `create`, `mount`, `umount`, `run`, `detach`: зонированное ublk-устройство ядро
   разрешает только привилегированному процессу.
-- S3 с **выключенным версионированием**: Yandex Object Storage (дозапись его `PATCH`) или
-  другой S3, умеющий multipart с `UploadPartCopy` (проверен Selectel). Способ дозаписи `create`
-  выбирает сам.
+- S3 с **выключенным версионированием**: Yandex Object Storage (дозапись его `PATCH`), Ceph RGW
+  (Append Object) или другой S3, умеющий multipart с `UploadPartCopy` (проверен Selectel). Способ
+  дозаписи `create` выбирает сам.
 - `btrfs-progs`, `util-linux`, сертификаты CA; пакеты Fedora — `RUNTIME_PACKAGES` в
   `setup-permissions.sh`.
 
@@ -142,7 +142,7 @@ derived: read window and GET part 2048 KiB, btrfs readahead 64 MiB, 30 parallel 
 | `--retry-initial-delay-ms` | `retry_initial_delay_ms` | 100 | Первая пауза между повторами. |
 | `--retry-backoff-factor` | `retry_backoff_factor` | 2.0 | Рост паузы. |
 | `--queues` | `nr_queues` | 4 | Очереди (потоки) устройства. |
-| — | `append` | определяет `create` | Как дописывать в объект зоны: `patch` (Yandex, 1 запрос) или `multipart` (S3 без PATCH: 4 запроса, сервер копирует объект). |
+| — | `append` | определяет `create` | Как дописывать в объект зоны: `PATCH` (Yandex, 1 запрос), `PUT_APPEND` (Ceph RGW Append Object, 1 запрос) или `MULTIPART` (остальной S3: 4 запроса, сервер копирует объект). |
 | `--queue-depth` | `queue_depth` | 128 | Глубина очереди. |
 
 ## 7. Сохранность данных
@@ -221,8 +221,8 @@ sudo systemctl enable --now btrs3fs@main
 ## 12. Ограничения
 
 - Один хост на диск: защиты от одновременного подключения нет.
-- На S3 без PATCH каждая дозапись — 4 запроса и серверное копирование объекта (до 16 МиБ): частые
-  `fsync` там дороже, чем на Yandex.
+- В режиме `MULTIPART` каждая дозапись — 4 запроса и серверное копирование объекта (до 16 МиБ):
+  частые `fsync` там дороже, чем на Yandex.
 - Первое чтение уже выгруженных данных идёт в S3 (десятки–сотни мс на запрос); случайное
   чтение мелких блоков медленное.
 

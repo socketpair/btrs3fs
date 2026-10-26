@@ -276,29 +276,117 @@ impl S3Store {
         .await
     }
 
-    /// Writes `body` at `offset` of an existing object, `offset` = its size.
-    pub async fn patch(&self, key: &str, offset: u64, body: Body) -> StoreResult<()> {
-        match self.append {
-            AppendMode::Patch => self.patch_request(key, offset, body).await,
-            AppendMode::Multipart => self.append_multipart(key, offset, body).await,
+    /// Grows a zone object the way the disk appends (SPEC.md §5): `offset` 0
+    /// creates it, else `body` goes at `offset` = the object's size.
+    pub async fn append(&self, key: &str, offset: u64, body: Body) -> StoreResult<()> {
+        match (self.append, offset) {
+            // RGW appends only to objects an append created.
+            (AppendMode::PutAppend, _) => self.rgw_append(key, offset, body).await,
+            (_, 0) => self.put(key, body).await,
+            (AppendMode::Patch, _) => self.patch_request(key, offset, body).await,
+            (AppendMode::Multipart, _) => self.append_multipart(key, offset, body).await,
         }
     }
 
-    /// Which way of appending this bucket accepts (SPEC.md §5): PATCH on a
-    /// probe object under `dir`; HTTP 405/501 means none, so multipart.
+    /// Yandex PATCH at `offset`, whatever the disk's append mode.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn patch(&self, key: &str, offset: u64, body: Body) -> StoreResult<()> {
+        self.patch_request(key, offset, body).await
+    }
+
+    /// Which way of appending this bucket accepts (SPEC.md §5), tried on
+    /// probe objects under `dir`: PATCH; else Ceph RGW Append Object, which
+    /// must answer 200 with the right `x-rgw-next-append-position` twice (a
+    /// service that ignores `?append` overwrites the object and sends no such
+    /// header — Selectel does); else multipart.
     pub async fn detect_append(&self, dir: &str) -> StoreResult<AppendMode> {
-        let key = format!("{}/append-probe", dir.trim_end_matches('/'));
+        let dir = dir.trim_end_matches('/');
         let block = Bytes::from(vec![0u8; crate::config::BLOCK_SIZE as usize]);
-        self.put(&key, Body::new(vec![block.clone()])).await?;
-        let patched = self
-            .patch_request(&key, block.len() as u64, Body::new(vec![block]))
-            .await;
+        let len = block.len() as u64;
+        let one = || Body::new(vec![block.clone()]);
+
+        let key = format!("{dir}/append-probe");
+        self.put(&key, one()).await?;
+        let patched = self.patch_request(&key, len, one()).await;
         self.delete(&key).await?;
         match patched {
-            Ok(()) => Ok(AppendMode::Patch),
-            Err(StoreError::Unsupported(_)) => Ok(AppendMode::Multipart),
+            Ok(()) => return Ok(AppendMode::Patch),
+            Err(StoreError::Unsupported(_)) => {}
+            Err(e) => return Err(e),
+        }
+
+        let key = format!("{dir}/append-probe-rgw");
+        let appended = async {
+            Ok::<_, StoreError>(
+                self.rgw_append_once(&key, 0, one()).await? == Some(len)
+                    && self.rgw_append_once(&key, len, one()).await? == Some(2 * len),
+            )
+        }
+        .await;
+        self.delete(&key).await?;
+        match appended {
+            Ok(true) => Ok(AppendMode::PutAppend),
+            Ok(false) => Ok(AppendMode::Multipart),
+            Err(e) => {
+                debug!("no Append Object: {e}");
+                Ok(AppendMode::Multipart)
+            }
+        }
+    }
+
+    /// Ceph RGW Append Object at `position`, which must be the object's size.
+    /// The answer must carry `x-rgw-next-append-position` = position + length;
+    /// anything else is an error, not a silent overwrite. A repeat after a lost
+    /// answer gets 409 (the position is no longer the size): the earlier try
+    /// landed if the object is exactly position + length long.
+    async fn rgw_append(&self, key: &str, position: u64, body: Body) -> StoreResult<()> {
+        let want = position + body.len();
+        match self.rgw_append_once(key, position, body).await {
+            Ok(Some(next)) if next == want => Ok(()),
+            Ok(next) => Err(anyhow!(
+                "{key}: append at {position} answered next position {next:?}, expected {want}"
+            )
+            .into()),
+            Err(StoreError::InvalidRange { .. }) if self.head_size(key).await? == want => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// One `PUT ?append&position=N` (with retries): `x-rgw-next-append-position`.
+    async fn rgw_append_once(
+        &self,
+        key: &str,
+        position: u64,
+        body: Body,
+    ) -> StoreResult<Option<u64>> {
+        let url = format!("{}?append&position={position}", self.object_url(key));
+        self.with_retries(&format!("APPEND {key} at {position}"), || async {
+            let resp = self
+                .send(reqwest::Method::PUT, &url, &[], Some(&body))
+                .await?;
+            let resp = check(resp, key).await?;
+            Ok(resp
+                .headers()
+                .get("x-rgw-next-append-position")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok()))
+        })
+        .await
+    }
+
+    /// HEAD: size of an existing object.
+    async fn head_size(&self, key: &str) -> StoreResult<u64> {
+        let url = self.object_url(key);
+        self.with_retries(&format!("HEAD {key}"), || async {
+            let resp = self.send(reqwest::Method::HEAD, &url, &[], None).await?;
+            let resp = check(resp, key).await?;
+            resp.headers()
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| Attempt::Fatal(anyhow!("{key}: HEAD without size").into()))
+        })
+        .await
     }
 
     /// Yandex PATCH: `Content-Range: bytes a-b/*`.
@@ -632,10 +720,13 @@ async fn check(resp: reqwest::Response, key: &str) -> Result<reqwest::Response, 
     let detail = format!("HTTP {status}: {}", s3_error_summary(&body));
     Err(match status {
         StatusCode::NOT_FOUND => Attempt::Fatal(StoreError::NotFound(key.to_string())),
-        StatusCode::RANGE_NOT_SATISFIABLE => Attempt::Fatal(StoreError::InvalidRange {
-            key: key.to_string(),
-            detail,
-        }),
+        // 409: Ceph RGW append at a position that is not the object's size.
+        StatusCode::RANGE_NOT_SATISFIABLE | StatusCode::CONFLICT => {
+            Attempt::Fatal(StoreError::InvalidRange {
+                key: key.to_string(),
+                detail,
+            })
+        }
         StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED => {
             Attempt::Fatal(StoreError::Unsupported(format!("{key}: {detail}")))
         }
@@ -953,6 +1044,19 @@ mod bucket_tests {
             .collect();
         assert_eq!(left, vec![keys[1].clone()]);
         cleanup(&s3, &format!("{prefix}/")).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn detect_append_mode() {
+        let s3 = store();
+        let prefix = unique_prefix("detect");
+        let mode = s3.detect_append(&prefix).await.unwrap();
+        eprintln!("append mode of this bucket: {mode:?}");
+        if let Ok(want) = std::env::var("BTRS3FS_EXPECT_APPEND") {
+            assert_eq!(format!("{mode:?}"), want);
+        }
+        assert!(s3.list(&format!("{prefix}/")).await.unwrap().is_empty()); // probes removed
     }
 
     #[tokio::test]
