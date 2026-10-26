@@ -9,7 +9,7 @@
   :root {
     --bg: #f2f4f6; --surface: #ffffff; --ink: #1b2430; --muted: #64707d; --rule: #dde2e7;
     --flow: #2563c9; --ok: #1e8e5a; --warn: #b7791f; --bad: #c53030;
-    --z-empty: #e6e9ed; --z-open: #3b82c4; --z-closed: #d9a13b; --z-full: #5b6b7c;
+    --z-empty: #e6e9ed; --z-open: #3b82c4; --z-closed: #d9a13b; --z-full: #5b6b7c; --z-full-faint: #b9c1ca;
     --warn-bg: #fbf3e4; --bad-bg: #fbeaea;
     color-scheme: light;
   }
@@ -17,7 +17,7 @@
     :root {
       --bg: #15191e; --surface: #1d232a; --ink: #e6eaef; --muted: #94a0ad; --rule: #2c343d;
       --flow: #6fa3f2; --ok: #3fb984; --warn: #e0a43c; --bad: #f06262;
-      --z-empty: #262d35; --z-open: #4f97d8; --z-closed: #d8a64a; --z-full: #7d8d9e;
+      --z-empty: #262d35; --z-open: #4f97d8; --z-closed: #d8a64a; --z-full: #7d8d9e; --z-full-faint: #444f5b;
       --warn-bg: #2e2717; --bad-bg: #33191b;
       color-scheme: dark;
     }
@@ -375,6 +375,8 @@ function legend(z, map) {
   return item("", "background:var(--z-open)", `${num(z.open)} open`) +
     item("", "background:var(--z-closed)", `${num(z.closed)} closed`) +
     item("", "background:var(--z-full)", `${num(z.full)} full`) +
+    (map && z.finished_early ? item("", "background:linear-gradient(var(--z-full-faint) 50%, var(--z-full) 50%)",
+      `${num(z.finished_early)} of them finished early (the rest unusable)`) : "") +
     item("", "background:var(--z-empty)", `${num(z.empty)} empty`) +
     (map ? item("ram", "", "data in RAM") +
       item("frag", "", `fragmented: ${num(z.fragmented)}, at most ${num(z.max_objects)} S3 objects in one`) : "");
@@ -408,7 +410,8 @@ function drawZones() {
   c.height = Math.floor(rows * (cell + gap) * dpr);
   const g = c.getContext("2d");
   g.scale(dpr, dpr);
-  const col = { e: cssVar("--z-empty"), o: cssVar("--z-open"), c: cssVar("--z-closed"), f: cssVar("--z-full") };
+  const col = { e: cssVar("--z-empty"), o: cssVar("--z-open"), c: cssVar("--z-closed"), f: cssVar("--z-full"),
+                faint: cssVar("--z-full-faint") };
   const ram = cssVar("--bad"), dot = cssVar("--surface");
   const zoneBlocks = zmap.zone_size / zmap.block_size;
   for (let i = 0; i < n; i++) {
@@ -417,8 +420,13 @@ function drawZones() {
     g.globalAlpha = zkind && zmap.kind[i] !== zkind && k !== "e" ? 0.35 : 1;
     g.fillStyle = col.e;
     g.fillRect(x, y, cell, cell);
-    // Open and closed zones fill from the bottom by how much they hold.
-    const h = k === "f" ? cell : k === "e" ? 0 : Math.max(1, Math.round(zmap.used[i] / zoneBlocks * cell));
+    // Zones fill from the bottom by how much they hold. A zone FINISHed early is
+    // full too, but its unwritten rest is faint: it can never be written.
+    const h = k === "e" ? 0 : Math.max(k === "f" ? 0 : 1, Math.round(zmap.used[i] / zoneBlocks * cell));
+    if (k === "f" && h < cell) {
+      g.fillStyle = col.faint;
+      g.fillRect(x, y, cell, cell - h);
+    }
     g.fillStyle = col[k];
     g.fillRect(x, y + cell - h, cell, h);
     if (zmap.buffered[i] > 0) {
@@ -441,7 +449,8 @@ $("zmap").addEventListener("mousemove", ev => {
   const i = Math.floor(cy / step) * zgeom.cols + colNo;
   if (cx < 0 || colNo >= zgeom.cols || i < 0 || i >= zgeom.n) { tip.style.display = "none"; return; }
   const b = zmap.block_size;
-  tip.innerHTML = `zone ${num(i)} at ${bytes(i * zmap.zone_size)} · ${ZONE[zmap.cond[i]][0]}` +
+  const early = zmap.cond[i] === "f" && zmap.used[i] * zmap.block_size < zmap.zone_size;
+  tip.innerHTML = `zone ${num(i)} at ${bytes(i * zmap.zone_size)} · ${early ? "full: finished early" : ZONE[zmap.cond[i]][0]}` +
     (zmap.cond[i] === "e" ? "" : ` · ${KIND[zmap.kind[i]]}`) + `<br>` +
     `${bytes(zmap.used[i] * b)} of ${bytes(zmap.zone_size)} written · ${num(zmap.objects[i])} S3 object${zmap.objects[i] === 1 ? "" : "s"}` +
     (zmap.buffered[i] ? ` · ${bytes(zmap.buffered[i] * b)} in RAM` : "");

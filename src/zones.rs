@@ -1538,6 +1538,9 @@ impl Engine {
             if st.data_end > 0 && st.data_end < self.zone_size {
                 c.partial += 1;
             }
+            if st.cond == Cond::Full && st.data_end < self.zone_size {
+                c.finished_early += 1;
+            }
             if st.data_end > 0 {
                 match st.kind {
                     Kind::Data => c.data_zones += 1,
