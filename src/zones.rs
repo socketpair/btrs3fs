@@ -1387,6 +1387,118 @@ mod tests {
         assert_eq!(got, [blk(1, 1), blk(2, 1), blk(3, 1)].concat());
     }
 
+    // Crash points (SPEC.md §5): the daemon dies at a given step, a new
+    // engine restores the zone from what the store holds.
+
+    #[tokio::test]
+    async fn crash_after_segment_upload_before_state() {
+        let store = mem();
+        let e = segments_engine(store.clone()).await;
+        segment_writes(&e, 0, 1, 2).await;
+        // The third upload reached the store, then the daemon died before
+        // recording it (and before acknowledging the FLUSH).
+        store
+            .put("t/0000000000000000-00002000", Body::new(vec![blk(3, 1)]))
+            .await
+            .unwrap();
+        drop(e);
+        let e = segments_engine(store).await;
+        assert_eq!(e.report(0, 1)[0].wp, 3 * B);
+        assert_eq!(
+            read(&e, 0, 3 * B).await,
+            [blk(1, 1), blk(2, 1), blk(3, 1)].concat()
+        );
+    }
+
+    #[tokio::test]
+    async fn crash_during_concatenation_before_complete() {
+        let store = mem();
+        let e = segments_engine(store.clone()).await;
+        segment_writes(&e, 0, 1, 3).await;
+        let job = e.compact_begin(0).await.unwrap().unwrap();
+        drop(job); // parts copied, never completed
+        drop(e);
+        let e = segments_engine(store.clone()).await;
+        assert_eq!(keys(&store, "t/").await.len(), 3); // segments untouched
+        assert_eq!(
+            read(&e, 0, 3 * B).await,
+            [blk(1, 1), blk(2, 1), blk(3, 1)].concat()
+        );
+        e.compact_zone(0).await.unwrap(); // and concatenate fine later
+        assert_eq!(keys(&store, "t/").await, ["t/0000000000000000-00000000"]);
+    }
+
+    #[tokio::test]
+    async fn crash_after_complete_before_deleting_segments() {
+        let store = mem();
+        let e = segments_engine(store.clone()).await;
+        segment_writes(&e, 0, 1, 3).await;
+        let job = e.compact_begin(0).await.unwrap().unwrap();
+        store.finish_concat(job.pending).await.unwrap(); // the base is replaced
+        drop(e); // died before updating the map and deleting the segments
+        let e = segments_engine(store.clone()).await;
+        assert_eq!(keys(&store, "t/").await, ["t/0000000000000000-00000000"]);
+        assert_eq!(e.report(0, 1)[0].wp, 3 * B);
+        assert_eq!(
+            read(&e, 0, 3 * B).await,
+            [blk(1, 1), blk(2, 1), blk(3, 1)].concat()
+        );
+    }
+
+    #[tokio::test]
+    async fn crash_during_reset_partial_delete() {
+        let store = mem();
+        let e = segments_engine(store.clone()).await;
+        segment_writes(&e, 0, 1, 4).await;
+        segment_writes(&e, 1, 1, 4).await;
+        drop(e);
+        // DeleteObjects of the RESET removed only some keys before the crash.
+        store.delete("t/0000000000000000-00000000").await.unwrap(); // the start
+        store.delete("t/0000000000100000-00002000").await.unwrap(); // the middle
+        let e = segments_engine(store.clone()).await;
+        assert_eq!(e.report(0, 1)[0].cond, Cond::Empty); // nothing reachable
+        assert_eq!(e.report(1, 1)[0].wp, ZS + 2 * B); // the prefix before the gap
+        assert_eq!(read(&e, ZS, 2 * B).await, [blk(1, 1), blk(2, 1)].concat());
+        assert_eq!(
+            keys(&store, "t/").await,
+            ["t/0000000000100000-00000000", "t/0000000000100000-00001000"]
+        );
+        // The zones work on: new data at the restored pointers.
+        segment_writes(&e, 0, 7, 1).await;
+        assert_eq!(read(&e, 0, B).await, blk(7, 1).to_vec());
+    }
+
+    #[tokio::test]
+    async fn crash_during_finish() {
+        let store = mem();
+        let e = segments_engine(store.clone()).await;
+        segment_writes(&e, 0, 1, 2).await; // FINISH flushed, died before the marker
+        e.write(ZS, blk(5, 1), false).unwrap();
+        e.finish_zone(ZS).await.unwrap(); // zone 1: fully finished
+        drop(e);
+        let e = segments_engine(store).await;
+        let r = e.report(0, 2);
+        assert_eq!((r[0].cond, r[0].wp), (Cond::Closed, 2 * B)); // FINISH lost: closed
+        assert_eq!((r[1].cond, r[1].wp), (Cond::Full, 2 * ZS)); // marker made it
+    }
+
+    #[tokio::test]
+    async fn store_failure_during_concatenation() {
+        let store = mem();
+        let e = segments_engine(store.clone()).await;
+        segment_writes(&e, 0, 1, 3).await;
+        mem_store(&store).set_fail(true);
+        assert!(e.compact_zone(0).await.is_err());
+        mem_store(&store).set_fail(false);
+        assert_eq!(keys(&store, "t/").await.len(), 3);
+        assert_eq!(
+            read(&e, 0, 3 * B).await,
+            [blk(1, 1), blk(2, 1), blk(3, 1)].concat()
+        );
+        e.compact_zone(0).await.unwrap();
+        assert_eq!(keys(&store, "t/").await, ["t/0000000000000000-00000000"]);
+    }
+
     #[tokio::test]
     async fn write_flush_read() {
         let store = mem();

@@ -75,6 +75,7 @@ impl Store {
     /// Whole object, `None` if it does not exist.
     #[cfg(test)]
     pub async fn get(&self, key: &str) -> StoreResult<Option<Bytes>> {
+        self.interleave().await;
         let res = match self {
             Store::Mem(m) => m.get(key),
             Store::S3(s) => s.get(key).await,
@@ -86,8 +87,19 @@ impl Store {
         }
     }
 
+    /// In tests every in-memory operation first yields to the scheduler, so
+    /// concurrent tasks interleave at each store call as they do over a
+    /// network; a no-op otherwise.
+    async fn interleave(&self) {
+        #[cfg(test)]
+        if matches!(self, Store::Mem(_)) {
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Creates or replaces an object.
     pub async fn put(&self, key: &str, body: Body) -> StoreResult<()> {
+        self.interleave().await;
         match self {
             Store::Mem(m) => m.put(key, body),
             Store::S3(s) => s.put(key, body).await,
@@ -97,6 +109,7 @@ impl Store {
     /// Grows a zone object: `offset` 0 creates it, else `body` goes at
     /// `offset` = the object's size, the way the disk appends (SPEC.md §5).
     pub async fn append(&self, key: &str, offset: u64, body: Body) -> StoreResult<()> {
+        self.interleave().await;
         match self {
             Store::Mem(m) if offset == 0 => m.put(key, body),
             Store::Mem(m) => m.patch(key, offset, body),
@@ -106,6 +119,7 @@ impl Store {
 
     /// Exactly `len` bytes starting at `offset`.
     pub async fn get_range(&self, key: &str, offset: u64, len: u64) -> StoreResult<Bytes> {
+        self.interleave().await;
         match self {
             Store::Mem(m) => m.get_range(key, offset, len),
             Store::S3(s) => s.get_range(key, offset, len).await,
@@ -114,6 +128,7 @@ impl Store {
 
     /// Deletes an object; deleting a missing object is not an error.
     pub async fn delete(&self, key: &str) -> StoreResult<()> {
+        self.interleave().await;
         match self {
             Store::Mem(m) => m.delete(key),
             Store::S3(s) => s.delete(key).await,
@@ -122,6 +137,7 @@ impl Store {
 
     /// Deletes many objects with few requests; missing objects are not an error.
     pub async fn delete_many(&self, keys: &[String]) -> StoreResult<()> {
+        self.interleave().await;
         match self {
             Store::Mem(m) => keys.iter().try_for_each(|k| m.delete(k)),
             Store::S3(s) => s.delete_many(keys).await,
@@ -130,6 +146,7 @@ impl Store {
 
     /// All objects whose key starts with `prefix`.
     pub async fn list(&self, prefix: &str) -> StoreResult<Vec<ObjectInfo>> {
+        self.interleave().await;
         match self {
             Store::Mem(m) => m.list(prefix),
             Store::S3(s) => s.list(prefix).await,
@@ -143,6 +160,7 @@ impl Store {
         dst: &str,
         parts: &[ConcatPart],
     ) -> StoreResult<PendingConcat> {
+        self.interleave().await;
         match self {
             Store::Mem(m) => {
                 let mut data = Vec::new();
@@ -159,6 +177,7 @@ impl Store {
     }
 
     pub async fn finish_concat(&self, pending: PendingConcat) -> StoreResult<()> {
+        self.interleave().await;
         match (self, pending) {
             (Store::Mem(m), PendingConcat::Mem { dst, data }) => {
                 m.put(&dst, Body::new(vec![Bytes::from(data)]))
@@ -177,6 +196,7 @@ impl Store {
 
     /// Aborts concatenations under `prefix` a crash left unfinished; how many.
     pub async fn abort_stale_concats(&self, prefix: &str) -> StoreResult<usize> {
+        self.interleave().await;
         match self {
             Store::Mem(_) => Ok(0),
             Store::S3(s) => s.abort_stale_concats(prefix).await,
