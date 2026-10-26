@@ -30,24 +30,26 @@
   button { font: inherit; }
   :focus-visible { outline: 2px solid var(--flow); outline-offset: 2px; }
 
-  header { background: var(--surface); border-bottom: 1px solid var(--rule); }
-  .bar { max-width: 1200px; margin: 0 auto; padding: 14px 20px 0; }
-  .ident { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; }
-  .ident h1 { font-size: 20px; font-weight: 650; margin: 0; }
-  .ident .meta { color: var(--muted); }
-  #live { margin-left: auto; color: var(--muted); }
+  /* Sections in a left panel, the way section pickers usually are. */
+  .app { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: 100vh; }
+  aside { background: var(--surface); border-right: 1px solid var(--rule); padding: 18px 12px; }
+  aside .ident { padding: 0 8px 14px; border-bottom: 1px solid var(--rule); margin-bottom: 10px; }
+  aside h1 { font-size: 18px; font-weight: 650; margin: 0; overflow-wrap: anywhere; }
+  aside .meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  #live { display: block; color: var(--muted); font-size: 13px; margin-top: 8px; }
   #live::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%;
                   background: var(--muted); margin-right: 6px; vertical-align: 1px; }
   #live.on::before { background: var(--ok); }
   #live.off { color: var(--bad); }
   #live.off::before { background: var(--bad); }
-  nav { display: flex; gap: 2px; margin-top: 10px; overflow-x: auto; }
-  nav button { background: none; border: 0; border-bottom: 2px solid transparent; color: var(--muted);
-               padding: 8px 14px; cursor: pointer; white-space: nowrap; }
-  nav button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--flow); font-weight: 600; }
-  #feedback { color: var(--muted); font-size: 13px; min-height: 1.4em; padding: 4px 0 8px; }
+  nav { display: flex; flex-direction: column; gap: 2px; }
+  nav button { background: none; border: 0; border-left: 3px solid transparent; color: var(--muted); text-align: left;
+               padding: 8px 10px; border-radius: 0 4px 4px 0; cursor: pointer; white-space: nowrap; }
+  nav button:hover { background: var(--bg); color: var(--ink); }
+  nav button[aria-selected="true"] { color: var(--ink); background: var(--bg); border-left-color: var(--flow); font-weight: 600; }
+  #feedback { color: var(--muted); font-size: 13px; min-height: 1.4em; margin-bottom: 8px; }
 
-  main { max-width: 1200px; margin: 0 auto; padding: 18px 20px 40px; }
+  main { max-width: 1200px; width: 100%; padding: 18px 24px 40px; }
   h2 { font-size: 16px; font-weight: 650; margin: 28px 0 10px; }
   .note { color: var(--muted); font-size: 13px; }
   .panel { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 14px 16px; }
@@ -79,6 +81,7 @@
   .link polygon { fill: var(--rule); }
   .link.moving line { stroke: var(--flow); stroke-dasharray: 8 6; animation: flow .9s linear infinite; }
   .link.moving polygon { fill: var(--flow); }
+  .link.moving.left line { animation-direction: reverse; }
   @keyframes flow { to { stroke-dashoffset: -14; } }
   @media (prefers-reduced-motion: reduce) { .link.moving line { animation: none; } }
   .gauge { position: relative; height: 12px; background: var(--z-empty); border-radius: 3px; margin: 8px 0 4px; overflow: hidden; }
@@ -139,31 +142,35 @@
   .sum { color: var(--muted); font-size: 12px; margin-top: 6px; }
 
   @media (max-width: 860px) {
+    .app { grid-template-columns: 1fr; }
+    aside { border-right: 0; border-bottom: 1px solid var(--rule); padding: 12px 12px 0; }
+    aside .ident { border-bottom: 0; margin-bottom: 4px; padding-bottom: 6px; }
+    nav { flex-direction: row; overflow-x: auto; }
+    nav button { border-left: 0; border-bottom: 3px solid transparent; border-radius: 4px 4px 0 0; }
+    nav button[aria-selected="true"] { border-bottom-color: var(--flow); }
     .pipe { grid-template-columns: 1fr; }
     .link { flex-direction: row; gap: 10px; padding: 6px 4px; justify-content: flex-start; }
     .link svg { width: 26px; height: 14px; transform: rotate(90deg); }
-    #live { margin-left: 0; }
   }
 </style>
 </head>
 <body>
-<header>
-  <div class="bar">
-    <div class="ident">
-      <h1 id="disk">btrs3fs</h1>
-      <span class="meta" id="meta">connecting to the device server…</span>
-      <span id="live">waiting</span>
-    </div>
-    <nav role="tablist">
-      <button role="tab" aria-selected="true" data-tab="overview">Overview</button>
-      <button role="tab" aria-selected="false" data-tab="zones">Zones</button>
-      <button role="tab" aria-selected="false" data-tab="btrfs">btrfs</button>
-      <button role="tab" aria-selected="false" data-tab="details">Details</button>
-    </nav>
-    <div id="feedback" role="status"></div>
+<div class="app">
+<aside>
+  <div class="ident">
+    <h1 id="disk">btrs3fs</h1>
+    <div class="meta" id="meta">connecting to the device server…</div>
+    <span id="live">waiting</span>
   </div>
-</header>
+  <nav role="tablist" aria-orientation="vertical">
+    <button role="tab" aria-selected="true" data-tab="overview">Overview</button>
+    <button role="tab" aria-selected="false" data-tab="zones">Zones</button>
+    <button role="tab" aria-selected="false" data-tab="btrfs">btrfs</button>
+    <button role="tab" aria-selected="false" data-tab="details">Details</button>
+  </nav>
+</aside>
 <main>
+<div id="feedback" role="status"></div>
 <section id="tab-overview">
   <div class="alerts" id="alerts"></div>
   <h2>Writes</h2>
@@ -225,6 +232,7 @@
     Raw data: <a href="stats.json">stats.json</a>, <a href="zones.json">zones.json</a>, <a href="btrfs.json">btrfs.json</a>.</p>
 </section>
 </main>
+</div>
 <script>
 "use strict";
 const HISTORY = 300;  // chart length in samples: 5 minutes at one sample per second
@@ -272,9 +280,13 @@ for (const b of document.querySelectorAll("nav button")) b.onclick = () => showT
 if (["zones", "btrfs", "details"].includes(location.hash.slice(1))) showTab(location.hash.slice(1));
 
 /* ---------- overview ---------- */
-function link(count, what, moving) {
-  return `<div class="link ${moving ? "moving" : ""}"><span class="rate">${count}</span>` +
-    `<svg viewBox="0 0 100 14" preserveAspectRatio="none" aria-hidden="true"><line x1="0" y1="7" x2="92" y2="7"/><polygon points="92,1 100,7 92,13"/></svg>` +
+/* An arrow between stages; `left` points from right to left (reads come back from S3). */
+function link(count, what, moving, left = false) {
+  const arrow = left
+    ? `<line x1="8" y1="7" x2="100" y2="7"/><polygon points="8,1 0,7 8,13"/>`
+    : `<line x1="0" y1="7" x2="92" y2="7"/><polygon points="92,1 100,7 92,13"/>`;
+  return `<div class="link ${moving ? "moving" : ""} ${left ? "left" : ""}"><span class="rate">${count}</span>` +
+    `<svg viewBox="0 0 100 14" preserveAspectRatio="none" aria-hidden="true">${arrow}</svg>` +
     `<span class="what">${what}</span></div>`;
 }
 const stage = (name, big, sub, extra = "", hot = false) =>
@@ -304,15 +316,15 @@ function renderOverview(s) {
           (s.upload_errors ? ` · <span class="bad">${num(s.upload_errors)} failed</span>` : "") +
           (s.retries ? ` · ${num(s.retries)} retries` : ""));
 
-  // Reads: S3 → cache and RAM → kernel.
+  // Reads, mirrored under the writes: kernel ← cache and RAM ← S3, so both S3 stages line up on the right.
   const hits = s.read_ahead_hits, miss = s.read_ahead_misses;
   const hitRate = hits + miss ? `${(hits / (hits + miss) * 100).toFixed(0)}% of small reads hit the cache` : "no small reads yet";
   $("pipe-r").innerHTML =
-    stage("S3", rate(r.rd), `median GET time ${s.get_latency_ms.p50 ? "≤ " + ms(s.get_latency_ms.p50) : "–"}`) +
-    link(`${num(r.gets)} GET/s`, "from S3", r.rd > 0) +
+    stage("Kernel reads", rate(r.kr), "out of the daemon") +
+    link(`${num(r.krReq)} req/s`, "to the kernel", r.kr > 0, true) +
     stage("Read cache and RAM", rate(r.cache + r.ram), `${hitRate} · ${rate(r.ram)} of not yet stored data`) +
-    link(`${num(r.krReq)} req/s`, "to the kernel", r.kr > 0) +
-    stage("Kernel reads", rate(r.kr), "out of the daemon");
+    link(`${num(r.gets)} GET/s`, "from S3", r.rd > 0, true) +
+    stage("S3", rate(r.rd), `median GET time ${s.get_latency_ms.p50 ? "≤ " + ms(s.get_latency_ms.p50) : "–"}`);
 
   $("charts").innerHTML =
     chart("Upload to S3", series.up, rate) +
