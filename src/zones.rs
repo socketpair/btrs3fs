@@ -1499,6 +1499,202 @@ mod tests {
         assert_eq!(keys(&store, "t/").await, ["t/0000000000000000-00000000"]);
     }
 
+    /// What the stress test did, to check that it exercised every path.
+    static STRESS_OPS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    const OP_FLUSH: usize = 0;
+    const OP_READ: usize = 1;
+    const OP_FINISH: usize = 2;
+    const OP_RESET: usize = 3;
+
+    /// Deterministic generator for the stress test (xorshift64*).
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n
+        }
+    }
+
+    /// What a zone task knows of its zone: bytes written, how many of them a
+    /// FLUSH or FINISH acknowledged, whether it is finished, whether a RESET
+    /// was started and not acknowledged.
+    #[derive(Clone, Default)]
+    struct Model {
+        written: Vec<u8>,
+        acked: usize,
+        finished: bool,
+        resetting: bool,
+    }
+
+    /// Random writes, flushes, reads, FINISH and RESET on one zone, checking
+    /// every read against the model. Store errors (injected) are allowed:
+    /// they only leave an operation unacknowledged.
+    async fn zone_task(e: Arc<Engine>, zi: usize, model: Arc<Mutex<Model>>, seed: u64) {
+        let mut rng = Rng(seed | 1);
+        let zstart = zi as u64 * ZS;
+        loop {
+            let op = rng.below(100);
+            let (len, finished) = {
+                let m = model.lock().unwrap();
+                (m.written.len() as u64, m.finished)
+            };
+            if op < 50 && !finished && len < ZS {
+                let n = (1 + rng.below(4)).min((ZS - len) / B);
+                let data = blk(rng.below(256) as u8, n);
+                e.write(zstart + len, data.clone(), false).unwrap();
+                model.lock().unwrap().written.extend_from_slice(&data);
+            } else if op < 75 {
+                if e.flush_zone(zi, Reason::Explicit).await.is_ok() {
+                    STRESS_OPS[OP_FLUSH].fetch_add(1, Ordering::Relaxed);
+                    let mut m = model.lock().unwrap();
+                    m.acked = m.acked.max(len as usize);
+                }
+            } else if op < 90 && len > 0 {
+                let off = rng.below(len / B) * B;
+                let n = (1 + rng.below((len - off) / B)) * B;
+                let want = model.lock().unwrap().written[off as usize..(off + n) as usize].to_vec();
+                let pieces = e.read_plan(zstart + off, n).unwrap();
+                if let Ok(got) = e.fetch(pieces).await {
+                    STRESS_OPS[OP_READ].fetch_add(1, Ordering::Relaxed);
+                    assert_eq!(got.concat(), want, "zone {zi} read at {off}+{n}");
+                }
+            } else if op < 94 && !finished {
+                if e.finish_zone(zstart).await.is_ok() {
+                    STRESS_OPS[OP_FINISH].fetch_add(1, Ordering::Relaxed);
+                    let mut m = model.lock().unwrap();
+                    m.acked = len as usize;
+                    m.finished = true;
+                }
+            } else if op >= 94 || finished || len == ZS {
+                model.lock().unwrap().resetting = true;
+                if e.reset_zone(zstart).await.is_ok() {
+                    STRESS_OPS[OP_RESET].fetch_add(1, Ordering::Relaxed);
+                    *model.lock().unwrap() = Model::default();
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// After a restart: every acknowledged byte is there (unless a RESET was
+    /// under way), nothing beyond what was written, and the zone is a prefix
+    /// of what was written. Returns the model of the restored zone.
+    async fn check_restored(e: &Engine, zi: usize, m: &Model) -> Model {
+        let (len, cond) = {
+            let st = e.zones[zi].state.lock().unwrap();
+            (st.data_end as usize, st.cond)
+        };
+        assert!(
+            len >= m.acked || m.resetting,
+            "zone {zi}: {len} bytes restored, {} acknowledged",
+            m.acked
+        );
+        assert!(
+            len <= m.written.len(),
+            "zone {zi}: {len} restored, {} written",
+            m.written.len()
+        );
+        let got = read(e, zi as u64 * ZS, len as u64).await;
+        assert_eq!(got, m.written[..len], "zone {zi}: restored data");
+        Model {
+            written: got,
+            acked: len,
+            finished: cond == Cond::Full,
+            resetting: false,
+        }
+    }
+
+    /// Zones written, flushed, read, finished and reset concurrently with the
+    /// compactor and injected store failures, then the "daemon" dies at a
+    /// random moment (every task aborted mid-operation) and a new engine
+    /// restores the disk from the store, round after round.
+    async fn stress(append: AppendMode) {
+        const ZONES: usize = 6;
+        const ROUNDS: u64 = 150;
+        let store = mem();
+        let mut cfg = DiskConfig::new(8 * ZS, ZS);
+        cfg.dirty_limit_bytes = 64 * B;
+        cfg.append = append;
+        let mut models = vec![Model::default(); ZONES];
+        let mut rng = Rng(0x5eed);
+        for round in 0..ROUNDS {
+            mem_store(&store).set_fail(false);
+            let e = Arc::new(
+                Engine::open(&cfg, Layout::new("t").unwrap(), store.clone())
+                    .await
+                    .unwrap(),
+            );
+            for (zi, m) in models.iter_mut().enumerate() {
+                *m = check_restored(&e, zi, m).await;
+            }
+            let shared: Vec<_> = models
+                .iter()
+                .map(|m| Arc::new(Mutex::new(m.clone())))
+                .collect();
+            let mut tasks: Vec<tokio::task::JoinHandle<()>> = (0..ZONES)
+                .map(|zi| {
+                    let seed = round * 1000 + zi as u64;
+                    tokio::spawn(zone_task(e.clone(), zi, shared[zi].clone(), seed))
+                })
+                .collect();
+            tasks.push(tokio::spawn(e.clone().compactor()));
+            tasks.push(tokio::spawn(e.clone().background_flusher()));
+            let chaos_store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(3)).await;
+                    mem_store(&chaos_store).set_fail(true);
+                    tokio::time::sleep(Duration::from_micros(300)).await;
+                    mem_store(&chaos_store).set_fail(false);
+                }
+            }));
+            tokio::time::sleep(Duration::from_millis(5 + rng.below(25))).await;
+            for t in &tasks {
+                t.abort(); // the daemon dies here
+            }
+            for t in tasks {
+                if let Err(err) = t.await
+                    && err.is_panic()
+                {
+                    std::panic::resume_unwind(err.into_panic());
+                }
+            }
+            models = shared.iter().map(|m| m.lock().unwrap().clone()).collect();
+            drop(e);
+        }
+        let ops: Vec<u64> = STRESS_OPS
+            .iter()
+            .map(|o| o.load(Ordering::Relaxed))
+            .collect();
+        eprintln!(
+            "stress {append:?}: {ROUNDS} crashes; acked flushes {}, reads {}, finishes {}, resets {}; \
+             concatenations so far {} ({} failed)",
+            ops[OP_FLUSH],
+            ops[OP_READ],
+            ops[OP_FINISH],
+            ops[OP_RESET],
+            STATS.compactions.get(),
+            STATS.compact_errors.get()
+        );
+        assert!(ops.iter().all(|&n| n > 0), "every operation ran: {ops:?}");
+        if append == AppendMode::Segments {
+            assert!(STATS.compactions.get() > 0, "the compactor ran");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stress_crashes_segments() {
+        stress(AppendMode::Segments).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stress_crashes_patch() {
+        stress(AppendMode::Patch).await;
+    }
+
     #[tokio::test]
     async fn write_flush_read() {
         let store = mem();

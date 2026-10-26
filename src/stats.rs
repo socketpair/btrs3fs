@@ -59,7 +59,7 @@ impl Counter {
         self.add(1);
     }
 
-    fn get(&self) -> u64 {
+    pub fn get(&self) -> u64 {
         self.0.load(Relaxed)
     }
 }
