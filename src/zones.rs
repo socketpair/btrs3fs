@@ -1047,6 +1047,22 @@ impl Engine {
         }
     }
 
+    /// Queues every zone served by more than one object for concatenation
+    /// at once, below the threshold too (the statistics page button).
+    /// Returns how many were queued; none on a disk without segments.
+    pub fn compact_all(&self) -> usize {
+        if !self.segments {
+            return 0;
+        }
+        let fragmented: Vec<usize> = (0..self.zones.len())
+            .filter(|&i| self.zones[i].state.lock().unwrap().objects.len() > 1)
+            .collect();
+        for &zi in &fragmented {
+            self.queue_compaction(zi, true);
+        }
+        fragmented.len()
+    }
+
     fn queue_compaction(&self, zi: usize, urgent: bool) {
         let mut q = self.compact_queue.lock().unwrap();
         if q.queued[zi] {
@@ -1351,6 +1367,21 @@ mod tests {
             &read(&e, ZS + 2 * B, 2 * B).await[B as usize..],
             &blk(4, 1)[..]
         );
+    }
+
+    #[tokio::test]
+    async fn compact_all_queues_every_fragmented_zone() {
+        let e = segments_engine(mem()).await;
+        segment_writes(&e, 1, 1, 2).await; // below the threshold
+        segment_writes(&e, 3, 1, 3).await;
+        segment_writes(&e, 5, 1, 1).await; // one object: nothing to do
+        assert_eq!(e.next_compaction(&[false; 8]), None);
+        assert_eq!(e.compact_all(), 2);
+        assert_eq!(e.next_compaction(&[false; 8]), Some(1));
+        assert_eq!(e.next_compaction(&[false; 8]), Some(3));
+        assert_eq!(e.next_compaction(&[false; 8]), None);
+        // A disk without segments has nothing to concatenate.
+        assert_eq!(engine_with(mem()).await.compact_all(), 0);
     }
 
     #[tokio::test]

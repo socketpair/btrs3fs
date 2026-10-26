@@ -228,11 +228,13 @@ pub enum Reason {
     Explicit,
     /// Zone FINISH: data is stored before the zone is tagged as finished.
     Finish,
+    /// The button on the statistics page (`POST /flush`).
+    Manual,
 }
 
 impl Reason {
-    /// Number of reasons: `Finish` is the last one.
-    const COUNT: usize = Reason::Finish as usize + 1;
+    /// Number of reasons: `Manual` is the last one.
+    const COUNT: usize = Reason::Manual as usize + 1;
 }
 
 pub struct Stats {
@@ -392,6 +394,7 @@ pub struct Snapshot {
     pub uploads_zone_closed: u64,
     pub uploads_explicit: u64,
     pub uploads_finish: u64,
+    pub uploads_manual: u64,
     pub uploads_in_flight: u64,
     pub uploads_in_flight_max: u64,
     pub upload_errors: u64,
@@ -467,6 +470,7 @@ impl Stats {
             uploads_zone_closed: self.reason(Reason::ZoneClosed).get(),
             uploads_explicit: self.reason(Reason::Explicit).get(),
             uploads_finish: self.reason(Reason::Finish).get(),
+            uploads_manual: self.reason(Reason::Manual).get(),
             uploads_in_flight: self.uploads.current.load(Relaxed),
             uploads_in_flight_max: self.uploads.max.load(Relaxed),
             upload_errors: self.upload_errors.get(),
@@ -509,9 +513,12 @@ impl Stats {
 }
 
 /// Serves the statistics page on 127.0.0.1:`port` in a background thread.
+/// Serves the page, `/stats.json` and the actions `POST /<name>`: `action`
+/// gets the name and answers with a JSON body, or `None` for an unknown one.
 pub fn serve_http(
     port: u16,
     snapshot: impl Fn() -> Snapshot + Send + 'static,
+    action: impl Fn(&str) -> Option<String> + Send + 'static,
 ) -> anyhow::Result<()> {
     let server = tiny_http::Server::http(("127.0.0.1", port))
         .map_err(|e| anyhow!("cannot listen on 127.0.0.1:{port}: {e}"))?;
@@ -520,7 +527,16 @@ pub fn serve_http(
         .spawn(move || {
             for req in server.incoming_requests() {
                 let path = req.url().split('?').next().unwrap_or_default();
+                let post = *req.method() == tiny_http::Method::Post;
                 let (status, body, content_type) = match path {
+                    // POST only: links and browser prefetch must not start actions.
+                    p if post => match action(p.trim_start_matches('/')) {
+                        Some(json) => (200, json, "application/json"),
+                        None => (404, "no such action\n".into(), "text/plain; charset=utf-8"),
+                    },
+                    "/compact" | "/flush" => {
+                        (405, "use POST\n".into(), "text/plain; charset=utf-8")
+                    }
                     "/" | "/index.html" => (200, PAGE.to_string(), "text/html; charset=utf-8"),
                     "/stats.json" => match serde_json::to_string(&snapshot()) {
                         Ok(json) => (200, json, "application/json"),
@@ -613,27 +629,36 @@ mod tests {
     fn serves_page_and_json() {
         // Port 0 cannot be used with a fixed URL; pick a high fixed test port.
         let port = 39470;
-        serve_http(port, || Snapshot {
-            disk: "t/".into(),
-            ..Default::default()
-        })
+        serve_http(
+            port,
+            || Snapshot {
+                disk: "t/".into(),
+                ..Default::default()
+            },
+            |name| (name == "compact").then(|| "{\"queued\":3}".to_string()),
+        )
         .unwrap();
-        let get = |path: &str| {
+        let send = |method: &str, path: &str| {
             use std::io::{Read, Write};
             let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
             write!(
                 s,
-                "GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+                "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             )
             .unwrap();
             let mut out = String::new();
             s.read_to_string(&mut out).unwrap();
             out
         };
+        let get = |path: &str| send("GET", path);
         let page = get("/");
         assert!(page.starts_with("HTTP/1.1 200") && page.contains("<html"));
         let json = get("/stats.json");
         assert!(json.contains("\"disk\":\"t/\""));
         assert!(get("/nope").starts_with("HTTP/1.1 404"));
+        assert!(get("/compact").starts_with("HTTP/1.1 405"));
+        let posted = send("POST", "/compact");
+        assert!(posted.starts_with("HTTP/1.1 200") && posted.ends_with("{\"queued\":3}"));
+        assert!(send("POST", "/nope").starts_with("HTTP/1.1 404"));
     }
 }

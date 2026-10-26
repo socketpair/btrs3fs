@@ -395,6 +395,7 @@ fn serve_disk(
     // The statistics page starts once the device number is known.
     let started = Instant::now();
     let stats_engine = engine.clone();
+    let act_rt = rt.handle().clone();
     let append = cfg.append;
     stats::set_zone_size(cfg.zone_size);
     let on_ready: device::OnReady = Box::new(move |bdev| {
@@ -405,6 +406,7 @@ fn serve_disk(
         });
         if let Some(port) = port {
             let device = bdev.to_string();
+            let act_engine = stats_engine.clone();
             let snapshot = move || {
                 let (zones, dirty_zones) = stats_engine.zone_summary();
                 stats::STATS.snapshot(stats::DiskState {
@@ -419,7 +421,27 @@ fn serve_disk(
                     zones,
                 })
             };
-            match stats::serve_http(port, snapshot) {
+            let act_rt = act_rt.clone();
+            let action = move |name: &str| match name {
+                "compact" => Some(format!("{{\"queued\":{}}}", act_engine.compact_all())),
+                "flush" => {
+                    let pending = act_engine.unflushed();
+                    let bytes: u64 = pending.iter().map(|&(_, b)| b).sum();
+                    info!(
+                        "statistics page: uploading {bytes} buffered bytes of {} zones",
+                        pending.len()
+                    );
+                    let e = act_engine.clone();
+                    act_rt.spawn(async move {
+                        if let Err(e) = e.flush_all(stats::Reason::Manual).await {
+                            warn!("upload asked from the statistics page failed: {e}");
+                        }
+                    });
+                    Some(format!("{{\"zones\":{},\"bytes\":{bytes}}}", pending.len()))
+                }
+                _ => None,
+            };
+            match stats::serve_http(port, snapshot, action) {
                 Ok(()) => {
                     let _ = STATS_PORT.set(port);
                 }

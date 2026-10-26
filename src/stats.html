@@ -35,6 +35,9 @@
   .card .label { color: var(--muted); font-size: 12px; }
   .card .value { font-size: 24px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
   .card .detail { color: var(--muted); font-size: 12px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .btn { margin-top: 8px; padding: 3px 10px; font: inherit; font-size: 12px; color: var(--text);
+         background: var(--line); border: 1px solid var(--line); border-radius: 4px; cursor: pointer; }
+  .btn:hover { border-color: var(--accent); }
   .meter { height: 6px; border-radius: 3px; background: var(--line); margin-top: 8px; overflow: hidden; }
   .meter > div { height: 100%; background: var(--accent); width: 0; }
   .chart svg { width: 100%; height: 90px; display: block; margin-top: 6px; }
@@ -56,6 +59,7 @@
   <h1>btrs3fs</h1>
   <span class="sub" id="title">connecting…</span>
   <span id="status">—</span>
+  <span class="sub" id="action"></span>
 </header>
 <main>
   <div class="grid" id="cards"></div>
@@ -177,11 +181,13 @@ function render(s, p, dt) {
   $("cards").innerHTML =
     card("Upload to S3", rate(upRate), `${num(upPerSec)} uploads/s · total ${bytes(s.upload_size.sum)}`) +
     card("Read from S3", rate(rdRate), `${num(d("gets"))} GET/s · total ${bytes(s.read_from_s3)}`) +
-    card("RAM buffers", bytes(s.dirty_bytes), `${s.dirty_zones} zones · background uploads above ${bytes(s.dirty_limit)} · writes wait at ${bytes(s.dirty_hard_limit)}`,
+    card("RAM buffers", bytes(s.dirty_bytes), `${s.dirty_zones} zones · background uploads above ${bytes(s.dirty_limit)} · writes wait at ${bytes(s.dirty_hard_limit)}` +
+         `<br><button class="btn" onclick="act('flush')">Upload buffered data</button>`,
          s.dirty_bytes / s.dirty_hard_limit * 100) +
     card("Uploads in parallel", `${s.uploads_in_flight}`, `max ${s.uploads_in_flight_max} · kernel requests ${s.requests_in_flight} (max ${s.requests_in_flight_max})`) +
     card("Zones", `${s.zones.open} open`, `${s.zones.closed} closed · ${s.zones.full} full · ${s.zones.empty} empty<br>` +
-         `${s.zones.partial} partly filled · ${s.zones.fragmented} fragmented (${num(s.zones.objects)} objects, at most ${s.zones.max_objects} in a zone)`) +
+         `${s.zones.partial} partly filled · ${s.zones.fragmented} fragmented (${num(s.zones.objects)} objects, at most ${s.zones.max_objects} in a zone)` +
+         (s.append === "SEGMENTS" ? `<br><button class="btn" onclick="act('compact')">Concatenate fragmented zones</button>` : "")) +
     card("Problems", `<span class="${s.upload_errors + s.req_errors ? "bad" : ""}">${num(s.upload_errors + s.req_errors)}</span>`,
          `failed uploads ${num(s.upload_errors)} · I/O errors ${num(s.req_errors)} · S3 retries ${num(s.retries)}` +
          (errRate ? ` · <span class="bad">${num(errRate)}/s</span>` : ""));
@@ -211,6 +217,7 @@ function render(s, p, dt) {
     ["reason: buffer limit", num(s.uploads_background), num(d("uploads_background"))],
     ["reason: explicit", num(s.uploads_explicit), num(d("uploads_explicit"))],
     ["reason: zone FINISH", num(s.uploads_finish), num(d("uploads_finish"))],
+    ["reason: upload button", num(s.uploads_manual), num(d("uploads_manual"))],
     ["S3 retries", num(s.retries), num(d("retries"))],
     ["failed uploads", num(s.upload_errors), num(d("upload_errors"))],
   ]);
@@ -243,6 +250,20 @@ function render(s, p, dt) {
     ["zone reports", num(s.req_report), num(d("req_report")), ""],
     ["errors", num(s.req_errors), num(d("req_errors")), ""],
   ]);
+}
+
+/* Actions of the daemon (POST); the answer goes to the header line. */
+async function act(name) {
+  try {
+    const r = await fetch(name, { method: "POST" });
+    if (!r.ok) throw new Error(r.status);
+    const j = await r.json();
+    $("action").textContent = name === "compact"
+      ? `${num(j.queued)} fragmented zones queued for concatenation`
+      : `uploading ${bytes(j.bytes)} buffered in ${num(j.zones)} zones`;
+  } catch (e) {
+    $("action").textContent = `${name} failed: ${e.message}`;
+  }
 }
 
 async function tick() {
