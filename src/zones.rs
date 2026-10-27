@@ -1865,6 +1865,8 @@ mod tests {
         {
             let mut st = e.zones[1].state.lock().unwrap();
             assert!(!e.idle_due(&st, now)); // just written
+            // A round time: `last_write + x - last_write` is exactly `x` then.
+            let written_at = std::mem::replace(&mut st.last_write, 1000.0);
             st.write_interval = Some(1.0); // 4 × 1 s is below the 30 s floor
             assert!(!e.idle_due(&st, st.last_write + 29.0));
             assert!(e.idle_due(&st, st.last_write + 30.0));
@@ -1876,6 +1878,7 @@ mod tests {
             assert!(e.idle_due(&st, st.last_write + 480.0));
             st.write_interval = Some(3600.0); // capped at an hour
             assert!(e.idle_due(&st, st.last_write + 3600.0));
+            st.last_write = written_at;
         }
         e.queue_idle();
         assert_eq!(e.next_compaction(&[false; 8]), None); // not idle yet by the clock
