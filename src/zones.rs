@@ -117,6 +117,10 @@ fn invalid<T>(msg: String) -> ZResult<T> {
     Err(ZoneError::Invalid(msg))
 }
 
+fn broken<T>(zi: usize) -> ZResult<T> {
+    invalid(format!("zone {zi} needs a RESET: the previous one failed"))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZoneInfo {
     pub start: u64,
@@ -232,7 +236,9 @@ struct ZoneState {
     /// Objects holding `[0, flushed)`, by offset: one zone object, or the
     /// segments of a SEGMENTS disk (SPEC.md §5).
     objects: Vec<Stored>,
-    /// The FINISH marker `<zone>.finished` exists in the store (SPEC.md §3.3).
+    /// The FINISH marker `<zone>.finished` may exist in the store (SPEC.md
+    /// §3.3): set before its PUT, so a PUT that failed after reaching the
+    /// store still has its marker deleted by RESET.
     marker: bool,
     /// Bumped on every RESET; part of the read-ahead cache key.
     generation: u64,
@@ -245,6 +251,9 @@ struct ZoneState {
     write_interval: Option<f64>,
     /// A write since the daemon started (`last_write` is a write, not the start).
     written: bool,
+    /// A RESET failed with some of the zone's objects maybe deleted: I/O is
+    /// refused until a RESET succeeds (SPEC.md §5).
+    broken: bool,
 }
 
 impl ZoneState {
@@ -357,7 +366,8 @@ impl Engine {
         let mut leftovers = Vec::new();
         let (mut full, mut empty, mut closed) = (0, 0, 0);
         let mut zones = Vec::with_capacity(nr_zones);
-        for (i, (objects, &finished)) in found.into_iter().zip(&finished).enumerate() {
+        let finished_found = finished;
+        for (i, (objects, &finished)) in found.into_iter().zip(&finished_found).enumerate() {
             let start = i as u64 * cfg.zone_size;
             let (objects, garbage) = cover(objects);
             let end = objects.last().map_or(0, |o| o.to);
@@ -372,10 +382,18 @@ impl Engine {
                 leftovers.push(key);
             }
             let size = objects.last().map_or(0, |o| o.to);
-            // A metadata marker without data is left by an interrupted RESET.
+            // RESET deletes the object at the zone start first, so markers
+            // without data are what an interrupted RESET left (SPEC.md §5).
             let is_meta = meta[i] && size > 0;
             if meta[i] && !is_meta {
                 leftovers.push(layout.meta_key(start));
+            }
+            let finished = finished && size > 0;
+            if finished_found[i] && !finished {
+                warn!(
+                    "zone {i}: FINISH marker without data, left by an interrupted RESET; deleting it"
+                );
+                leftovers.push(layout.finished_key(start));
             }
             let (cond, wp) = if finished || size == cfg.zone_size {
                 full += 1;
@@ -403,16 +421,18 @@ impl Engine {
                     last_write: started,
                     write_interval: None,
                     written: false,
+                    broken: false,
                 }),
                 upload: tokio::sync::Mutex::new(()),
             });
         }
+        // Leftovers of interrupted concatenations and RESETs (SPEC.md §5),
+        // gone before any new data can join them.
+        if !leftovers.is_empty() {
+            store.delete_many(&leftovers).await?;
+            info!("deleted {} leftover objects", leftovers.len());
+        }
         if segments {
-            // Leftovers of interrupted concatenations (SPEC.md §5).
-            if !leftovers.is_empty() {
-                store.delete_many(&leftovers).await?;
-                info!("deleted {} segments already concatenated", leftovers.len());
-            }
             let aborted = store.abort_stale_concats(&layout.dir()).await?;
             if aborted > 0 {
                 info!("aborted {aborted} unfinished concatenations");
@@ -529,6 +549,9 @@ impl Engine {
         }
         let zone = &self.zones[zi];
         let mut st = zone.state.lock().unwrap();
+        if st.broken {
+            return broken(zi);
+        }
         if st.cond == Cond::Full {
             return invalid(format!("write to full zone {zi}"));
         }
@@ -584,6 +607,9 @@ impl Engine {
         }
         let zone = &self.zones[zi];
         let st = zone.state.lock().unwrap();
+        if st.broken {
+            return broken(zi);
+        }
         let mut pieces = Vec::new();
         let mut pos = rel;
 
@@ -903,22 +929,35 @@ impl Engine {
 
     /// FINISH: stores the zone data, puts the empty marker `<zone>.finished`
     /// and makes the zone FULL. Persisting it keeps finished zones FULL after a
-    /// restart (SPEC.md §3.3).
+    /// restart (SPEC.md §3.3). A zone without data gets no marker: a marker
+    /// without data is a leftover of a RESET, and the zone is EMPTY again
+    /// after a restart.
     pub async fn finish_zone(&self, offset: u64) -> ZResult<()> {
         let (zi, _) = self.locate(offset)?;
         let zone = &self.zones[zi];
         let _upload = zone.upload.lock().await;
-        if zone.state.lock().unwrap().cond == Cond::Full {
-            return Ok(());
+        {
+            let mut st = zone.state.lock().unwrap();
+            if st.broken {
+                return broken(zi);
+            }
+            if st.cond == Cond::Full {
+                return Ok(());
+            }
+            if st.data_end == 0 {
+                st.cond = Cond::Full;
+                st.wp = self.zone_size;
+                return Ok(());
+            }
         }
         self.flush_locked(zi, Reason::Finish).await?;
+        zone.state.lock().unwrap().marker = true;
         self.store
             .put(&self.layout.finished_key(zone.start), Body::default())
             .await?;
 
         let compaction = {
             let mut st = zone.state.lock().unwrap();
-            st.marker = true;
             st.cond = Cond::Full;
             st.wp = self.zone_size;
             self.compaction_due(&st)
@@ -930,7 +969,7 @@ impl Engine {
         Ok(())
     }
 
-    /// RESET: deletes the zone object and its FINISH marker, drops buffered data.
+    /// RESET: deletes the zone's objects and markers, drops buffered data.
     pub async fn reset_zone(&self, offset: u64) -> ZResult<()> {
         let (zi, _) = self.locate(offset)?;
         self.reset_index(zi).await
@@ -938,12 +977,13 @@ impl Engine {
 
     async fn reset_index(&self, zi: usize) -> ZResult<()> {
         let zone = &self.zones[zi];
-        // Holding `upload` keeps a concurrent flush from re-creating the object
-        // between the delete and the state change.
+        // Holding `upload` keeps flushes, marker PUTs and concatenations of
+        // the zone out until the state change.
         let _upload = zone.upload.lock().await;
-        let keys = {
-            let st = zone.state.lock().unwrap();
-            if st.cond == Cond::Empty
+        let marker = {
+            let mut st = zone.state.lock().unwrap();
+            if !st.broken
+                && st.cond == Cond::Empty
                 && st.data_end == 0
                 && st.objects.is_empty()
                 && !st.marker
@@ -951,37 +991,53 @@ impl Engine {
             {
                 return Ok(());
             }
-            self.stored_keys(zone, &st)
+            // A concatenation under way never completes now, even if the
+            // RESET fails and leaves the rest of the state as it is.
+            st.generation += 1;
+            st.marker
         };
-        // Segments: everything under the zone's prefix, leftovers included.
-        let keys = if self.segments {
-            let listed = self.store.list(&self.layout.zone_key(zone.start)).await?;
-            listed.into_iter().map(|o| o.key).collect()
-        } else {
-            keys
-        };
-        // Delete first: if it fails the zone keeps its state and stays consistent.
-        match keys.as_slice() {
-            [] => {}
-            [key] => self.store.delete(key).await?,
-            _ => self.store.delete_many(&keys).await?,
+        if let Err(e) = self.delete_zone_objects(zone.start, marker).await {
+            self.break_locked(zi);
+            warn!("zone {zi}: RESET failed; I/O to the zone is refused until a RESET succeeds");
+            return Err(e);
         }
         self.clear_locked(zi);
         debug!("zone {zi} reset");
         Ok(())
     }
 
-    /// Objects of the zone in the store: its data objects and the FINISH marker.
-    fn stored_keys(&self, zone: &Zone, st: &ZoneState) -> Vec<String> {
-        let mut keys: Vec<String> = st
-            .objects
-            .iter()
-            .map(|o| self.object_key(zone.start, o))
-            .collect();
-        if st.marker {
-            keys.push(self.layout.finished_key(zone.start));
+    /// Deletes a zone's objects, the one at the zone start first and the
+    /// rest only after it is gone: a RESET interrupted at any point leaves
+    /// the zone either untouched or without its start, which restores as
+    /// EMPTY with the rest deleted (SPEC.md §5).
+    async fn delete_zone_objects(&self, zone_start: u64, marker: bool) -> ZResult<()> {
+        if !self.segments {
+            self.store.delete(&self.layout.zone_key(zone_start)).await?;
+            if marker {
+                self.store
+                    .delete(&self.layout.finished_key(zone_start))
+                    .await?;
+            }
+            return Ok(());
         }
-        keys
+        // Segments: everything under the zone's prefix, leftovers included;
+        // the listing is complete, as everything that creates objects of the
+        // zone waits for its `upload` lock.
+        let first = self.layout.segment_key(zone_start, 0);
+        let prefix = self.layout.zone_key(zone_start);
+        let (deleted, listed) = tokio::join!(self.store.delete(&first), self.store.list(&prefix));
+        deleted?;
+        let rest: Vec<String> = listed?
+            .into_iter()
+            .map(|o| o.key)
+            .filter(|k| *k != first)
+            .collect();
+        match rest.as_slice() {
+            [] => {}
+            [key] => self.store.delete(key).await?,
+            _ => self.store.delete_many(&rest).await?,
+        }
+        Ok(())
     }
 
     /// Makes the zone EMPTY and drops its buffer; the caller holds `upload`
@@ -1004,8 +1060,33 @@ impl Engine {
             st.last_write = boottime();
             st.write_interval = None;
             st.written = false;
+            st.broken = false;
             (dropped, had_object)
         };
+        self.forget_data(zi, dropped, had_object);
+    }
+
+    /// After a failed RESET, with the caller holding `upload`: some objects
+    /// of the zone may be gone, so its data is dropped and I/O refused until
+    /// a RESET succeeds; the condition and write pointer stay, so the kernel
+    /// sees the zone not empty and resets it again before using it. Markers
+    /// stay flagged for that RESET to delete.
+    fn break_locked(&self, zi: usize) {
+        let (dropped, had_object) = {
+            let mut st = self.zones[zi].state.lock().unwrap();
+            let had_object = !st.objects.is_empty();
+            let dropped = st.buffered();
+            st.chunks.clear();
+            st.data_end = st.flushed;
+            st.objects.clear();
+            st.broken = true;
+            (dropped, had_object)
+        };
+        self.forget_data(zi, dropped, had_object);
+    }
+
+    /// Releases a dropped buffer and cached data of a zone.
+    fn forget_data(&self, zi: usize, dropped: u64, had_object: bool) {
         // Only stored data is cached.
         if let (Some(c), true) = (&self.read_cache, had_object) {
             c.forget_zone(zi);
@@ -1016,37 +1097,51 @@ impl Engine {
         }
     }
 
-    /// RESET_ALL: all zone objects go in DeleteObjects batches of up to 1000
+    /// RESET_ALL: everything of the disk but its config, the objects at zone
+    /// starts first as in a RESET, in DeleteObjects batches of up to 1000
     /// keys instead of one DELETE per zone (SPEC.md §4).
     pub async fn reset_all(&self) -> ZResult<()> {
-        // Every `upload` lock, so no flush re-creates an object between the
+        // Every `upload` lock, so nothing creates an object between the
         // delete and the state change. Taken in zone order; nothing else holds
         // two of them, so this cannot deadlock.
         let mut guards = Vec::with_capacity(self.zones.len());
-        let mut keys = Vec::new();
         for zone in &self.zones {
             guards.push(zone.upload.lock().await);
-            keys.extend(self.stored_keys(zone, &zone.state.lock().unwrap()));
+            zone.state.lock().unwrap().generation += 1;
         }
-        if self.segments {
-            // Everything of the disk but its config, leftovers included.
-            let config_key = self.layout.config_key();
-            let listed = self.store.list(&self.layout.dir()).await?;
-            keys = listed
-                .into_iter()
-                .map(|o| o.key)
-                .filter(|k| *k != config_key)
-                .collect();
-        }
-        // On failure no zone changes state, as with a failed single DELETE,
-        // though some objects may be gone: their zones then fail I/O until the
-        // next RESET or restart, which restores them from the store as EMPTY.
-        self.store.delete_many(&keys).await?;
+        let deleted = self.delete_all_objects().await;
         for zi in 0..self.zones.len() {
-            self.clear_locked(zi);
+            match deleted {
+                Ok(_) => self.clear_locked(zi),
+                Err(_) => self.break_locked(zi),
+            }
         }
-        debug!("all zones reset, {} objects deleted", keys.len());
+        if deleted.is_err() {
+            warn!("RESET_ALL failed; I/O to every zone is refused until it is reset");
+        }
+        debug!("all zones reset, {} objects deleted", deleted?);
         Ok(())
+    }
+
+    async fn delete_all_objects(&self) -> ZResult<usize> {
+        let config_key = self.layout.config_key();
+        let listed = self.store.list(&self.layout.dir()).await?;
+        let (first, rest): (Vec<String>, Vec<String>) = listed
+            .into_iter()
+            .map(|o| o.key)
+            .filter(|k| *k != config_key)
+            .partition(|k| {
+                if self.segments {
+                    self.layout
+                        .parse_segment_key(k)
+                        .is_some_and(|(_, at)| at == 0)
+                } else {
+                    self.layout.parse_zone_key(k).is_some()
+                }
+            });
+        self.store.delete_many(&first).await?;
+        self.store.delete_many(&rest).await?;
+        Ok(first.len() + rest.len())
     }
 
     /// Zone descriptors for REPORT_ZONES starting at zone `first`.
@@ -1228,7 +1323,7 @@ impl Engine {
         }
         for zi in 0..self.zones.len() {
             let zone = &self.zones[zi];
-            let unmarked = |st: &ZoneState| st.kind == Kind::Meta && !st.meta_marker;
+            let unmarked = |st: &ZoneState| st.kind == Kind::Meta && !st.meta_marker && !st.broken;
             if !unmarked(&zone.state.lock().unwrap()) {
                 continue;
             }
@@ -1420,22 +1515,24 @@ impl Engine {
     /// zone changed meanwhile: after a RESET (another generation) a new first
     /// segment `-00000000` may hold new data, and completing would overwrite
     /// it with old data; after another concatenation the parts are stale.
-    /// Then deletes the concatenated segments. Returns whether it completed.
+    /// Then deletes the concatenated segments, still under the lock: after a
+    /// RESET new data may be stored under the same keys. Returns whether it
+    /// completed.
     async fn compact_end(&self, zi: usize, job: CompactJob) -> ZResult<bool> {
         let zone = &self.zones[zi];
         let end = job.parts.last().expect("at least two parts").to;
+        let _upload = zone.upload.lock().await;
+        let unchanged = {
+            let st = zone.state.lock().unwrap();
+            st.generation == job.generation && st.objects.starts_with(&job.parts)
+        };
+        if !unchanged {
+            self.store.abort_concat(job.pending).await;
+            debug!("zone {zi} changed during its concatenation; dropped it");
+            return Ok(false);
+        }
+        self.store.finish_concat(job.pending).await?;
         {
-            let _upload = zone.upload.lock().await;
-            let unchanged = {
-                let st = zone.state.lock().unwrap();
-                st.generation == job.generation && st.objects.starts_with(&job.parts)
-            };
-            if !unchanged {
-                self.store.abort_concat(job.pending).await;
-                debug!("zone {zi} changed during its concatenation; dropped it");
-                return Ok(false);
-            }
-            self.store.finish_concat(job.pending).await?;
             let mut st = zone.state.lock().unwrap();
             let rest = st.objects.split_off(job.parts.len());
             st.objects = std::iter::once(Stored {
@@ -1452,7 +1549,8 @@ impl Engine {
             .filter(|o| o.start != 0)
             .map(|o| self.layout.segment_key(zone.start, o.start))
             .collect();
-        // Readers still holding a deleted segment plan anew on 404.
+        // Readers still holding a deleted segment plan anew on 404. Segments
+        // left by a failure lie within the base: deleted at restart or by RESET.
         self.store.delete_many(&merged).await?;
         debug!("zone {zi}: {} segments concatenated", job.parts.len());
         Ok(true)
@@ -1821,7 +1919,7 @@ mod tests {
             ["t/0000000000000000-00000000", "t/0000000000000000-00003000"]
         );
 
-        // Past a gap: left by an interrupted RESET, deleted.
+        // Past a gap: unreachable, deleted.
         put("t/0000000000100000-00000000", blk(5, 1)).await;
         put("t/0000000000100000-00002000", blk(6, 1)).await;
         let e = segments_engine(store.clone()).await;
@@ -1932,27 +2030,126 @@ mod tests {
         );
     }
 
+    /// A zone with three segments, a FINISH marker and a metadata marker.
+    async fn finished_meta_zone(e: &Engine, store: &Store, zone: u64) {
+        e.dirty.fetch_add(B, Ordering::SeqCst);
+        e.write_reserved(zone * ZS, blk(1, 1), false, true).unwrap();
+        e.flush_zone(zone as usize, Reason::Explicit).await.unwrap();
+        segment_writes(e, zone, 2, 2).await;
+        e.store_meta_markers().await;
+        e.finish_zone(zone * ZS).await.unwrap();
+        assert_eq!(keys(store, &e.layout.zone_key(zone * ZS)).await.len(), 5);
+    }
+
     #[tokio::test]
-    async fn crash_during_reset_partial_delete() {
+    async fn crash_during_reset_leaves_zone_untouched_or_empty() {
+        // Segments: deleting the zone start failed: nothing else is gone.
         let store = mem();
         let e = segments_engine(store.clone()).await;
-        segment_writes(&e, 0, 1, 4).await;
-        segment_writes(&e, 1, 1, 4).await;
+        finished_meta_zone(&e, &store, 1).await;
+        mem_store(&store).fail_deletes_of(Some("0000000000100000-00000000"));
+        assert!(e.reset_zone(ZS).await.is_err());
+        mem_store(&store).fail_deletes_of(None);
+        assert_eq!(keys(&store, "t/").await.len(), 5);
         drop(e);
-        // DeleteObjects of the RESET removed only some keys before the crash.
-        store.delete("t/0000000000000000-00000000").await.unwrap(); // the start
-        store.delete("t/0000000000100000-00002000").await.unwrap(); // the middle
         let e = segments_engine(store.clone()).await;
-        assert_eq!(e.report(0, 1)[0].cond, Cond::Empty); // nothing reachable
-        assert_eq!(e.report(1, 1)[0].wp, ZS + 2 * B); // the prefix before the gap
-        assert_eq!(read(&e, ZS, 2 * B).await, [blk(1, 1), blk(2, 1)].concat());
+        assert_eq!(e.report(1, 1)[0].cond, Cond::Full); // untouched
         assert_eq!(
-            keys(&store, "t/").await,
-            ["t/0000000000100000-00000000", "t/0000000000100000-00001000"]
+            read(&e, ZS, 3 * B).await,
+            [blk(1, 1), blk(2, 1), blk(3, 1)].concat()
         );
-        // The zones work on: new data at the restored pointers.
-        segment_writes(&e, 0, 7, 1).await;
-        assert_eq!(read(&e, 0, B).await, blk(7, 1).to_vec());
+        assert_eq!(keys(&store, "t/").await.len(), 5);
+
+        // The daemon died after deleting the zone start, during the rest.
+        mem_store(&store).fail_deletes_of(Some("0000000000100000-00001000"));
+        let deleting = e.reset_zone(ZS).await;
+        assert!(deleting.is_err());
+        mem_store(&store).fail_deletes_of(None);
+        // The start went first; some of the rest is left.
+        let left = keys(&store, "t/").await;
+        assert!(!left.is_empty() && !left.contains(&"t/0000000000100000-00000000".to_string()));
+        drop(e);
+        let e = segments_engine(store.clone()).await;
+        assert_eq!(e.report(1, 1)[0].cond, Cond::Empty);
+        assert!(keys(&store, "t/").await.is_empty());
+
+        // PATCH: the zone object gone, the FINISH marker left.
+        let store = mem();
+        let e = engine_with(store.clone()).await;
+        e.write(ZS, blk(1, 2), false).unwrap();
+        e.finish_zone(ZS).await.unwrap();
+        mem_store(&store).fail_deletes_of(Some(".finished"));
+        assert!(e.reset_zone(ZS).await.is_err());
+        mem_store(&store).fail_deletes_of(None);
+        assert_eq!(keys(&store, "t/").await, ["t/0000000000100000.finished"]);
+        drop(e);
+        let e = engine_with(store.clone()).await;
+        assert_eq!(e.report(1, 1)[0].cond, Cond::Empty);
+        assert!(keys(&store, "t/").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_reset_refuses_io_until_reset() {
+        let store = mem();
+        let e = segments_engine(store.clone()).await;
+        finished_meta_zone(&e, &store, 2).await;
+        segment_writes(&e, 3, 1, 3).await;
+        let job = e.compact_begin(3).await.unwrap().unwrap();
+        mem_store(&store).fail_deletes_of(Some("-00001000"));
+        assert!(e.reset_zone(2 * ZS).await.is_err());
+        assert!(e.reset_zone(3 * ZS).await.is_err());
+        mem_store(&store).fail_deletes_of(None);
+        // The concatenation started before the RESET never completes.
+        assert!(!e.compact_end(3, job).await.unwrap());
+        let r = e.report(2, 2);
+        assert_eq!((r[0].cond, r[1].cond), (Cond::Full, Cond::ImpOpen)); // not empty: reset again
+        assert!(e.read_plan(3 * ZS, B).is_err());
+        assert!(e.write(3 * ZS + 3 * B, blk(9, 1), false).is_err());
+        assert!(e.finish_zone(3 * ZS).await.is_err());
+        e.reset_zone(2 * ZS).await.unwrap();
+        e.reset_zone(3 * ZS).await.unwrap();
+        assert!(keys(&store, "t/").await.is_empty());
+        segment_writes(&e, 3, 7, 1).await;
+        assert_eq!(read(&e, 3 * ZS, B).await, blk(7, 1).to_vec());
+    }
+
+    #[tokio::test]
+    async fn finish_marker_goes_with_reset_even_if_its_put_failed() {
+        let store = mem();
+        let e = engine_with(store.clone()).await;
+        e.write(0, blk(1, 2), false).unwrap();
+        e.flush_zone(0, Reason::Explicit).await.unwrap();
+        // The marker PUT reached the store but its answer was lost.
+        mem_store(&store).set_fail(true);
+        assert!(e.finish_zone(0).await.is_err());
+        mem_store(&store).set_fail(false);
+        store
+            .put("t/0000000000000000.finished", Body::default())
+            .await
+            .unwrap();
+        e.reset_zone(0).await.unwrap();
+        assert!(keys(&store, "t/").await.is_empty());
+        // New data in the zone is not taken for a finished zone after a restart.
+        e.write(0, blk(2, 1), false).unwrap();
+        e.flush_zone(0, Reason::Explicit).await.unwrap();
+        drop(e);
+        let e = engine_with(store).await;
+        assert_eq!(
+            (e.report(0, 1)[0].cond, e.report(0, 1)[0].wp),
+            (Cond::Closed, B)
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_of_empty_zone_stores_nothing() {
+        let store = mem();
+        let e = segments_engine(store.clone()).await;
+        e.finish_zone(4 * ZS).await.unwrap();
+        assert_eq!(e.report(4, 1)[0].cond, Cond::Full);
+        assert!(keys(&store, "t/").await.is_empty());
+        drop(e);
+        let e = segments_engine(store).await;
+        assert_eq!(e.report(4, 1)[0].cond, Cond::Empty);
     }
 
     #[tokio::test]
@@ -2024,11 +2221,17 @@ mod tests {
         let zstart = zi as u64 * ZS;
         loop {
             let op = rng.below(100);
-            let (len, finished) = {
+            let (len, finished, resetting) = {
                 let m = model.lock().unwrap();
-                (m.written.len() as u64, m.finished)
+                (m.written.len() as u64, m.finished, m.resetting)
             };
-            if op < 50 && !finished && len < ZS {
+            if resetting {
+                // A failed RESET: the zone refuses I/O until one succeeds.
+                if e.reset_zone(zstart).await.is_ok() {
+                    STRESS_OPS[OP_RESET].fetch_add(1, Ordering::Relaxed);
+                    *model.lock().unwrap() = Model::default();
+                }
+            } else if op < 50 && !finished && len < ZS {
                 let n = (1 + rng.below(4)).min((ZS - len) / B);
                 let data = blk(rng.below(256) as u8, n);
                 e.write(zstart + len, data.clone(), false).unwrap();
@@ -2066,18 +2269,20 @@ mod tests {
         }
     }
 
-    /// After a restart: every acknowledged byte is there (unless a RESET was
-    /// under way), nothing beyond what was written, and the zone is a prefix
-    /// of what was written. Returns the model of the restored zone.
+    /// After a restart: every acknowledged byte is there, or the zone is
+    /// empty if a RESET was under way; nothing beyond what was written, and
+    /// the zone is a prefix of what was written. Returns the model of the
+    /// restored zone.
     async fn check_restored(e: &Engine, zi: usize, m: &Model) -> Model {
         let (len, cond) = {
             let st = e.zones[zi].state.lock().unwrap();
             (st.data_end as usize, st.cond)
         };
         assert!(
-            len >= m.acked || m.resetting,
-            "zone {zi}: {len} bytes restored, {} acknowledged",
-            m.acked
+            len >= m.acked || (m.resetting && len == 0),
+            "zone {zi}: {len} bytes restored, {} acknowledged{}",
+            m.acked,
+            if m.resetting { ", RESET under way" } else { "" }
         );
         assert!(
             len <= m.written.len(),
@@ -2253,16 +2458,8 @@ mod tests {
         assert_eq!(obj.len() as u64, B);
         assert!(store.get(marker).await.unwrap().is_none());
 
-        // FINISH of an empty zone puts only the marker; RESET removes it.
+        // FINISH of an empty zone stores nothing (`finish_of_empty_zone_stores_nothing`).
         e.finish_zone(ZS).await.unwrap();
-        assert!(store.get("t/0000000000100000").await.unwrap().is_none());
-        assert!(
-            store
-                .get("t/0000000000100000.finished")
-                .await
-                .unwrap()
-                .is_some()
-        );
         e.reset_zone(ZS).await.unwrap();
         assert!(store.list("t/0000000000100000").await.unwrap().is_empty());
     }
@@ -2341,7 +2538,7 @@ mod tests {
             e.flush_zone(1, Reason::Explicit).await.unwrap();
             e.write(3 * ZS, blk(5, 2), false).unwrap();
             e.finish_zone(3 * ZS).await.unwrap(); // partially written, finished
-            e.finish_zone(4 * ZS).await.unwrap(); // empty, finished
+            e.finish_zone(4 * ZS).await.unwrap(); // empty, finished: nothing stored
         }
         let e = engine_with(store).await;
         let r = e.report(0, 5);
@@ -2349,7 +2546,7 @@ mod tests {
         assert_eq!((r[1].cond, r[1].wp), (Cond::Full, 2 * ZS));
         assert_eq!((r[2].cond, r[2].wp), (Cond::Empty, 2 * ZS));
         assert_eq!((r[3].cond, r[3].wp), (Cond::Full, 4 * ZS));
-        assert_eq!((r[4].cond, r[4].wp), (Cond::Full, 5 * ZS));
+        assert_eq!((r[4].cond, r[4].wp), (Cond::Empty, 4 * ZS)); // no data, no marker
         assert_eq!(&read(&e, 2 * B, B).await[..], &blk(1, 1)[..]);
         assert_eq!(&read(&e, 3 * ZS + B, B).await[..], &blk(5, 1)[..]);
         assert!(read(&e, 3 * ZS + 2 * B, B).await.iter().all(|&b| b == 0));

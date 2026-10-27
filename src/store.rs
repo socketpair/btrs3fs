@@ -140,7 +140,9 @@ impl Store {
     pub async fn delete_many(&self, keys: &[String]) -> StoreResult<()> {
         self.interleave().await;
         match self {
-            Store::Mem(m) => keys.iter().try_for_each(|k| m.delete(k)),
+            // DeleteObjects keeps no order; backwards is the worst case for a
+            // zone, its start (the lowest key) going last.
+            Store::Mem(m) => keys.iter().rev().try_for_each(|k| m.delete(k)),
             Store::S3(s) => s.delete_many(keys).await,
         }
     }
@@ -215,6 +217,8 @@ struct MemObject {
 pub struct MemStore {
     objects: Mutex<BTreeMap<String, MemObject>>,
     fail: AtomicBool,
+    /// Deletes of keys containing this fail (tests).
+    fail_deletes_of: Mutex<Option<String>>,
     range_gets: AtomicU64,
 }
 
@@ -223,6 +227,13 @@ impl MemStore {
     #[cfg(test)]
     pub fn set_fail(&self, fail: bool) {
         self.fail.store(fail, Ordering::SeqCst);
+    }
+
+    /// Makes deletes of keys containing `part` fail; `None` stops it. A batch
+    /// deletes the keys before the first failing one, as DeleteObjects may.
+    #[cfg(test)]
+    pub fn fail_deletes_of(&self, part: Option<&str>) {
+        *self.fail_deletes_of.lock().unwrap() = part.map(str::to_string);
     }
 
     /// Ranged GETs served so far (tests count requests with it).
@@ -300,6 +311,11 @@ impl MemStore {
 
     fn delete(&self, key: &str) -> StoreResult<()> {
         self.check_fail()?;
+        if let Some(part) = &*self.fail_deletes_of.lock().unwrap()
+            && key.contains(part.as_str())
+        {
+            return Err(anyhow::anyhow!("injected failure deleting {key}").into());
+        }
         self.objects.lock().unwrap().remove(key);
         Ok(())
     }
