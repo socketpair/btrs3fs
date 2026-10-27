@@ -72,7 +72,7 @@ btrs3fs destroy --creds $C --prefix disks/data --yes               # удали�
 | Команда | Назначение |
 |---|---|
 | `create --creds F --prefix P --size S [параметры §6]` | Записать `P/disk.json` и отформатировать в btrfs (все профили `single`). Отказ, если под префиксом есть объекты; при ошибке созданное удаляется. |
-| `mount --creds F --prefix P <точка> [-o опции] [--dev-id N]` | Запустить устройство в фоне и смонтировать с `noatime,lazytime,commit=300` (+ `-o`). Возвращается после монтирования. |
+| `mount --creds F --prefix P <точка> [-o опции] [--dev-id N]` | Запустить устройство в фоне и смонтировать с `nosuid,nodev,noatime,lazytime,commit=300` (+ `-o`). Возвращается после монтирования. |
 | `umount <точка>` | Размонтировать и остановить устройство. |
 | `run --creds F --prefix P [--dev-id 0]` | Устройство без монтирования, на переднем плане (systemd, §9). |
 | `run --memory --size S` | Устройство в RAM без S3 — для экспериментов. |
@@ -189,7 +189,7 @@ sudo systemctl enable --now btrs3fs@main
 Строка fstab (`x-systemd.requires` размонтирует ФС раньше остановки устройства):
 
 ```
-/dev/ublkb0 /mnt/data btrfs noatime,lazytime,commit=300,_netdev,x-systemd.requires=btrs3fs@main.service 0 0
+/dev/ublkb0 /mnt/data btrfs nosuid,nodev,noatime,lazytime,commit=300,_netdev,x-systemd.requires=btrs3fs@main.service 0 0
 ```
 
 ## 10. Что лежит в бакете

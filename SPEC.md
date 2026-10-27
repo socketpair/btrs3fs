@@ -389,8 +389,10 @@ io_uring (`libublk::ops::submit_sqe`). Состояние зон — общий 
   ошибке удаляет созданное.
 - `mount`: `fork()` до создания потоков; потомок — `setsid`, `chdir /`, stdio на `/dev/null`
   (stderr — если нет `--log-to-stderr`), готовность родителю по pipe: `READY <bdev> <порт>`
-  или `ERROR …`. Родитель — `mount -t btrfs -o noatime,lazytime,commit=300[,…]`, при ошибке
-  SIGTERM потомку. Опции монтирования — решение пользователя (`manual.md` §7).
+  или `ERROR …`. Родитель — `mount -t btrfs -o nosuid,nodev,noatime,lazytime,commit=300[,…]`, при ошибке
+  SIGTERM потомку. Опции монтирования — решение пользователя (`manual.md` §7); `nosuid,nodev` —
+  потому что образ ФС приходит из бакета: кто может писать в бакет (или подменить ответы S3),
+  иначе подложил бы setuid-файл или узел устройства и получил root на машине.
 - `umount`: устройство по точке из `/proc/self/mountinfo` → `umount` → `detach`.
 - `detach`: отказ, если `/dev/ublkbN` открыт (`O_EXCL`); иначе SIGTERM серверу и ожидание.
   Сервера нет или устройство в `FAIL_IO` — `DEL_DEV`. `--force` — SIGKILL без проверок.

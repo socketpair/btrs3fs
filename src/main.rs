@@ -32,8 +32,10 @@ use zones::Engine;
 
 /// btrfs mount options always used by `mount`: user decision (SPEC.md §9.2);
 /// commit=300 makes btrfs commit (and FLUSH) every 5 minutes, so writes merge
-/// into fewer, larger S3 appends.
-const MOUNT_OPTIONS: &str = "noatime,lazytime,commit=300";
+/// into fewer, larger S3 appends. nosuid,nodev: the image comes from the
+/// bucket, so whoever can write there must not get setuid files or device
+/// nodes onto this host.
+const MOUNT_OPTIONS: &str = "nosuid,nodev,noatime,lazytime,commit=300";
 
 /// How long `mount` waits for udev to create /dev/ublkbN after the device
 /// server reported it ready. Judgement call: udev needs milliseconds.
@@ -123,7 +125,7 @@ struct MountArgs {
     disk: DiskArgs,
     /// Directory to mount the filesystem on.
     mountpoint: PathBuf,
-    /// Extra mount options, appended to noatime,lazytime,commit=300.
+    /// Extra mount options, appended to nosuid,nodev,noatime,lazytime,commit=300.
     #[arg(short = 'o', long)]
     options: Option<String>,
     /// ublk device id; -1 lets the kernel choose.
@@ -1061,11 +1063,11 @@ mod tests {
 
     #[test]
     fn options() {
-        assert_eq!(mount_options(None), "noatime,lazytime,commit=300");
-        assert_eq!(mount_options(Some(" ")), "noatime,lazytime,commit=300");
+        assert_eq!(mount_options(None), "nosuid,nodev,noatime,lazytime,commit=300");
+        assert_eq!(mount_options(Some(" ")), "nosuid,nodev,noatime,lazytime,commit=300");
         assert_eq!(
             mount_options(Some("compress=zstd")),
-            "noatime,lazytime,commit=300,compress=zstd"
+            "nosuid,nodev,noatime,lazytime,commit=300,compress=zstd"
         );
     }
 }
