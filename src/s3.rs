@@ -10,7 +10,6 @@ use crate::config::{
     DEFAULT_RETRY_TIMEOUT_SECS, DiskConfig,
 };
 use crate::store::{Body, ConcatPart, Layout, ObjectInfo, StoreError, StoreResult};
-use crate::tuning::{Pace, SLOW_FACTOR};
 use anyhow::{Context, anyhow};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
@@ -88,9 +87,6 @@ pub struct S3Store {
     credentials: Credentials,
     retry: RetryPolicy,
     append: AppendMode,
-    /// Expected transfer times from the link (`mount`/`run` with `--s3-*`);
-    /// `None`: transfers are bounded like server operations.
-    pace: Option<Pace>,
 }
 
 /// TCP keepalive probes on idle connections: notices connections silently
@@ -105,12 +101,12 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// and is retried. Judgement call: a healthy setup takes well under a second.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// One attempt of a request whose time the link does not predict — work on
-/// the server (LIST, DeleteObjects, copies, completion) or any request
-/// without `--s3-*` — is sent again after this. Judgement call: it must
-/// exceed the server's own think time; the slowest PATCH measured was ~30 s,
-/// on objects grown past 20 MB, which 16 MiB zones avoid (SPEC.md §11).
-const SERVER_TIMEOUT: Duration = Duration::from_secs(60);
+/// Longest wait for an answer before the attempt is retried: a fixed time up
+/// to the response headers, then the longest silence while reading the body.
+/// Judgement call: it must exceed the server's own think time; the slowest
+/// PATCH measured was ~30 s, on objects grown past 20 MB, which 16 MiB zones
+/// avoid (SPEC.md §11). Timeouts derived from the link failed (SPEC.md §12).
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl S3Store {
     pub fn bucket(&self) -> &str {
@@ -123,6 +119,7 @@ impl S3Store {
             .tcp_keepalive(TCP_KEEPALIVE)
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .http1_only()
             .user_agent(concat!("btrs3fs/", env!("CARGO_PKG_VERSION")));
         if let Some(proxy) = &transport.proxy {
@@ -146,16 +143,7 @@ impl S3Store {
             ),
             retry,
             append: AppendMode::Patch,
-            pace: None,
         })
-    }
-
-    /// Same client and connection pool, transfers timed from the link.
-    pub fn with_pace(&self, pace: Pace) -> Self {
-        Self {
-            pace: Some(pace),
-            ..self.clone()
-        }
     }
 
     /// Same client and connection pool with another way to append (from disk.json).
@@ -248,40 +236,17 @@ impl S3Store {
     }
 
     /// Runs `attempt` until it succeeds, fails fatally or the budget is spent.
-    async fn with_retries<T, F, Fut>(&self, what: &str, attempt: F) -> StoreResult<T>
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T, Attempt>>,
-    {
-        self.with_retries_timed(what, None, attempt).await
-    }
-
-    /// `with_retries` for a transfer the link predicts takes `expected`: an
-    /// attempt taking `SLOW_FACTOR` times longer is stalled and sent again
-    /// (SPEC.md §8); each new attempt may take longer by the backoff factor,
-    /// so a link that became slower still gets through within the budget.
-    async fn with_retries_timed<T, F, Fut>(
-        &self,
-        what: &str,
-        expected: Option<Duration>,
-        mut attempt: F,
-    ) -> StoreResult<T>
+    async fn with_retries<T, F, Fut>(&self, what: &str, mut attempt: F) -> StoreResult<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, Attempt>>,
     {
         let started = Instant::now();
         let mut delay = self.retry.initial_delay;
-        let mut limit = expected.map_or(SERVER_TIMEOUT, |e| e.mul_f64(SLOW_FACTOR));
         let mut tries = 0u32;
         loop {
             tries += 1;
-            // Not cut to what is left of the budget: a sliver would only fail.
-            let outcome = match tokio::time::timeout(limit, attempt()).await {
-                Ok(outcome) => outcome,
-                Err(_) => Err(Attempt::Retry(anyhow!("not done within {limit:?}"))),
-            };
-            match outcome {
+            match attempt().await {
                 Ok(v) => return Ok(v),
                 Err(Attempt::Fatal(e)) => return Err(e),
                 Err(Attempt::Retry(e)) => {
@@ -297,13 +262,11 @@ impl S3Store {
                     warn!("{what}: attempt {tries} failed ({e:#}), retrying in {wait:?}");
                     crate::stats::STATS.retries.inc();
                     tokio::time::sleep(wait).await;
-                    // Never past the budget: a larger pause or limit could not be used.
-                    let grow = |d: Duration| {
-                        Duration::try_from_secs_f64(d.as_secs_f64() * self.retry.backoff_factor)
-                            .map_or(self.retry.timeout, |d| d.min(self.retry.timeout))
-                    };
-                    delay = grow(delay);
-                    limit = grow(limit);
+                    // Never past the budget: a longer pause could not be waited out.
+                    delay = Duration::try_from_secs_f64(
+                        delay.as_secs_f64() * self.retry.backoff_factor,
+                    )
+                    .map_or(self.retry.timeout, |d| d.min(self.retry.timeout));
                 }
             }
         }
@@ -311,8 +274,7 @@ impl S3Store {
 
     pub async fn put(&self, key: &str, body: Body) -> StoreResult<()> {
         let url = self.object_url(key);
-        let expected = self.pace.map(|p| p.upload(body.len()));
-        self.with_retries_timed(&format!("PUT {key}"), expected, || async {
+        self.with_retries(&format!("PUT {key}"), || async {
             let resp = self
                 .send(reqwest::Method::PUT, &url, &[], Some(&body))
                 .await?;
@@ -433,8 +395,7 @@ impl S3Store {
         body: Body,
     ) -> StoreResult<Option<u64>> {
         let url = format!("{}?append&position={position}", self.object_url(key));
-        let expected = self.pace.map(|p| p.upload(body.len()));
-        self.with_retries_timed(&format!("APPEND {key} at {position}"), expected, || async {
+        self.with_retries(&format!("APPEND {key} at {position}"), || async {
             let resp = self
                 .send(reqwest::Method::PUT, &url, &[], Some(&body))
                 .await?;
@@ -470,8 +431,7 @@ impl S3Store {
         }
         let url = self.object_url(key);
         let range = format!("bytes {}-{}/*", offset, offset + body.len() - 1);
-        let expected = self.pace.map(|p| p.upload(body.len()));
-        self.with_retries_timed(&format!("PATCH {key} {range}"), expected, || async {
+        self.with_retries(&format!("PATCH {key} {range}"), || async {
             let headers = [("content-range", range.clone())];
             let resp = self
                 .send(reqwest::Method::PATCH, &url, &headers, Some(&body))
@@ -660,8 +620,7 @@ impl S3Store {
         }
         let url = self.object_url(key);
         let range = format!("bytes={}-{}", offset, offset + len - 1);
-        let expected = self.pace.map(|p| p.get(len));
-        self.with_retries_timed(&format!("GET {key} {range}"), expected, || async {
+        self.with_retries(&format!("GET {key} {range}"), || async {
             let headers = [("range", range.clone())];
             let resp = self
                 .send(reqwest::Method::GET, &url, &headers, None)
@@ -1077,37 +1036,6 @@ mod tests {
             "a%20b/c%2Bd/0000000002000000"
         );
         assert_eq!(encode_query("p/q r"), "p%2Fq%20r");
-    }
-
-    /// A client that never connects: for the retry loop alone.
-    fn offline() -> S3Store {
-        let creds = Creds {
-            endpoint: "https://s3.invalid".into(),
-            region: "r".into(),
-            bucket: "b".into(),
-            access_key: "a".into(),
-            secret_key: "s".into(),
-            allow_http: false,
-        };
-        S3Store::new(&creds, &Transport { proxy: None }, RetryPolicy::default()).unwrap()
-    }
-
-    #[tokio::test]
-    async fn stalled_attempts_are_sent_again_with_more_time() {
-        let s3 = offline();
-        // Predicted 10 ms: an attempt gets 40 ms, the next one 80 ms.
-        let expected = Some(Duration::from_millis(10));
-        let tries = std::sync::atomic::AtomicU32::new(0);
-        let got = s3
-            .with_retries_timed("GET k", expected, || async {
-                tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                // The link became slower than the margin allows.
-                tokio::time::sleep(Duration::from_millis(60)).await;
-                Ok::<_, Attempt>(7)
-            })
-            .await
-            .unwrap();
-        assert_eq!((got, tries.into_inner()), (7, 2));
     }
 
     #[tokio::test]

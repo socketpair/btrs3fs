@@ -375,10 +375,6 @@ fn serve_disk(
         cfg.zone_size
     );
     let disk = layout.dir();
-    let store = match (store, &tuning, link) {
-        (Store::S3(s), Some(t), Some(l)) => Store::S3(s.with_pace(l.pace(t))),
-        (store, ..) => store,
-    };
     let engine = rt.block_on(Engine::open(&cfg, layout, Arc::new(store)))?;
     let read_ahead = tuning.map_or(ReadAhead::DISABLED, |t| ReadAhead {
         window: t.unit,
