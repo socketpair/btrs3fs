@@ -624,17 +624,24 @@ fn cmd_mount(a: MountArgs, keep_stderr: bool) -> anyhow::Result<i32> {
         (_, Some(err)) => bail!("device server failed: {err}"),
         _ => bail!("device server exited unexpectedly, see `journalctl -t btrs3fs`"),
     };
-    wait_for_path(Path::new(&bdev), DEVICE_NODE_TIMEOUT)?;
-
-    let mounted = Process::new("mount")
-        .args(["-t", "btrfs", "-o", &options, &bdev])
-        .arg(&mountpoint)
-        .status()
-        .context("cannot run mount")?;
-    if !mounted.success() {
+    // From here on a failure must not leave the device server running.
+    let mounted = wait_for_path(Path::new(&bdev), DEVICE_NODE_TIMEOUT).and_then(|()| {
+        let status = Process::new("mount")
+            .args(["-t", "btrfs", "-o", &options, &bdev])
+            .arg(&mountpoint)
+            .status()
+            .context("cannot run mount")?;
+        ensure!(
+            status.success(),
+            "mount of {bdev} on {} failed",
+            mountpoint.display()
+        );
+        Ok(())
+    });
+    if let Err(e) = mounted {
         warn!("mounting {bdev} failed, stopping its server process {pid}");
         stop_process(pid);
-        bail!("mount of {bdev} on {} failed", mountpoint.display());
+        return Err(e);
     }
     info!(
         "{bdev} mounted on {} with {options}; server process {pid}",
