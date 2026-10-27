@@ -122,6 +122,10 @@
   .kv td:first-child { white-space: nowrap; }
   .kv td:last-child { text-align: right; padding-left: 12px; }
   .kv tr.bad td:last-child { color: var(--bad); font-weight: 600; }
+  /* Counters: a number never breaks; a long name wraps instead. */
+  #d-counters { grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); }
+  #d-counters .kv td:first-child { white-space: normal; }
+  #d-counters .kv td:last-child { white-space: nowrap; }
 
   .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
   .btn { background: var(--surface); color: var(--ink); border: 1px solid var(--rule); border-radius: 5px; padding: 6px 12px; cursor: pointer; }
@@ -233,6 +237,7 @@
   <h2>Uploads to S3</h2>
   <div class="hists" id="h-up"></div>
   <h2>Reads from S3</h2>
+  <p class="note" id="d-get-part"></p>
   <div class="hists" id="h-rd"></div>
   <div id="h-cat-wrap"><h2>Concatenation of segments</h2><div class="hists" id="h-cat"></div></div>
   <h2>Counters</h2>
@@ -507,6 +512,11 @@ function renderDetails(s) {
   $("h-up").innerHTML = hist("Upload size", s.upload_size) + hist("Upload time", s.upload_latency_ms) +
     hist("Zones uploaded per FLUSH", s.zones_per_flush);
   $("h-rd").innerHTML = hist("GET size", s.get_size) + hist("GET time", s.get_latency_ms);
+  $("d-get-part").innerHTML = s.get_part
+    ? `Reads are cut into GETs of at most <b>${bytes(s.get_part)}</b> run in parallel: S3 would return larger pieces, ` +
+      `but one GET streams only at the per-stream rate. The size is latency × read stream of the link given at mount; ` +
+      `read-ahead fetches windows of the same size.`
+    : "Reads are not cut into parts: no link characteristics were given.";
   const seg = s.append === "SEGMENTS";
   $("h-cat-wrap").hidden = !seg;
   if (seg) $("h-cat").innerHTML = hist("Concatenation time", s.compact_time_ms) + hist("Segments per concatenation", s.segments_per_compaction);

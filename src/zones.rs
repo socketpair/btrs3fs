@@ -1490,6 +1490,12 @@ impl Engine {
         self.uploads
     }
 
+    /// Part size large reads are split into for parallel GETs; `None` when
+    /// they are not split (no link given).
+    pub fn get_part(&self) -> Option<u64> {
+        (self.get_part != u64::MAX).then_some(self.get_part)
+    }
+
     /// Every zone for the zone map of the page (SPEC.md §9.3).
     pub fn zone_map(&self) -> ZoneMap {
         let n = self.zones.len();

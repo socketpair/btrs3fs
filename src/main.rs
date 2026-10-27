@@ -425,6 +425,7 @@ fn serve_disk(
                     dirty_zones,
                     zones,
                     uploads_limit: stats_engine.uploads_limit() as u64,
+                    get_part: stats_engine.get_part(),
                     read_only: snap_fs.read_only(),
                 })
             };
