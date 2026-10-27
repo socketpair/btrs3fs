@@ -310,6 +310,8 @@ pub struct Engine {
     compact_kick: Notify,
     /// A zone became metadata and needs its marker at once.
     meta_pending: std::sync::atomic::AtomicBool,
+    /// Wakes the marker loop of the compactor.
+    meta_kick: Notify,
 }
 
 impl Engine {
@@ -461,6 +463,7 @@ impl Engine {
             }),
             compact_kick: Notify::new(),
             meta_pending: std::sync::atomic::AtomicBool::new(false),
+            meta_kick: Notify::new(),
         };
         // Zones restored with several segments: concatenate them.
         for (zi, zone) in engine.zones.iter().enumerate() {
@@ -1212,8 +1215,13 @@ impl Engine {
         let mut busy = vec![false; self.zones.len()];
         // Bytes the running uploads were picked for (buffered at pick time).
         let mut in_flight = 0u64;
+        // After a failure no upload starts before this; running ones go on.
+        let mut paused_until: Option<tokio::time::Instant> = None;
         loop {
-            while running.len() < self.uploads {
+            if paused_until.is_some_and(|t| t <= tokio::time::Instant::now()) {
+                paused_until = None;
+            }
+            while paused_until.is_none() && running.len() < self.uploads {
                 let over = self.dirty_bytes().saturating_sub(in_flight) > self.dirty_limit;
                 let Some((zi, bytes, reason)) = self.background_pick(&busy, over) else {
                     break;
@@ -1223,22 +1231,19 @@ impl Engine {
                 let engine: &Engine = &self;
                 running.push(async move { (zi, bytes, engine.flush_zone(zi, reason).await) });
             }
-            if running.is_empty() {
-                // `notify_one` keeps a permit, so a kick sent meanwhile is not lost.
-                self.kick.notified().await;
-                continue;
-            }
             tokio::select! {
-                Some((zi, bytes, res)) = running.next() => {
+                Some((zi, bytes, res)) = running.next(), if !running.is_empty() => {
                     busy[zi] = false;
                     in_flight -= bytes;
                     if let Err(e) = res {
                         warn!("background flush of zone {zi} failed: {e}");
-                        tokio::time::sleep(BACKGROUND_RETRY_PAUSE).await;
+                        paused_until = Some(tokio::time::Instant::now() + BACKGROUND_RETRY_PAUSE);
                     }
                 }
-                // More data arrived: maybe room for another upload.
+                // More data arrived: maybe room for another upload. `notify_one`
+                // keeps a permit, so a kick sent meanwhile is not lost.
                 _ = self.kick.notified() => {}
+                _ = sleep_until_some(paused_until) => {}
             }
         }
     }
@@ -1405,55 +1410,66 @@ impl Engine {
     }
 
     /// Concatenates segments of SEGMENTS zones on the server (SPEC.md §5), up
-    /// to `COMPACT_PARALLELISM` zones at once, never one zone twice at once.
+    /// to `COMPACT_PARALLELISM` zones at once, never one zone twice at once,
+    /// and puts metadata markers. The two loops run side by side in this one
+    /// task: a marker PUT waits for the zone lock a concatenation may hold,
+    /// so one loop must never wait for it with the other's work unpolled.
     pub async fn compactor(self: Arc<Self>) {
         if !self.segments {
             return;
         }
+        tokio::join!(self.compact_loop(), self.marker_loop());
+    }
+
+    async fn compact_loop(&self) {
         let mut running = futures_util::stream::FuturesUnordered::new();
         let mut busy = vec![false; self.zones.len()];
         // One timer for the loop: a sleep made anew each turn would never
         // fire while concatenations keep finishing.
         let mut scan = tokio::time::interval(IDLE_SCAN);
         scan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // After a failure no concatenation starts before this; running ones go on.
+        let mut paused_until: Option<tokio::time::Instant> = None;
         loop {
-            if self.meta_pending.swap(false, Ordering::SeqCst) {
-                self.store_meta_markers().await;
+            if paused_until.is_some_and(|t| t <= tokio::time::Instant::now()) {
+                paused_until = None;
             }
-            while running.len() < COMPACT_PARALLELISM {
+            while paused_until.is_none() && running.len() < COMPACT_PARALLELISM {
                 let Some(zi) = self.next_compaction(&busy) else {
                     break;
                 };
                 busy[zi] = true;
-                let engine: &Engine = &self;
-                running.push(async move { (zi, engine.compact_zone(zi).await) });
-            }
-            if running.is_empty() {
-                tokio::select! {
-                    _ = self.compact_kick.notified() => {}
-                    _ = scan.tick() => {
-                        self.store_meta_markers().await;
-                        self.queue_idle();
-                    }
-                }
-                continue;
+                running.push(async move { (zi, self.compact_zone(zi).await) });
             }
             tokio::select! {
-                _ = scan.tick() => {
-                    self.store_meta_markers().await;
-                    self.queue_idle();
-                }
-                Some((zi, res)) = running.next() => {
+                _ = scan.tick() => self.queue_idle(),
+                Some((zi, res)) = running.next(), if !running.is_empty() => {
                     busy[zi] = false;
                     if let Err(e) = res {
                         STATS.compact_errors.inc();
                         STATS.err_compact.record(&e);
                         warn!("concatenation of zone {zi} failed: {e}");
-                        tokio::time::sleep(BACKGROUND_RETRY_PAUSE).await;
+                        paused_until = Some(tokio::time::Instant::now() + BACKGROUND_RETRY_PAUSE);
                     }
                 }
                 _ = self.compact_kick.notified() => {}
+                _ = sleep_until_some(paused_until) => {}
             }
+        }
+    }
+
+    /// Puts metadata markers when a zone becomes metadata and every
+    /// `IDLE_SCAN` (retrying failed PUTs).
+    async fn marker_loop(&self) {
+        let mut scan = tokio::time::interval(IDLE_SCAN);
+        scan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = self.meta_kick.notified() => {}
+                _ = scan.tick() => {}
+            }
+            self.meta_pending.store(false, Ordering::SeqCst);
+            self.store_meta_markers().await;
         }
     }
 
@@ -1579,7 +1595,7 @@ impl Engine {
     fn mark_meta_soon(&self) {
         if self.segments {
             self.meta_pending.store(true, Ordering::SeqCst);
-            self.compact_kick.notify_one();
+            self.meta_kick.notify_one();
         }
     }
 
@@ -1678,6 +1694,14 @@ impl Engine {
 }
 
 /// Zero-filled buffers totalling `len` bytes, without allocation.
+/// Sleeps until `t`; never returns for `None`.
+async fn sleep_until_some(t: Option<tokio::time::Instant>) {
+    match t {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
 pub fn zeros(len: u64) -> impl Iterator<Item = Bytes> {
     let mut left = len;
     std::iter::from_fn(move || {
@@ -1855,6 +1879,40 @@ mod tests {
         let e = segments_engine(store.clone()).await;
         assert_eq!(e.zones[2].state.lock().unwrap().kind, Kind::Unknown);
         assert!(store.get(marker).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn marker_waiting_for_a_zone_lock_does_not_stop_concatenation() {
+        let store = mem();
+        let e = Arc::new(segments_engine(store.clone()).await);
+        segment_writes(&e, 1, 1, 3).await;
+        // Zone 2 becomes metadata while its lock is held (a long upload).
+        e.dirty.fetch_add(B, Ordering::SeqCst);
+        e.write_reserved(2 * ZS, blk(1, 1), false, true).unwrap();
+        let held = e.zones[2].upload.lock().await;
+        let task = tokio::spawn(e.clone().compactor());
+        assert_eq!(e.compact_all(), 1);
+        wait_for("concatenation", || {
+            e.zones[1].state.lock().unwrap().objects.len() == 1
+        })
+        .await;
+        drop(held);
+        wait_for("metadata marker", || {
+            e.zones[2].state.lock().unwrap().meta_marker
+        })
+        .await;
+        task.abort();
+    }
+
+    /// Waits up to 5 s for `done`.
+    async fn wait_for(what: &str, done: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what} stalled"));
     }
 
     #[tokio::test]
