@@ -213,6 +213,10 @@ pub struct Creds {
     pub bucket: String,
     pub access_key: String,
     pub secret_key: String,
+    /// A plain `http://` endpoint must be allowed explicitly: without TLS
+    /// anyone on the path reads the data and can alter the disk image.
+    #[serde(default)]
+    pub allow_http: bool,
 }
 
 impl Creds {
@@ -221,10 +225,42 @@ impl Creds {
             .with_context(|| format!("cannot read credentials file {}", path.display()))?;
         let creds: Self = serde_json::from_slice(&data)
             .with_context(|| format!("cannot parse credentials file {}", path.display()))?;
-        if !creds.endpoint.starts_with("https://") && !creds.endpoint.starts_with("http://") {
-            bail!("endpoint must start with https:// or http://");
+        creds.check_endpoint()?;
+        if let Ok(meta) = std::fs::metadata(path) {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o077 != 0 {
+                log::warn!(
+                    "credentials file {} is readable by other users; chmod 600 it",
+                    path.display()
+                );
+            }
         }
         Ok(creds)
+    }
+
+    /// The endpoint is a bare `https://host[:port]` (or `http://` if allowed).
+    fn check_endpoint(&self) -> anyhow::Result<()> {
+        let url = reqwest::Url::parse(self.endpoint.trim_end_matches('/'))
+            .with_context(|| format!("invalid endpoint {:?}", self.endpoint))?;
+        match url.scheme() {
+            "https" => {}
+            "http" if self.allow_http => {}
+            "http" => bail!(
+                "endpoint {} is plain http: anyone on the way can read and alter the disk; \
+                 use https or set \"allow_http\": true in the credentials file",
+                self.endpoint
+            ),
+            other => bail!("endpoint scheme must be https, not {other}"),
+        }
+        ensure!(
+            url.host_str().is_some_and(|h| !h.is_empty())
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.username().is_empty(),
+            "endpoint must be just https://host[:port], got {:?}",
+            self.endpoint
+        );
+        Ok(())
     }
 }
 
@@ -274,6 +310,35 @@ pub fn parse_size(s: &str) -> anyhow::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoints() {
+        let check = |endpoint: &str, allow_http: bool| {
+            Creds {
+                endpoint: endpoint.into(),
+                region: "r".into(),
+                bucket: "b".into(),
+                access_key: "a".into(),
+                secret_key: "s".into(),
+                allow_http,
+            }
+            .check_endpoint()
+        };
+        assert!(check("https://storage.yandexcloud.net", false).is_ok());
+        assert!(check("https://s3.example:8443/", false).is_ok());
+        assert!(check("http://minio:9000", false).is_err()); // must be allowed
+        assert!(check("http://minio:9000", true).is_ok());
+        for bad in [
+            "storage.yandexcloud.net",
+            "ftp://host",
+            "https://",
+            "https://host/bucket",
+            "https://user:pw@host",
+            "https://ho st",
+        ] {
+            assert!(check(bad, true).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn default_config_is_valid() {
