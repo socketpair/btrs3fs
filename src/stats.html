@@ -554,7 +554,7 @@ function zoneFs(f) {
       `<div class="zlist"><table class="grid"><tr><th>path</th><th>size</th></tr>` +
       f.files.map(x => `<tr><td>${pathCell(x.path)}</td><td>${x.size === null ? "deleted" : bytes(x.size)}</td></tr>`).join("") +
       `</table></div>`;
-  } else if (g && g.kind.includes("data")) {
+  } else if (g && g.kind.split("+").includes("data")) {
     body += `<p class="note">No file data: what was written here is deleted and waits for btrfs to reset the zone.</p>`;
   }
   if (f.trees.length) {
