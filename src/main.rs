@@ -1063,8 +1063,14 @@ mod tests {
 
     #[test]
     fn options() {
-        assert_eq!(mount_options(None), "nosuid,nodev,noatime,lazytime,commit=300");
-        assert_eq!(mount_options(Some(" ")), "nosuid,nodev,noatime,lazytime,commit=300");
+        assert_eq!(
+            mount_options(None),
+            "nosuid,nodev,noatime,lazytime,commit=300"
+        );
+        assert_eq!(
+            mount_options(Some(" ")),
+            "nosuid,nodev,noatime,lazytime,commit=300"
+        );
         assert_eq!(
             mount_options(Some("compress=zstd")),
             "nosuid,nodev,noatime,lazytime,commit=300,compress=zstd"

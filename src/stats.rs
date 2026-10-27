@@ -719,6 +719,9 @@ pub fn serve_http(
                 let path = req.url().split('?').next().unwrap_or_default();
                 let post = *req.method() == tiny_http::Method::Post;
                 let (status, body, content_type) = match path {
+                    _ if !from_our_page(&req) => {
+                        (403, "forbidden\n".into(), "text/plain; charset=utf-8")
+                    }
                     // POST only: links and browser prefetch must not start actions.
                     p if post => match action(p.trim_start_matches('/')) {
                         Some(json) => (200, json, "application/json"),
@@ -745,6 +748,31 @@ pub fn serve_http(
         })?;
     info!("statistics on http://127.0.0.1:{port}/");
     Ok(())
+}
+
+/// Only pages and tools of this host may use the server, which runs as
+/// root: a `Host` that is not a loopback name is a page that rebound its DNS
+/// name to 127.0.0.1, an `Origin` that is not one another site's script or
+/// form (a POST needs no preflight). Any port: an SSH tunnel moves it. curl
+/// sends no `Origin`.
+fn from_our_page(req: &tiny_http::Request) -> bool {
+    let value = |name: &'static str| {
+        req.headers()
+            .iter()
+            .find(|h| h.field.equiv(name))
+            .map(|h| h.value.as_str())
+    };
+    value("Host").is_some_and(is_loopback_host)
+        && value("Origin").is_none_or(|o| o.strip_prefix("http://").is_some_and(is_loopback_host))
+}
+
+/// `127.0.0.1`, `localhost` or `[::1]`, with or without a port.
+fn is_loopback_host(host: &str) -> bool {
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if !name.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => host,
+    };
+    matches!(name, "127.0.0.1" | "localhost" | "[::1]")
 }
 
 fn header(name: &str, value: &str) -> tiny_http::Header {
@@ -873,18 +901,21 @@ mod tests {
             |name| (name == "compact").then(|| "{\"queued\":3}".to_string()),
         )
         .unwrap();
-        let send = |method: &str, path: &str| {
+        let ours = format!("127.0.0.1:{port}");
+        let request = |method: &str, path: &str, host: &str, origin: Option<&str>| {
             use std::io::{Read, Write};
             let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let origin = origin.map_or(String::new(), |o| format!("Origin: {o}\r\n"));
             write!(
                 s,
-                "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                "{method} {path} HTTP/1.1\r\nHost: {host}\r\n{origin}Content-Length: 0\r\nConnection: close\r\n\r\n"
             )
             .unwrap();
             let mut out = String::new();
             s.read_to_string(&mut out).unwrap();
             out
         };
+        let send = |method: &str, path: &str| request(method, path, &ours, None);
         let get = |path: &str| send("GET", path);
         let page = get("/");
         assert!(page.starts_with("HTTP/1.1 200") && page.contains("<html"));
@@ -896,5 +927,17 @@ mod tests {
         let posted = send("POST", "/compact");
         assert!(posted.starts_with("HTTP/1.1 200") && posted.ends_with("{\"queued\":3}"));
         assert!(send("POST", "/nope").starts_with("HTTP/1.1 404"));
+        // The page itself posts with its own origin; localhost works too.
+        let page_origin = format!("http://{ours}");
+        assert!(request("POST", "/compact", &ours, Some(&page_origin)).starts_with("HTTP/1.1 200"));
+        let localhost = format!("localhost:{port}");
+        assert!(request("GET", "/stats.json", &localhost, None).starts_with("HTTP/1.1 200"));
+        assert!(request("GET", "/", "localhost:8080", None).starts_with("HTTP/1.1 200")); // a tunnel
+        assert!(is_loopback_host("[::1]:9470") && is_loopback_host("localhost"));
+        assert!(!is_loopback_host("127.0.0.1.evil.example") && !is_loopback_host("evil:9470"));
+        // A rebound DNS name and another site's form are refused.
+        assert!(request("GET", "/stats.json", "evil.example:80", None).starts_with("HTTP/1.1 403"));
+        let evil = Some("http://evil.example");
+        assert!(request("POST", "/compact", &ours, evil).starts_with("HTTP/1.1 403"));
     }
 }
