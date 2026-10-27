@@ -575,13 +575,10 @@ impl S3Store {
                     .await?;
                 aborted += 1;
             }
-            match (
-                page.is_truncated,
-                page.next_key_marker,
-                page.next_upload_id_marker,
-            ) {
-                (true, Some(k), Some(i)) => markers = Some((k, i)),
-                _ => return Ok(aborted),
+            let next = page.next_key_marker.zip(page.next_upload_id_marker);
+            match next_page(page.is_truncated, next, &markers, prefix)? {
+                Some(m) => markers = Some(m),
+                None => return Ok(aborted),
             }
         }
     }
@@ -715,11 +712,33 @@ impl S3Store {
                 key: c.key,
                 size: c.size,
             }));
-            match (page.is_truncated, page.next_continuation_token) {
-                (true, Some(t)) => token = Some(t),
-                _ => return Ok(out),
+            match next_page(
+                page.is_truncated,
+                page.next_continuation_token,
+                &token,
+                prefix,
+            )? {
+                Some(t) => token = Some(t),
+                None => return Ok(out),
             }
         }
+    }
+}
+
+/// Where the next page of a listing starts: `None` at the end. A truncated
+/// page without a new place to go on from is an error: taking it as the end
+/// would lose objects (zones restored EMPTY and overwritten), repeating it
+/// would loop forever.
+fn next_page<T: PartialEq>(
+    truncated: bool,
+    next: Option<T>,
+    current: &Option<T>,
+    prefix: &str,
+) -> StoreResult<Option<T>> {
+    match next {
+        _ if !truncated => Ok(None),
+        Some(n) if current.as_ref() != Some(&n) => Ok(Some(n)),
+        _ => Err(anyhow!("listing of {prefix} is truncated with no new place to continue").into()),
     }
 }
 
@@ -965,6 +984,23 @@ mod tests {
             "a%20b/c%2Bd/0000000002000000"
         );
         assert_eq!(encode_query("p/q r"), "p%2Fq%20r");
+    }
+
+    #[test]
+    fn listing_pages() {
+        let none: Option<String> = None;
+        assert_eq!(next_page(false, None, &none, "p").unwrap(), None);
+        assert_eq!(
+            next_page(false, Some("t".to_string()), &none, "p").unwrap(),
+            None
+        );
+        assert_eq!(
+            next_page(true, Some("t".to_string()), &none, "p").unwrap(),
+            Some("t".to_string())
+        );
+        assert!(next_page(true, None, &none, "p").is_err()); // V1-style answer: no token
+        let at = Some("t".to_string());
+        assert!(next_page(true, Some("t".to_string()), &at, "p").is_err()); // the same page again
     }
 
     #[test]
