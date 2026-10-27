@@ -1003,7 +1003,8 @@ fn cmd_measure(a: DiskArgs) -> anyhow::Result<i32> {
     let creds = config::Creds::load(&a.creds)?;
     let s3 = S3Store::new(&creds, &a.transport, RetryPolicy::default())?;
     eprintln!("measuring the link to S3, about 20 s…");
-    let measured = runtime()?.block_on(measure::measure(&s3, &a.prefix))?;
+    let layout = Layout::new(&a.prefix)?;
+    let measured = runtime()?.block_on(measure::measure(&s3, layout.prefix()))?;
     println!("{}", measure::report(&measured));
     Ok(0)
 }

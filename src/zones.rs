@@ -390,7 +390,12 @@ impl Engine {
             let (objects, garbage) = cover(objects);
             let end = objects.last().map_or(0, |o| o.to);
             for g in garbage {
-                let key = layout.segment_key(start, g);
+                // PATCH: an empty zone object, the only object of its zone.
+                let key = if segments {
+                    layout.segment_key(start, g)
+                } else {
+                    layout.zone_key(start)
+                };
                 if g >= end {
                     warn!(
                         "zone {i}: {key} lies past the zone's data at {end:#x}, \
@@ -1203,7 +1208,7 @@ impl Engine {
 
     /// Buffered data writes may not take beyond: twice the soft limit.
     pub fn hard_limit(&self) -> u64 {
-        2 * self.dirty_limit
+        self.dirty_limit.saturating_mul(2)
     }
 
     /// Takes `len` bytes of buffer room for a write if it stays within the

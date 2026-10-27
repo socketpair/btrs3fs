@@ -345,6 +345,15 @@ impl Layout {
         let prefix = prefix.trim_end_matches('/');
         anyhow::ensure!(!prefix.is_empty(), "prefix must not be empty");
         anyhow::ensure!(!prefix.starts_with('/'), "prefix must not start with '/'");
+        // `.` and `..` are folded by URL parsing after signing (the signature
+        // then fails); empty parts and control characters make odd keys.
+        anyhow::ensure!(
+            prefix
+                .split('/')
+                .all(|part| !matches!(part, "" | "." | ".."))
+                && !prefix.chars().any(char::is_control),
+            "prefix {prefix:?} must not have empty, `.` or `..` parts or control characters"
+        );
         Ok(Self {
             prefix: prefix.to_string(),
         })
@@ -453,6 +462,14 @@ const META_SUFFIX: &str = ".meta";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefixes() {
+        assert!(Layout::new("disks/data/").is_ok());
+        for bad in ["", "/a", "a//b", "a/./b", "a/..", "a\nb"] {
+            assert!(Layout::new(bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn keys_of_the_disk_and_nested_disks() {

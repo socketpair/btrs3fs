@@ -142,10 +142,10 @@ derived: read window and GET part 2048 KiB, btrfs readahead 64 MiB, 30 parallel 
 |---|---|---|---|
 | `--size` | `disk_size` | — | Размер диска, кратен зоне. |
 | `--zone-size` | `zone_size` | `16M` | Размер зоны = наибольший объект. Степень двойки до 32M; btrfs требует ≥ 4M. Больше 16M не ставьте: Яндекс резко замедляет дозапись в объекты больше ~20 МБ. |
-| `--dirty-limit` | `dirty_limit_bytes` | `256M` | Несброшенные данные в RAM: сверх — выгрузка в фоне, при двукратном превышении запись ждёт. |
+| `--dirty-limit` | `dirty_limit_bytes` | `256M` | Несброшенные данные в RAM: сверх — выгрузка в фоне, при двукратном превышении запись ждёт. Не меньше размера зоны: иначе запись размером в зону зависала бы. |
 | `--retry-timeout-seconds` | `retry_timeout_seconds` | 60 | Сколько повторять запрос к S3 до ошибки. |
-| `--retry-initial-delay-ms` | `retry_initial_delay_ms` | 100 | Первая пауза между повторами. |
-| `--retry-backoff-factor` | `retry_backoff_factor` | 2.0 | Рост паузы. |
+| `--retry-initial-delay-ms` | `retry_initial_delay_ms` | 100 | Первая пауза между повторами, не меньше 1. |
+| `--retry-backoff-factor` | `retry_backoff_factor` | 2.0 | Рост паузы, не меньше 1; пауза не длиннее `--retry-timeout-seconds`. |
 | `--queues` | `nr_queues` | 4 | Очереди (потоки) устройства. |
 | — | `append` | определяет `create` | Как растут объекты зон: `PATCH` (Yandex), `PUT_APPEND` (Ceph RGW Append Object) или `SEGMENTS` (каждая выгрузка — новый объект `<зона>-<смещение>`, фоновая склейка на сервере). |
 | `--queue-depth` | `queue_depth` | 128 | Глубина очереди. |

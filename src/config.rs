@@ -173,15 +173,23 @@ impl DiskConfig {
             "too many zones: {} (at most {MAX_ZONES}; larger zones make room)",
             self.nr_zones()
         );
+        // A write as large as a zone (the largest request) must fit under
+        // twice the limit while the soft limit alone does not start an upload
+        // of open zones; a smaller limit hangs such writes (SPEC.md §5).
         ensure!(
-            self.dirty_limit_bytes >= BLOCK_SIZE,
-            "dirty_limit_bytes {} is less than one block",
-            self.dirty_limit_bytes
+            self.dirty_limit_bytes >= self.zone_size,
+            "dirty_limit_bytes {} is less than the zone size {}",
+            self.dirty_limit_bytes,
+            self.zone_size
         );
         ensure!(
-            self.retry_backoff_factor >= 1.0,
-            "retry_backoff_factor {} must be >= 1.0",
+            self.retry_backoff_factor.is_finite() && self.retry_backoff_factor >= 1.0,
+            "retry_backoff_factor {} must be a number >= 1",
             self.retry_backoff_factor
+        );
+        ensure!(
+            self.retry_initial_delay_ms >= 1,
+            "retry_initial_delay_ms must be at least 1"
         );
         ensure!(self.nr_queues >= 1, "nr_queues must be at least 1");
         ensure!(
@@ -309,6 +317,11 @@ pub fn parse_size(s: &str) -> anyhow::Result<u64> {
         bytes.fract() == 0.0,
         "size {s:?} is not a whole number of bytes"
     );
+    // 2^64 exactly: `u64::MAX as f64` rounds up to it.
+    ensure!(
+        bytes < 18_446_744_073_709_551_616.0,
+        "size {s:?} is too large"
+    );
     Ok(bytes as u64)
 }
 
@@ -317,10 +330,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn limits_and_retries_are_bounded() {
+        let zone = 16 << 20;
+        let ok = DiskConfig::new(1 << 30, zone);
+        assert!(ok.validate().is_ok());
+        let with = |f: &dyn Fn(&mut DiskConfig)| {
+            let mut c = ok.clone();
+            f(&mut c);
+            c.validate()
+        };
+        assert!(with(&|c| c.dirty_limit_bytes = zone - 4096).is_err()); // a zone-sized write would hang
+        assert!(with(&|c| c.retry_backoff_factor = f64::INFINITY).is_err());
+        assert!(with(&|c| c.retry_backoff_factor = f64::NAN).is_err());
+        assert!(with(&|c| c.retry_initial_delay_ms = 0).is_err());
+    }
+
+    #[test]
     fn zone_count_is_bounded() {
         let zone = 4 << 20;
         assert!(DiskConfig::new(MAX_ZONES * zone, zone).validate().is_ok());
-        assert!(DiskConfig::new((MAX_ZONES + 1) * zone, zone).validate().is_err());
+        assert!(
+            DiskConfig::new((MAX_ZONES + 1) * zone, zone)
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
@@ -411,5 +444,7 @@ mod tests {
         assert_eq!(parse_size("10GiB").unwrap(), 10 << 30);
         assert_eq!(parse_size("1.5k").unwrap(), 1536);
         assert!(parse_size("12X").is_err());
+        assert!(parse_size("20000000T").is_err()); // past 2^64
+        assert!(parse_size("99999999999999999999").is_err());
     }
 }

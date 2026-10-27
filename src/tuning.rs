@@ -154,7 +154,8 @@ pub fn parse_duration(s: &str) -> anyhow::Result<Duration> {
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid duration {s:?}"))?;
     anyhow::ensure!(v > 0.0 && v.is_finite(), "duration {s:?} must be positive");
-    Ok(Duration::from_secs_f64(v * scale))
+    Duration::try_from_secs_f64(v * scale)
+        .map_err(|_| anyhow::anyhow!("duration {s:?} is too large"))
 }
 
 #[cfg(test)]
@@ -206,5 +207,6 @@ mod tests {
         assert_eq!(parse_duration("0.5s").unwrap(), Duration::from_millis(500));
         assert!(parse_duration("36").is_err());
         assert!(parse_duration("0ms").is_err());
+        assert!(parse_duration("1e30s").is_err());
     }
 }

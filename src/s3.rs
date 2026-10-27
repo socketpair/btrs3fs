@@ -259,7 +259,11 @@ impl S3Store {
                     warn!("{what}: attempt {tries} failed ({e:#}), retrying in {wait:?}");
                     crate::stats::STATS.retries.inc();
                     tokio::time::sleep(wait).await;
-                    delay = delay.mul_f64(self.retry.backoff_factor);
+                    // Never past the budget: a larger pause could not be waited out.
+                    delay = Duration::try_from_secs_f64(
+                        delay.as_secs_f64() * self.retry.backoff_factor,
+                    )
+                    .map_or(self.retry.timeout, |d| d.min(self.retry.timeout));
                 }
             }
         }
@@ -419,6 +423,9 @@ impl S3Store {
 
     /// Yandex PATCH: `Content-Range: bytes a-b/*`.
     async fn patch_request(&self, key: &str, offset: u64, body: Body) -> StoreResult<()> {
+        if body.len() == 0 {
+            return Err(anyhow!("empty PATCH of {key}").into());
+        }
         let url = self.object_url(key);
         let range = format!("bytes {}-{}/*", offset, offset + body.len() - 1);
         self.with_retries(&format!("PATCH {key} {range}"), || async {
@@ -599,12 +606,15 @@ impl S3Store {
         let url = self.object_url(key);
         self.with_retries(&format!("GET {key}"), || async {
             let resp = self.send(reqwest::Method::GET, &url, &[], None).await?;
-            Ok(read_body(check(resp, key).await?, OBJECT_LIMIT).await?)
+            read_body(check(resp, key).await?, OBJECT_LIMIT).await
         })
         .await
     }
 
     pub async fn get_range(&self, key: &str, offset: u64, len: u64) -> StoreResult<Bytes> {
+        if len == 0 {
+            return Err(anyhow!("empty range of {key}").into());
+        }
         let url = self.object_url(key);
         let range = format!("bytes={}-{}", offset, offset + len - 1);
         self.with_retries(&format!("GET {key} {range}"), || async {
@@ -1033,7 +1043,10 @@ mod tests {
     #[tokio::test]
     async fn answers_are_bounded() {
         let answer = |n: usize| reqwest::Response::from(http::Response::new(vec![b'x'; n]));
-        assert_eq!(read_body(answer(10), 10).await.ok().map(|b| b.len()), Some(10));
+        assert_eq!(
+            read_body(answer(10), 10).await.ok().map(|b| b.len()),
+            Some(10)
+        );
         assert!(read_body(answer(11), 10).await.is_err());
         assert_eq!(read_text(answer(3), 10).await.ok().as_deref(), Some("xxx"));
     }
