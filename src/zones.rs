@@ -275,6 +275,17 @@ impl ZoneState {
     fn buffered(&self) -> u64 {
         self.data_end - self.flushed
     }
+
+    /// EMPTY with nothing stored or buffered: no object of the zone exists
+    /// (startup deleted any leftovers), so RESET has nothing to do.
+    fn is_clean(&self) -> bool {
+        !self.broken
+            && self.cond == Cond::Empty
+            && self.data_end == 0
+            && self.objects.is_empty()
+            && !self.marker
+            && !self.meta_marker
+    }
 }
 
 struct Zone {
@@ -1005,13 +1016,7 @@ impl Engine {
         let _upload = zone.upload.lock().await;
         let marker = {
             let mut st = zone.state.lock().unwrap();
-            if !st.broken
-                && st.cond == Cond::Empty
-                && st.data_end == 0
-                && st.objects.is_empty()
-                && !st.marker
-                && !st.meta_marker
-            {
+            if st.is_clean() {
                 return Ok(());
             }
             // A concatenation under way never completes now, even if the
@@ -1136,13 +1141,18 @@ impl Engine {
         for zi in 0..self.zones.len() {
             match deleted {
                 Ok(_) => self.clear_locked(zi),
+                // A clean zone had nothing to delete and stays usable: the
+                // kernel would not reset a zone it sees EMPTY.
+                Err(_) if self.zones[zi].state.lock().unwrap().is_clean() => {}
                 Err(_) => self.break_locked(zi),
             }
         }
         if deleted.is_err() {
             warn!("RESET_ALL failed; I/O to every zone is refused until it is reset");
         }
-        debug!("all zones reset, {} objects deleted", deleted?);
+        // Not inside `debug!`: its arguments are not evaluated when debug is off.
+        let deleted = deleted?;
+        debug!("all zones reset, {deleted} objects deleted");
         Ok(())
     }
 
@@ -2233,6 +2243,22 @@ mod tests {
         assert!(keys(&store, "t/").await.is_empty());
         segment_writes(&e, 3, 7, 1).await;
         assert_eq!(read(&e, 3 * ZS, B).await, blk(7, 1).to_vec());
+    }
+
+    #[tokio::test]
+    async fn failed_reset_all_breaks_only_zones_with_something() {
+        let store = mem();
+        let e = segments_engine(store.clone()).await;
+        segment_writes(&e, 1, 1, 2).await;
+        mem_store(&store).set_fail(true);
+        assert!(e.reset_all().await.is_err());
+        mem_store(&store).set_fail(false);
+        assert_eq!(e.report(1, 1)[0].cond, Cond::ImpOpen); // reset again by the kernel
+        assert!(e.write(ZS + 2 * B, blk(9, 1), false).is_err());
+        // An EMPTY zone the kernel will not reset stays usable.
+        assert_eq!(e.report(2, 1)[0].cond, Cond::Empty);
+        e.write(2 * ZS, blk(7, 1), false).unwrap();
+        assert_eq!(read(&e, 2 * ZS, B).await, blk(7, 1).to_vec());
     }
 
     #[tokio::test]
