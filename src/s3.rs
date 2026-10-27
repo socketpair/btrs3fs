@@ -443,7 +443,7 @@ impl S3Store {
         let url = format!("{url}?uploads");
         self.with_retries(&format!("POST {key}?uploads"), || async {
             let resp = self.send(reqwest::Method::POST, &url, &[], None).await?;
-            let xml = read_text(check(resp, key).await?, XML_LIMIT).await?;
+            let xml = check(resp, key).await?.text().await?;
             let r: InitiateResult = quick_xml::de::from_str(&xml).map_err(|e| {
                 Attempt::Fatal(anyhow!("cannot parse multipart upload answer: {e}").into())
             })?;
@@ -483,7 +483,7 @@ impl S3Store {
                         let resp = self
                             .send(reqwest::Method::PUT, &part_url, &headers, None)
                             .await?;
-                        let xml = read_text(check(resp, src).await?, XML_LIMIT).await?;
+                        let xml = check(resp, src).await?.text().await?;
                         body_error(&xml, dst)?;
                         let r: CopyPartResult = quick_xml::de::from_str(&xml).map_err(|e| {
                             Attempt::Fatal(anyhow!("cannot parse copy part answer: {e}").into())
@@ -529,7 +529,7 @@ impl S3Store {
                 let resp = self
                     .send(reqwest::Method::POST, &url, &headers, Some(&xml))
                     .await?;
-                let answer = read_text(check(resp, &p.dst).await?, XML_LIMIT).await?;
+                let answer = check(resp, &p.dst).await?.text().await?;
                 body_error(&answer, &p.dst)
             })
             .await;
@@ -566,7 +566,7 @@ impl S3Store {
             let page: UploadsResult = self
                 .with_retries(&format!("LIST UPLOADS {prefix}"), || async {
                     let resp = self.send(reqwest::Method::GET, &url, &[], None).await?;
-                    let xml = read_text(check(resp, prefix).await?, XML_LIMIT).await?;
+                    let xml = check(resp, prefix).await?.text().await?;
                     quick_xml::de::from_str(&xml).map_err(|e| {
                         Attempt::Fatal(anyhow!("cannot parse multipart uploads list: {e}").into())
                     })
@@ -606,7 +606,7 @@ impl S3Store {
         let url = self.object_url(key);
         self.with_retries(&format!("GET {key}"), || async {
             let resp = self.send(reqwest::Method::GET, &url, &[], None).await?;
-            read_body(check(resp, key).await?, OBJECT_LIMIT).await
+            Ok(check(resp, key).await?.bytes().await?)
         })
         .await
     }
@@ -676,7 +676,7 @@ impl S3Store {
             let resp = self
                 .send(reqwest::Method::POST, &url, &headers, Some(&body))
                 .await?;
-            let xml = read_text(check(resp, &keys[0]).await?, XML_LIMIT).await?;
+            let xml = check(resp, &keys[0]).await?.text().await?;
             let result: DeleteResult = quick_xml::de::from_str(&xml)
                 .map_err(|e| Attempt::Fatal(anyhow!("cannot parse delete response: {e}").into()))?;
             // Quiet mode lists only the keys that failed.
@@ -711,7 +711,7 @@ impl S3Store {
             let page: ListResult = self
                 .with_retries(&format!("LIST {prefix}"), || async {
                     let resp = self.send(reqwest::Method::GET, &url, &[], None).await?;
-                    let xml = read_text(check(resp, prefix).await?, XML_LIMIT).await?;
+                    let xml = check(resp, prefix).await?.text().await?;
                     quick_xml::de::from_str(&xml).map_err(|e| {
                         Attempt::Fatal(anyhow!("cannot parse list response: {e}").into())
                     })
@@ -806,15 +806,8 @@ fn delete_xml(keys: &[String]) -> String {
     xml
 }
 
-/// Largest XML answer read (listings of 1000 keys are ~300 KiB).
-const XML_LIMIT: u64 = 16 << 20;
-/// Largest whole object read: `disk.json`, probes; zones are at most 32 MiB.
-const OBJECT_LIMIT: u64 = 64 << 20;
-/// Largest error body kept to explain a failure.
-const ERROR_LIMIT: u64 = 64 << 10;
-
-/// Reads an answer body of at most `limit` bytes: a broken or hostile
-/// server streaming without end must not exhaust the daemon's memory.
+/// Reads a ranged GET answer of at most the `limit` bytes asked for: a
+/// server ignoring the range would otherwise send a whole object.
 async fn read_body(mut resp: reqwest::Response, limit: u64) -> Result<Bytes, Attempt> {
     let too_big =
         |n: u64| Attempt::Fatal(anyhow!("answer of {n} bytes, at most {limit} expected").into());
@@ -832,20 +825,13 @@ async fn read_body(mut resp: reqwest::Response, limit: u64) -> Result<Bytes, Att
     Ok(buf.freeze())
 }
 
-/// `read_body` as UTF-8 text.
-async fn read_text(resp: reqwest::Response, limit: u64) -> Result<String, Attempt> {
-    let body = read_body(resp, limit).await?;
-    String::from_utf8(body.into())
-        .map_err(|e| Attempt::Fatal(anyhow!("answer is not UTF-8: {e}").into()))
-}
-
 /// Maps the HTTP status to success, a retryable or a fatal error.
 async fn check(resp: reqwest::Response, key: &str) -> Result<reqwest::Response, Attempt> {
     let status = resp.status();
     if status.is_success() {
         return Ok(resp);
     }
-    let body = read_text(resp, ERROR_LIMIT).await.unwrap_or_default();
+    let body = resp.text().await.unwrap_or_default();
     Err(classify(status, &body, key))
 }
 
@@ -1048,7 +1034,6 @@ mod tests {
             Some(10)
         );
         assert!(read_body(answer(11), 10).await.is_err());
-        assert_eq!(read_text(answer(3), 10).await.ok().as_deref(), Some("xxx"));
     }
 
     #[test]

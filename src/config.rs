@@ -13,10 +13,8 @@ use std::path::Path;
 /// also the btrfs sector size and the page size on x86-64.
 pub const BLOCK_SIZE: u64 = 4096;
 
-/// Zones of one disk: every zone takes a few hundred bytes of RAM, and
-/// `disk.json` comes from the bucket — a bad one must not make the daemon
-/// allocate tens of GiB. 2^20 zones are 16 TiB with 16 MiB zones.
-pub const MAX_ZONES: u64 = 1 << 20;
+/// Zones of one disk: the kernel counts them in 32 bits.
+pub const MAX_ZONES: u64 = u32::MAX as u64;
 
 /// Most appends one S3 object may receive. Requirement of the task (taken
 /// from the Yandex Object Storage append limit as the user knows it; 5228
@@ -170,7 +168,7 @@ impl DiskConfig {
         );
         ensure!(
             self.nr_zones() <= MAX_ZONES,
-            "too many zones: {} (at most {MAX_ZONES}; larger zones make room)",
+            "too many zones: {} (at most {MAX_ZONES})",
             self.nr_zones()
         );
         // A write as large as a zone (the largest request) must fit under
