@@ -515,8 +515,9 @@ function renderDetails(s) {
   $("d-get-part").innerHTML = s.get_part
     ? `Reads are cut into GETs of at most <b>${bytes(s.get_part)}</b> run in parallel: S3 would return larger pieces, ` +
       `but one GET streams only at the per-stream rate. The size is latency × read stream of the link given at mount; ` +
-      `read-ahead fetches windows of the same size.`
-    : "Reads are not cut into parts: no link characteristics were given.";
+      `read-ahead fetches windows of the same size. Up to <b>${num(s.reads_limit)}</b> GETs run at once ` +
+      `(total read rate / rate of one such GET).`
+    : `Reads are not cut into parts: no link characteristics were given. Up to ${num(s.reads_limit)} GETs run at once.`;
   const seg = s.append === "SEGMENTS";
   $("h-cat-wrap").hidden = !seg;
   if (seg) $("h-cat").innerHTML = hist("Concatenation time", s.compact_time_ms) + hist("Segments per concatenation", s.segments_per_compaction);

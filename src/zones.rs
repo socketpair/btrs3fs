@@ -16,7 +16,7 @@ use crate::readahead::{ReadAhead, ReadCache};
 use crate::stats::{Reason, STATS, ZoneCounts};
 use crate::store::{Body, Layout, PendingConcat, Store, StoreError};
 use bytes::Bytes;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::StreamExt;
 use log::{debug, info, warn};
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,7 +26,8 @@ use tokio::sync::{Notify, Semaphore};
 
 /// S3 requests run at once without a link to tune for: uploads of the
 /// temporary `create` device and tests. Judgement call: enough to keep a link
-/// busy with zone-sized bodies, few enough not to hit S3 request rate limits. With a link, uploads follow it (SPEC.md §6.1).
+/// busy with zone-sized bodies, few enough not to hit S3 request rate limits.
+/// With a link, uploads and GETs follow it (SPEC.md §6.1).
 const S3_PARALLELISM: usize = 16;
 
 /// Shared zero-filled buffer for reads past the write pointer; a larger read
@@ -88,9 +89,6 @@ pub enum CompactWhy {
 /// Concatenations running at once. They copy on the server, so this only
 /// bounds the S3 request rate. Judgement call.
 const COMPACT_PARALLELISM: usize = 4;
-/// GETs one read keeps in flight per level (pieces of the plan, windows,
-/// objects of a window); parts of one object are bounded by its size.
-const READ_PARALLELISM: usize = 64;
 
 /// Pause of the background flusher after a failed upload. The upload itself
 /// already retried for retry_timeout_seconds; this only avoids a busy loop
@@ -317,6 +315,9 @@ pub struct Engine {
     /// `uploads` permits shared by every upload, whatever its reason
     /// (SPEC.md §5).
     upload_slots: Semaphore,
+    /// GETs at once, every read together (SPEC.md §6.1).
+    reads: usize,
+    get_slots: Semaphore,
     /// Store reads larger than this go out as parallel GETs of this size
     /// (SPEC.md §6.2).
     get_part: u64,
@@ -479,6 +480,8 @@ impl Engine {
             read_cache: None,
             uploads: S3_PARALLELISM,
             upload_slots: Semaphore::new(S3_PARALLELISM),
+            reads: S3_PARALLELISM,
+            get_slots: Semaphore::new(S3_PARALLELISM),
             get_part: u64::MAX,
             segments,
             compact_queue: Mutex::new(CompactQueue {
@@ -520,6 +523,13 @@ impl Engine {
     pub fn with_uploads(mut self, uploads: usize) -> Self {
         self.uploads = uploads.max(1);
         self.upload_slots = Semaphore::new(self.uploads);
+        self
+    }
+
+    /// GETs at once, every read together.
+    pub fn with_reads(mut self, reads: usize) -> Self {
+        self.reads = reads.max(1);
+        self.get_slots = Semaphore::new(self.reads);
         self
     }
 
@@ -788,8 +798,10 @@ impl Engine {
         }
     }
 
-    /// One GET, counted in the statistics.
+    /// One GET, counted in the statistics; waits for one of `reads` slots.
     async fn get(&self, key: &str, offset: u64, len: u64) -> ZResult<Bytes> {
+        // Never closed, so acquiring cannot fail.
+        let _slot = self.get_slots.acquire().await.unwrap();
         let started = Instant::now();
         let data = self
             .store
@@ -1651,6 +1663,11 @@ impl Engine {
         self.uploads
     }
 
+    /// GETs allowed at once.
+    pub fn reads_limit(&self) -> usize {
+        self.reads
+    }
+
     /// Part size large reads are split into for parallel GETs; `None` when
     /// they are not split (no link given).
     pub fn get_part(&self) -> Option<u64> {
@@ -1752,16 +1769,13 @@ impl Engine {
 }
 
 /// Zero-filled buffers totalling `len` bytes, without allocation.
-/// Runs `futures` up to `READ_PARALLELISM` at once and joins their buffers
-/// in order; the first error wins.
+/// Runs `futures` at once (each GET waits for a slot of `reads`) and joins
+/// their buffers in order; the first error wins.
 async fn in_order<F>(futures: Vec<F>) -> ZResult<Vec<Bytes>>
 where
     F: std::future::Future<Output = ZResult<Vec<Bytes>>>,
 {
-    let parts: Vec<Vec<Bytes>> = futures_util::stream::iter(futures)
-        .buffered(READ_PARALLELISM)
-        .try_collect()
-        .await?;
+    let parts = futures_util::future::try_join_all(futures).await?;
     Ok(parts.into_iter().flatten().collect())
 }
 

@@ -1,7 +1,7 @@
 //! Settings derived from the link to S3 (SPEC.md §6.1). The admin measures the
 //! link with `btrs3fs measure` and passes it to `mount`/`run`; the read window,
-//! the part size of large GETs, the btrfs readahead window and the number of
-//! parallel uploads all follow from it.
+//! the part size of large GETs, the btrfs readahead window, the numbers of
+//! parallel uploads and GETs and the request timeouts all follow from it.
 
 use std::fmt;
 use std::time::Duration;
@@ -29,6 +29,11 @@ const READAHEAD_MAX: u64 = 256 * MIB;
 /// a few zones serial; S3 was measured up to 64 at once (SPEC.md §12).
 const UPLOADS_MIN: usize = 4;
 const UPLOADS_MAX: usize = 64;
+
+/// A request may take this many times longer than the link predicts before
+/// it counts as stalled and is sent again (user decision: the margin of the
+/// btrfs readahead window).
+pub const SLOW_FACTOR: f64 = READAHEAD_FACTOR;
 
 /// Characteristics of the link to S3; rates are bytes per second.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -81,11 +86,45 @@ impl Link {
         let one_upload = zone_size as f64 / (latency + zone_size as f64 / self.write_stream as f64);
         let uploads = ((self.write_total as f64 / one_upload).ceil() as usize)
             .clamp(UPLOADS_MIN, UPLOADS_MAX);
+        // The same for GETs of one unit (user decision).
+        let one_get = unit as f64 / (latency + unit as f64 / self.read_stream as f64);
+        let reads = ((self.read_total as f64 / one_get).ceil() as usize).max(1);
         Tuning {
             unit,
             fs_readahead,
             uploads,
+            reads,
         }
+    }
+
+    /// Expected request times with every parallel request running.
+    pub fn pace(&self, t: &Tuning) -> Pace {
+        Pace {
+            latency: self.latency,
+            get_rate: (self.read_stream as f64).min(self.read_total as f64 / t.reads as f64),
+            upload_rate: (self.write_stream as f64).min(self.write_total as f64 / t.uploads as f64),
+        }
+    }
+}
+
+/// How long a request of a given size should take on the link, every
+/// parallel request running: what request timeouts are derived from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pace {
+    pub latency: Duration,
+    /// Bytes per second of one GET.
+    pub get_rate: f64,
+    /// Bytes per second of one upload.
+    pub upload_rate: f64,
+}
+
+impl Pace {
+    pub fn get(&self, bytes: u64) -> Duration {
+        self.latency + Duration::from_secs_f64(bytes as f64 / self.get_rate)
+    }
+
+    pub fn upload(&self, bytes: u64) -> Duration {
+        self.latency + Duration::from_secs_f64(bytes as f64 / self.upload_rate)
     }
 }
 
@@ -115,6 +154,8 @@ pub struct Tuning {
     pub fs_readahead: u64,
     /// Zones uploaded at once by FLUSH and the background flusher.
     pub uploads: usize,
+    /// GETs at once, every read together.
+    pub reads: usize,
 }
 
 impl fmt::Display for Tuning {
@@ -123,10 +164,12 @@ impl fmt::Display for Tuning {
             f,
             "read window and GET part {} KiB (latency × read stream), \
              btrfs readahead {} MiB ({READAHEAD_FACTOR} × latency × total read), \
-             {} parallel uploads (total write / one zone upload)",
+             {} parallel uploads (total write / one zone upload), \
+             {} parallel GETs (total read / one GET of the window)",
             self.unit / KIB,
             self.fs_readahead / MIB,
-            self.uploads
+            self.uploads,
+            self.reads
         )
     }
 }
@@ -170,6 +213,14 @@ mod tests {
         let t = Link::YANDEX_CLOUD.tuning(ZONE);
         assert_eq!((t.unit, t.fs_readahead), (2 * MIB, 64 * MIB));
         assert!((16..=64).contains(&t.uploads), "{t:?}");
+        // Alone 2 MiB take 32 ms + 35 ms, ~30 MiB/s: 564 MiB/s want 19 GETs.
+        assert_eq!(t.reads, 19);
+        // 19 GETs share 564 MiB/s: 2 MiB take 32 ms + 67 ms.
+        let pace = Link::YANDEX_CLOUD.pace(&t);
+        assert!(
+            (pace.get(2 * MIB).as_millis() as u64).abs_diff(99) <= 2,
+            "{pace:?}"
+        );
 
         // The laptop over the internet.
         let laptop = Link {
@@ -182,6 +233,10 @@ mod tests {
         let t = laptop.tuning(ZONE);
         assert_eq!((t.unit, t.fs_readahead), (128 * KIB, 4 * MIB));
         assert!((4..=16).contains(&t.uploads), "{t:?}");
+        assert!((5..=20).contains(&t.reads), "{t:?}");
+        // 13 uploads share 36 MiB/s, ~2.8 MiB/s each: a zone takes ~5.8 s.
+        let zone = laptop.pace(&t).upload(16 * MIB).as_secs_f64();
+        assert!((5.5..6.5).contains(&zone), "{zone}");
     }
 
     #[test]

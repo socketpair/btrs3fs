@@ -375,6 +375,10 @@ fn serve_disk(
         cfg.zone_size
     );
     let disk = layout.dir();
+    let store = match (store, &tuning, link) {
+        (Store::S3(s), Some(t), Some(l)) => Store::S3(s.with_pace(l.pace(t))),
+        (store, ..) => store,
+    };
     let engine = rt.block_on(Engine::open(&cfg, layout, Arc::new(store)))?;
     let read_ahead = tuning.map_or(ReadAhead::DISABLED, |t| ReadAhead {
         window: t.unit,
@@ -382,7 +386,10 @@ fn serve_disk(
     });
     let mut engine = engine.with_read_ahead(read_ahead)?;
     if let Some(t) = tuning {
-        engine = engine.with_uploads(t.uploads).with_get_part(t.unit);
+        engine = engine
+            .with_uploads(t.uploads)
+            .with_reads(t.reads)
+            .with_get_part(t.unit);
     }
     let engine = Arc::new(engine);
     rt.spawn(engine.clone().background_flusher());
@@ -428,6 +435,7 @@ fn serve_disk(
                     zones,
                     uploads_limit: stats_engine.uploads_limit() as u64,
                     get_part: stats_engine.get_part(),
+                    reads_limit: stats_engine.reads_limit() as u64,
                     read_only: snap_fs.read_only(),
                 })
             };

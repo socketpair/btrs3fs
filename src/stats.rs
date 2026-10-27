@@ -543,6 +543,8 @@ pub struct Snapshot {
     pub uploads_limit: u64,
     /// Part size large reads are split into for parallel GETs (`null`: not split).
     pub get_part: Option<u64>,
+    /// GETs allowed at once.
+    pub reads_limit: u64,
     pub last_errors: LastErrors,
     /// Problems to point out, worst first.
     pub alerts: Vec<Alert>,
@@ -561,6 +563,7 @@ pub struct DiskState {
     pub zones: ZoneCounts,
     pub uploads_limit: u64,
     pub get_part: Option<u64>,
+    pub reads_limit: u64,
     /// The filesystem on the device is mounted read-only (`None`: not mounted).
     pub read_only: Option<bool>,
 }
@@ -630,6 +633,7 @@ impl Stats {
             writes_waiting_max: self.writes_waiting.max.load(Relaxed),
             uploads_limit: d.uploads_limit,
             get_part: d.get_part,
+            reads_limit: d.reads_limit,
             last_errors,
             alerts,
             disk: d.disk,
@@ -845,6 +849,7 @@ mod tests {
             zones: ZoneCounts::default(),
             uploads_limit: 4,
             get_part: Some(2 << 20),
+            reads_limit: 19,
             read_only,
         };
         let err = |secs_ago, text: &str| {
