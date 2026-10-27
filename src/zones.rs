@@ -16,7 +16,7 @@ use crate::readahead::{ReadAhead, ReadCache};
 use crate::stats::{Reason, STATS, ZoneCounts};
 use crate::store::{Body, Layout, PendingConcat, Store, StoreError};
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use log::{debug, info, warn};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -88,6 +88,9 @@ pub enum CompactWhy {
 /// Concatenations running at once. They copy on the server, so this only
 /// bounds the S3 request rate. Judgement call.
 const COMPACT_PARALLELISM: usize = 4;
+/// GETs one read keeps in flight per level (pieces of the plan, windows,
+/// objects of a window); parts of one object are bounded by its size.
+const READ_PARALLELISM: usize = 64;
 
 /// Pause of the background flusher after a failed upload. The upload itself
 /// already retried for retry_timeout_seconds; this only avoids a busy loop
@@ -657,47 +660,49 @@ impl Engine {
         Ok(pieces)
     }
 
-    /// Resolves a read plan into buffers (fetching store ranges).
+    /// Resolves a read plan into buffers (fetching store ranges), pieces in
+    /// parallel.
     pub async fn fetch(&self, pieces: Vec<Piece>) -> ZResult<Vec<Bytes>> {
-        let mut out = Vec::with_capacity(pieces.len());
-        for p in pieces {
-            match p {
-                Piece::Store {
-                    key,
-                    offset,
-                    len,
-                    zone_offset,
-                    zone,
-                    generation,
-                    flushed,
-                } => match &self.read_cache {
-                    // Only small reads, and only windows wholly stored: they never change.
-                    Some(c)
-                        if len < c.window()
-                            && (zone_offset + len).next_multiple_of(c.window()) <= flushed =>
-                    {
-                        self.read_windows(c, (zone, generation), zone_offset, len, &mut out)
-                            .await?
+        let futures: Vec<_> = pieces.into_iter().map(|p| self.fetch_piece(p)).collect();
+        in_order(futures).await
+    }
+
+    async fn fetch_piece(&self, piece: Piece) -> ZResult<Vec<Bytes>> {
+        match piece {
+            Piece::Store {
+                key,
+                offset,
+                len,
+                zone_offset,
+                zone,
+                generation,
+                flushed,
+            } => match &self.read_cache {
+                // Only small reads, and only windows wholly stored: they never change.
+                Some(c)
+                    if len < c.window()
+                        && (zone_offset + len).next_multiple_of(c.window()) <= flushed =>
+                {
+                    self.read_windows(c, (zone, generation), zone_offset, len)
+                        .await
+                }
+                _ => match self.get_parts(&key, offset, len).await {
+                    // A segment concatenated and deleted meanwhile: plan anew.
+                    Err(ZoneError::Store(StoreError::NotFound(_))) if self.segments => {
+                        self.read_stored(zone, zone_offset, len).await
                     }
-                    _ => match self.get_parts(&key, offset, len).await {
-                        // A segment concatenated and deleted meanwhile: plan anew.
-                        Err(ZoneError::Store(StoreError::NotFound(_))) if self.segments => {
-                            out.extend(self.read_stored(zone, zone_offset, len).await?)
-                        }
-                        got => out.extend(got?),
-                    },
+                    got => got,
                 },
-                Piece::Mem(b) => {
-                    STATS.read_from_ram.add(b.len() as u64);
-                    out.push(b);
-                }
-                Piece::Zero(len) => {
-                    STATS.read_zeros.add(len);
-                    out.extend(zeros(len));
-                }
+            },
+            Piece::Mem(b) => {
+                STATS.read_from_ram.add(b.len() as u64);
+                Ok(vec![b])
+            }
+            Piece::Zero(len) => {
+                STATS.read_zeros.add(len);
+                Ok(zeros(len).collect())
             }
         }
-        Ok(out)
     }
 
     /// `[offset, offset + len)` of an object as parallel GETs of `get_part`.
@@ -731,19 +736,12 @@ impl Engine {
                     })
                     .collect()
             };
-            let mut out = Vec::new();
-            let mut fetched = Ok(());
-            for (key, offset, n) in &parts {
-                match self.get_parts(key, *offset, *n).await {
-                    Ok(got) => out.extend(got),
-                    Err(e) => {
-                        fetched = Err(e);
-                        break;
-                    }
-                }
-            }
-            match fetched {
-                Ok(()) => return Ok(out),
+            let futures: Vec<_> = parts
+                .iter()
+                .map(|(key, offset, n)| self.get_parts(key, *offset, *n))
+                .collect();
+            match in_order(futures).await {
+                Ok(out) => return Ok(out),
                 // Concatenated meanwhile: the objects changed, plan anew. The
                 // same plan failing twice is a real error.
                 Err(ZoneError::Store(StoreError::NotFound(_)))
@@ -795,36 +793,37 @@ impl Engine {
         (zone, generation): (usize, u64),
         offset: u64,
         len: u64,
-        out: &mut Vec<Bytes>,
-    ) -> ZResult<()> {
+    ) -> ZResult<Vec<Bytes>> {
         let w = cache.window();
         let end = offset + len;
-        for wi in offset / w..end.div_ceil(w) {
-            let start = wi * w;
-            let slot = cache.slot((zone, generation, wi));
-            let mut fetched = false;
-            let data = slot
-                .get_or_try_init(|| {
-                    fetched = true;
-                    async move {
-                        let parts = self.read_stored(zone, start, w).await?;
-                        Ok::<_, ZoneError>(match parts.as_slice() {
-                            [one] => one.clone(),
-                            _ => Bytes::from(parts.concat()),
-                        })
-                    }
-                })
-                .await?;
-            let (from, to) = (offset.max(start) - start, end.min(start + w) - start);
-            out.push(data.slice(from as usize..to as usize));
-            if fetched {
-                STATS.read_ahead_misses.inc();
-            } else {
-                STATS.read_ahead_hits.inc();
-                STATS.read_from_cache.add(to - from);
-            }
-        }
-        Ok(())
+        let windows: Vec<_> = (offset / w..end.div_ceil(w))
+            .map(|wi| async move {
+                let start = wi * w;
+                let slot = cache.slot((zone, generation, wi));
+                let mut fetched = false;
+                let data = slot
+                    .get_or_try_init(|| {
+                        fetched = true;
+                        async move {
+                            let parts = self.read_stored(zone, start, w).await?;
+                            Ok::<_, ZoneError>(match parts.as_slice() {
+                                [one] => one.clone(),
+                                _ => Bytes::from(parts.concat()),
+                            })
+                        }
+                    })
+                    .await?;
+                let (from, to) = (offset.max(start) - start, end.min(start + w) - start);
+                if fetched {
+                    STATS.read_ahead_misses.inc();
+                } else {
+                    STATS.read_ahead_hits.inc();
+                    STATS.read_from_cache.add(to - from);
+                }
+                Ok(vec![data.slice(from as usize..to as usize)])
+            })
+            .collect();
+        in_order(windows).await
     }
 
     /// Uploads buffered data of one zone. Returns once everything that was
@@ -1715,6 +1714,19 @@ impl Engine {
 }
 
 /// Zero-filled buffers totalling `len` bytes, without allocation.
+/// Runs `futures` up to `READ_PARALLELISM` at once and joins their buffers
+/// in order; the first error wins.
+async fn in_order<F>(futures: Vec<F>) -> ZResult<Vec<Bytes>>
+where
+    F: std::future::Future<Output = ZResult<Vec<Bytes>>>,
+{
+    let parts: Vec<Vec<Bytes>> = futures_util::stream::iter(futures)
+        .buffered(READ_PARALLELISM)
+        .try_collect()
+        .await?;
+    Ok(parts.into_iter().flatten().collect())
+}
+
 /// Sleeps until `t`; never returns for `None`.
 async fn sleep_until_some(t: Option<tokio::time::Instant>) {
     match t {
