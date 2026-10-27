@@ -830,6 +830,17 @@ fn classify(status: StatusCode, body: &str, key: &str) -> Attempt {
         StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT => {
             Attempt::Retry(anyhow!(detail))
         }
+        // S3 judged the transfer, not the request: the body stalled or was
+        // cut (AWS answers these with 400), or the clock is off for a few
+        // seconds after a sleep until NTP corrects it.
+        StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN
+            if matches!(
+                xml_tag(body, "Code").as_deref(),
+                Some("RequestTimeout" | "IncompleteBody" | "RequestTimeTooSkewed")
+            ) =>
+        {
+            Attempt::Retry(anyhow!(detail))
+        }
         // 400 without an S3 error code comes from a balancer or proxy in
         // front of S3, not from S3 judging the request: Selectel answered so
         // to requests cut off when the route changed (SPEC.md §11). Our
@@ -1116,6 +1127,12 @@ mod tests {
         assert!(retried(408, "<html>408 Request Time-out</html>"));
         assert!(retried(503, ""));
         assert!(!retried(403, "<Error><Code>AccessDenied</Code></Error>"));
+        assert!(retried(400, "<Error><Code>RequestTimeout</Code></Error>"));
+        assert!(retried(400, "<Error><Code>IncompleteBody</Code></Error>"));
+        assert!(retried(
+            403,
+            "<Error><Code>RequestTimeTooSkewed</Code></Error>"
+        ));
     }
 
     #[test]
