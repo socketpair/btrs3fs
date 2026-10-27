@@ -112,7 +112,21 @@
   .filter .btn { padding: 3px 10px; font-size: 13px; }
   .filter .btn[aria-checked="true"] { border-color: var(--flow); color: var(--flow); font-weight: 600; }
   #zmap-wrap { position: relative; margin-top: 10px; }
-  #zmap { display: block; width: 100%; cursor: crosshair; }
+  #zmap { display: block; width: 100%; cursor: pointer; }
+  /* Zone details: one panel under the map; the strip repeats the clicked cell, stretched. */
+  #zinfo { margin-top: 12px; }
+  .zbar { position: relative; height: 18px; margin: 10px 0 6px; background: var(--z-empty); border-radius: 3px; overflow: hidden; }
+  .zbar i { position: absolute; top: 0; bottom: 0; }
+  .zbar i + i { border-left: 1px solid var(--surface); }
+  .zbar .ram { background: var(--bad); opacity: .6; }
+  .zbar .faint { background: var(--z-full-faint); }
+  .zcols { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 8px 28px; margin-top: 14px; }
+  .zcols h3 { font-size: 14px; font-weight: 600; margin: 0 0 6px; }
+  .zcols h4 { font-size: 13px; font-weight: 600; margin: 14px 0 0; }
+  .zlist { max-height: 420px; overflow: auto; margin-top: 6px; border: 1px solid var(--rule); border-radius: 4px; }
+  .zlist table.grid th { position: sticky; top: 0; background: var(--surface); }
+  .zlist table.grid td:first-child { white-space: normal; overflow-wrap: anywhere; }
+  .zlist .dir { color: var(--muted); }
   #ztip { position: absolute; pointer-events: none; background: var(--ink); color: var(--surface); font-size: 12px;
           padding: 6px 8px; border-radius: 4px; white-space: nowrap; display: none; z-index: 2; }
 
@@ -206,10 +220,11 @@
       <button class="btn" data-act="compact" id="btn-compact">Concatenate fragmented zones</button>
     </div>
     <p class="note">One cell per zone in disk order, left to right; partly written zones fill from the bottom.
-      Hover a cell for its details; the switch above dims all zones but data or metadata ones. “Upload buffered data” stores everything held in RAM now but does not commit
+      Hover a cell for a summary, click it for what the zone holds — below the map; the switch above dims all zones but data or metadata ones. “Upload buffered data” stores everything held in RAM now but does not commit
       btrfs — use “Commit the filesystem” on the btrfs tab for that. “Concatenate fragmented zones” merges the S3
       objects of every zone that has more than one.</p>
   </div>
+  <div class="panel" id="zinfo" hidden></div>
 </section>
 
 <section id="tab-btrfs" hidden>
@@ -387,7 +402,7 @@ function legend(z, map) {
       item("frag", "", `fragmented: ${num(z.fragmented)}, at most ${num(z.max_objects)} S3 objects in one`) : "");
 }
 
-let zmap = null, zgeom = null, zkind = "";
+let zmap = null, zgeom = null, zkind = "", zsel = null;
 const KIND = { d: "data", m: "metadata" };
 const kindOf = i => zmap.kind[i] === "m" ? "m" : "d";
 for (const b of document.querySelectorAll("[data-kind]")) b.onclick = () => {
@@ -445,16 +460,124 @@ function drawZones() {
     }
   }
   g.globalAlpha = 1;
+  if (zsel !== null && zsel < n) {
+    g.strokeStyle = cssVar("--ink"); g.lineWidth = 2;
+    g.strokeRect((zsel % cols) * (cell + gap) - 1, Math.floor(zsel / cols) * (cell + gap) - 1, cell + 2, cell + 2);
+  }
   zgeom = { cell, gap, cols, n };
 }
-$("zmap").addEventListener("mousemove", ev => {
-  const tip = $("ztip");
-  if (!zmap || !zgeom) return;
+/* The zone under the pointer, or -1. */
+function zoneAt(ev) {
+  if (!zmap || !zgeom) return -1;
   const rect = $("zmap").getBoundingClientRect();
   const cx = ev.clientX - rect.left, cy = ev.clientY - rect.top;
   const step = zgeom.cell + zgeom.gap, colNo = Math.floor(cx / step);
   const i = Math.floor(cy / step) * zgeom.cols + colNo;
-  if (cx < 0 || colNo >= zgeom.cols || i < 0 || i >= zgeom.n) { tip.style.display = "none"; return; }
+  return cx < 0 || colNo >= zgeom.cols || i < 0 || i >= zgeom.n ? -1 : i;
+}
+$("zmap").addEventListener("click", ev => { const i = zoneAt(ev); if (i >= 0) showZone(i); });
+async function showZone(i) {
+  zsel = i;
+  drawZones();
+  const box = $("zinfo");
+  box.hidden = false;
+  box.innerHTML = `<div class="title">Zone ${num(i)}</div><p class="note">Reading what the zone holds…</p>`;
+  try {
+    const r = await fetch(`zone-${i}.json`, { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const z = await r.json();
+    if (zsel === i) box.innerHTML = zoneView(z.block, z.fs);
+  } catch (e) {
+    box.innerHTML = `<div class="title">Zone ${num(i)}</div><p class="note">Cannot read zone-${i}.json: ${esc(e.message)}. Click the cell again to retry.</p>`;
+  }
+}
+/* The clicked cell stretched along the zone: S3 objects, RAM, the unwritten rest. */
+function zoneBar(b) {
+  const pct = v => (v / b.size * 100).toFixed(3) + "%";
+  const color = { empty: "--z-empty", closed: "--z-closed", full: "--z-full" }[b.cond] || "--z-open";
+  const parts = b.objects.filter(o => o.to > o.from).map(o =>
+    `<i style="left:${pct(o.from)};width:${pct(o.to - o.from)};background:var(${color})" title="${esc(o.key)}"></i>`);
+  if (b.buffered) parts.push(`<i class="ram" style="left:${pct(b.stored)};width:${pct(b.buffered)}" title="in RAM"></i>`);
+  if (b.cond === "full" && b.written < b.size)
+    parts.push(`<i class="faint" style="left:${pct(b.written)};width:${pct(b.size - b.written)}" title="finished early: never written"></i>`);
+  const objects = b.objects.filter(o => o.to > o.from).length;
+  const said = [];
+  if (b.stored) said.push(`${bytes(b.stored)} in ${num(objects)} S3 object${objects === 1 ? "" : "s"}`);
+  if (b.buffered) said.push(`${bytes(b.buffered)} in RAM`);
+  if (b.written < b.size)
+    said.push(b.cond === "full" ? `${bytes(b.size - b.written)} never to be written (finished early)`
+      : `${bytes(b.size - b.written)} not written yet`);
+  if (!said.length) said.push("nothing written");
+  return `<div class="zbar" role="img" aria-label="${esc(said.join(", "))}">${parts.join("")}</div><p class="note">${said.join(", ")}.</p>`;
+}
+function zoneView(b, f) {
+  return `<div class="title">Zone ${num(b.index)}, at ${bytes(b.start)} on the disk</div>` + zoneBar(b) +
+    `<div class="zcols"><section>${zoneBlock(b)}</section><section>${zoneFs(f)}</section></div>`;
+}
+function zoneBlock(b) {
+  const markers = b.objects.filter(o => o.to === o.from);
+  const objects = b.objects.filter(o => o.to > o.from);
+  const list = objects.length
+    ? `<h4>S3 objects</h4><div class="zlist"><table class="grid"><tr><th>key</th><th>zone bytes</th></tr>` +
+      objects.map(o => `<tr><td>${esc(o.key)}</td><td>${bytes(o.from)} – ${bytes(o.to)}</td></tr>`).join("") + `</table></div>`
+    : "";
+  return `<h3>Block device</h3>` + kv([
+    ["condition", esc(b.cond)],
+    ["kind", esc(b.kind)],
+    ["write pointer", bytes(b.write_pointer)],
+    ["last write", b.secs_since_write === null ? "none since the daemon started" : `${span(b.secs_since_write)} ago`],
+    ["average interval between writes", b.write_interval_secs === null ? "–" : span(b.write_interval_secs)],
+    ["waiting for concatenation", b.compaction_queued ? "yes" : "no"],
+    ...(markers.length ? [["markers", markers.map(o => esc(o.key.slice(o.key.lastIndexOf(".")))).join(", ")]] : []),
+    ...(b.broken ? [["state", "a RESET failed: reads and writes fail until the next RESET", true]] : []),
+  ]) + list;
+}
+/* A path with its directory muted, so file names stand out in a long list. */
+function pathCell(p) {
+  const cut = p.lastIndexOf("/") + 1;
+  return `<span class="dir">${esc(p.slice(0, cut))}</span>${esc(p.slice(cut))}`;
+}
+function zoneFs(f) {
+  if (!f.mounted) return `<h3>btrfs</h3><p class="note">The filesystem is not mounted: mount the disk to see what it keeps here.</p>`;
+  const g = f.block_group;
+  let body = `<h3>btrfs</h3>`;
+  if (f.superblock) body += `<p>Superblock log: btrfs writes copies of its superblock here one after another and resets the zone when it fills up.</p>`;
+  if (!g && !f.superblock) body += `<p class="note">Free: btrfs has not allocated this zone.</p>`;
+  if (g) body += kv([
+    ["block group", `${esc(g.kind)}, ${esc(g.profile)}`],
+    ["logical addresses", `${bytes(g.logical)} – ${bytes(g.logical + g.length)}`],
+    ["used", g.used === null ? "–" : `${bytes(g.used)} of ${bytes(g.length)}`],
+  ]);
+  if (f.files.length) {
+    const total = f.files.reduce((a, x) => a + (x.size || 0), 0);
+    body += `<h4>${num(f.files.length)} file${f.files.length === 1 ? "" : "s"} with data in this zone, ${bytes(total)} in all</h4>` +
+      `<div class="zlist"><table class="grid"><tr><th>path</th><th>size</th></tr>` +
+      f.files.map(x => `<tr><td>${pathCell(x.path)}</td><td>${x.size === null ? "deleted" : bytes(x.size)}</td></tr>`).join("") +
+      `</table></div>`;
+  } else if (g && g.kind.includes("data")) {
+    body += `<p class="note">No file data: what was written here is deleted and waits for btrfs to reset the zone.</p>`;
+  }
+  if (f.trees.length) {
+    const byTree = new Map();
+    for (const t of f.trees) {
+      const row = byTree.get(t.tree) || { leaves: 0, nodes: 0 };
+      if (t.level) row.nodes += t.blocks; else row.leaves += t.blocks;
+      byTree.set(t.tree, row);
+    }
+    body += `<h4>Tree blocks</h4><table class="grid"><tr><th>tree</th><th>leaves</th><th>nodes</th></tr>` +
+      [...byTree].map(([tree, r]) => `<tr><td>${esc(tree)}</td><td>${num(r.leaves)}</td><td>${num(r.nodes)}</td></tr>`).join("") +
+      `</table>`;
+  }
+  if (f.unnamed) body += `<p class="note">${num(f.unnamed)} extents or inodes have no name: deleted since, or in a subvolume the mount does not reach.</p>`;
+  if (f.error) body += `<p class="note" style="color:var(--bad)">${esc(f.error)}</p>`;
+  return body;
+}
+$("zmap").addEventListener("mousemove", ev => {
+  const tip = $("ztip");
+  const i = zoneAt(ev);
+  if (i < 0) { tip.style.display = "none"; return; }
+  const rect = $("zmap").getBoundingClientRect();
+  const cx = ev.clientX - rect.left, cy = ev.clientY - rect.top;
   const b = zmap.block_size;
   const early = zmap.cond[i] === "f" && zmap.used[i] * zmap.block_size < zmap.zone_size;
   tip.innerHTML = `zone ${num(i)} at ${bytes(i * zmap.zone_size)} · ${early ? "full: finished early" : ZONE[zmap.cond[i]][0]}` +

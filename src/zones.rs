@@ -149,6 +149,41 @@ pub struct ZoneMap {
     pub buffered: Vec<u32>,
 }
 
+/// `/zone-<n>.json`, the block level part: one zone in full.
+#[derive(serde::Serialize)]
+pub struct ZoneDetail {
+    pub index: usize,
+    /// Byte offset on the device.
+    pub start: u64,
+    pub size: u64,
+    pub cond: &'static str,
+    pub write_pointer: u64,
+    /// Bytes written by the kernel (stored or in RAM).
+    pub written: u64,
+    /// Bytes confirmed by S3.
+    pub stored: u64,
+    /// Bytes in RAM, not in S3 yet.
+    pub buffered: u64,
+    pub kind: &'static str,
+    /// S3 objects serving the zone and its markers (`from = to = 0`).
+    pub objects: Vec<ObjectDetail>,
+    /// Since the last write; `None`: not written since the daemon started.
+    pub secs_since_write: Option<f64>,
+    /// Average interval between writes.
+    pub write_interval_secs: Option<f64>,
+    pub compaction_queued: bool,
+    /// A RESET failed: I/O is refused until one succeeds.
+    pub broken: bool,
+}
+
+#[derive(serde::Serialize)]
+pub struct ObjectDetail {
+    pub key: String,
+    /// Zone bytes `[from, to)` the object serves.
+    pub from: u64,
+    pub to: u64,
+}
+
 /// A part of a read request.
 #[derive(Debug)]
 pub enum Piece {
@@ -1672,6 +1707,60 @@ impl Engine {
     /// they are not split (no link given).
     pub fn get_part(&self) -> Option<u64> {
         (self.get_part != u64::MAX).then_some(self.get_part)
+    }
+
+    /// Everything the daemon knows of zone `zi`, for the zone map of the
+    /// page (SPEC.md §9.3); `None` past the last zone.
+    pub fn zone_detail(&self, zi: usize) -> Option<ZoneDetail> {
+        let zone = self.zones.get(zi)?;
+        let queued = self.compact_queue.lock().unwrap().queued[zi];
+        let st = zone.state.lock().unwrap();
+        let mut objects: Vec<ObjectDetail> = st
+            .objects
+            .iter()
+            .map(|o| ObjectDetail {
+                key: self.object_key(zone.start, o),
+                from: o.from,
+                to: o.to,
+            })
+            .collect();
+        let mut marker = |present: bool, key: String| {
+            if present {
+                objects.push(ObjectDetail {
+                    key,
+                    from: 0,
+                    to: 0,
+                });
+            }
+        };
+        marker(st.marker, self.layout.finished_key(zone.start));
+        marker(st.meta_marker, self.layout.meta_key(zone.start));
+        Some(ZoneDetail {
+            index: zi,
+            start: zone.start,
+            size: self.zone_size,
+            cond: match st.cond {
+                Cond::Empty => "empty",
+                Cond::ImpOpen => "open (implicitly)",
+                Cond::ExpOpen => "open (explicitly)",
+                Cond::Closed => "closed",
+                Cond::Full => "full",
+            },
+            write_pointer: st.wp,
+            written: st.data_end,
+            stored: st.flushed,
+            buffered: st.buffered(),
+            kind: match st.kind {
+                Kind::Unknown => "unknown (no request since the start)",
+                Kind::Data => "data",
+                Kind::Meta => "metadata",
+            },
+            objects,
+            secs_since_write: st.written.then(|| (boottime() - st.last_write).max(0.0)),
+            write_interval_secs: st.write_interval,
+            compaction_queued: queued,
+            broken: st.broken,
+        })
     }
 
     /// Every zone for the zone map of the page (SPEC.md §9.3).

@@ -1,4 +1,5 @@
 mod btrfs;
+mod btrfs_zone;
 mod config;
 mod device;
 mod ident;
@@ -463,7 +464,17 @@ fn serve_disk(
                 "stats.json" => serde_json::to_string(&snapshot()).ok(),
                 "btrfs.json" => serde_json::to_string(&json_fs.info()).ok(),
                 "zones.json" => serde_json::to_string(&map_engine.zone_map()).ok(),
-                _ => None,
+                // One zone in full, on a click on the zone map.
+                name => {
+                    let zi: usize = name
+                        .strip_prefix("zone-")?
+                        .strip_suffix(".json")?
+                        .parse()
+                        .ok()?;
+                    let block = map_engine.zone_detail(zi)?;
+                    let fs = json_fs.zone(block.start, block.size);
+                    serde_json::to_string(&serde_json::json!({ "block": block, "fs": fs })).ok()
+                }
             };
             match stats::serve_http(port, json, action) {
                 Ok(()) => {

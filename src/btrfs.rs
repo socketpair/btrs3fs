@@ -172,6 +172,14 @@ impl Btrfs {
         })
     }
 
+    /// What btrfs keeps in the zone at device bytes `[start, start + size)`.
+    pub fn zone(&self, start: u64, size: u64) -> crate::btrfs_zone::ZoneFs {
+        match self.find() {
+            Some(fs) => crate::btrfs_zone::zone_contents(&fs.mountpoint, start, size),
+            None => Default::default(),
+        }
+    }
+
     /// Whether the filesystem is mounted read-only; `None` when not mounted.
     pub fn read_only(&self) -> Option<bool> {
         mount_of(&format!("/dev/{}", self.device)).map(|(_, ro)| ro)
