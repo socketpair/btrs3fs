@@ -369,7 +369,9 @@ impl Engine {
                 continue;
             };
             anyhow::ensure!(
-                start + obj.size <= cfg.zone_size
+                start
+                    .checked_add(obj.size)
+                    .is_some_and(|end| end <= cfg.zone_size)
                     && start.is_multiple_of(BLOCK_SIZE)
                     && obj.size.is_multiple_of(BLOCK_SIZE),
                 "object {} has invalid size {}",
