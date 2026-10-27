@@ -710,29 +710,50 @@ impl Engine {
     }
 
     /// `[from, from + len)` of a zone's stored data, planned from its objects
-    /// as they are now.
+    /// as they are now; planned anew when a segment is concatenated and
+    /// deleted during the read.
     async fn read_stored(&self, zi: usize, from: u64, len: u64) -> ZResult<Vec<Bytes>> {
         let zone = &self.zones[zi];
-        let parts: Vec<(String, u64, u64)> = {
-            let st = zone.state.lock().unwrap();
-            let end = from + len;
-            if end > st.flushed {
-                return invalid(format!("zone {zi} was reset during a read"));
+        let mut previous = None;
+        loop {
+            let parts: Vec<(String, u64, u64)> = {
+                let st = zone.state.lock().unwrap();
+                let end = from + len;
+                if end > st.flushed {
+                    return invalid(format!("zone {zi} was reset during a read"));
+                }
+                st.objects
+                    .iter()
+                    .filter(|o| o.to > from && o.from < end)
+                    .map(|o| {
+                        let (a, b) = (from.max(o.from), end.min(o.to));
+                        (self.object_key(zone.start, o), a - o.start, b - a)
+                    })
+                    .collect()
+            };
+            let mut out = Vec::new();
+            let mut fetched = Ok(());
+            for (key, offset, n) in &parts {
+                match self.get_parts(key, *offset, *n).await {
+                    Ok(got) => out.extend(got),
+                    Err(e) => {
+                        fetched = Err(e);
+                        break;
+                    }
+                }
             }
-            st.objects
-                .iter()
-                .filter(|o| o.to > from && o.from < end)
-                .map(|o| {
-                    let (a, b) = (from.max(o.from), end.min(o.to));
-                    (self.object_key(zone.start, o), a - o.start, b - a)
-                })
-                .collect()
-        };
-        let mut out = Vec::new();
-        for (key, offset, n) in parts {
-            out.extend(self.get_parts(&key, offset, n).await?);
+            match fetched {
+                Ok(()) => return Ok(out),
+                // Concatenated meanwhile: the objects changed, plan anew. The
+                // same plan failing twice is a real error.
+                Err(ZoneError::Store(StoreError::NotFound(_)))
+                    if self.segments && previous.as_ref() != Some(&parts) =>
+                {
+                    previous = Some(parts)
+                }
+                Err(e) => return Err(e),
+            }
         }
-        Ok(out)
     }
 
     /// Key of a stored object of the zone starting at `zone_start`.
@@ -2031,6 +2052,34 @@ mod tests {
         e.compact_zone(0).await.unwrap(); // deletes two of them
         let got = e.fetch(pieces).await.unwrap().concat();
         assert_eq!(got, [blk(1, 1), blk(2, 1), blk(3, 1)].concat());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stored_reads_survive_concurrent_concatenation() {
+        let store = mem();
+        let e = Arc::new(segments_engine(store.clone()).await);
+        segment_writes(&e, 0, 0, 2).await;
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (e, done) = (e.clone(), done.clone());
+            tokio::spawn(async move {
+                let mut reads = 0;
+                while !done.load(Ordering::SeqCst) {
+                    let n = e.zones[0].state.lock().unwrap().flushed;
+                    let got = e.read_stored(0, 0, n).await.unwrap().concat();
+                    let want: Vec<u8> = (0..n / B).flat_map(|i| blk(i as u8, 1).to_vec()).collect();
+                    assert_eq!(got, want);
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        for i in 2..60 {
+            segment_writes(&e, 0, i, 1).await;
+            e.compact_zone(0).await.unwrap();
+        }
+        done.store(true, Ordering::SeqCst);
+        assert!(reader.await.unwrap() > 0);
     }
 
     // Crash points (SPEC.md §5): the daemon dies at a given step, a new
