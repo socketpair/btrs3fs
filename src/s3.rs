@@ -9,7 +9,7 @@ use crate::config::{
     AppendMode, Creds, DEFAULT_RETRY_BACKOFF, DEFAULT_RETRY_INITIAL_DELAY_MS,
     DEFAULT_RETRY_TIMEOUT_SECS, DiskConfig,
 };
-use crate::store::{Body, ConcatPart, ObjectInfo, StoreError, StoreResult};
+use crate::store::{Body, ConcatPart, Layout, ObjectInfo, StoreError, StoreResult};
 use anyhow::{Context, anyhow};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
@@ -543,7 +543,8 @@ impl S3Store {
 
     /// Aborts the multipart uploads under `prefix` (ListMultipartUploads),
     /// which only a crashed concatenation leaves; how many.
-    pub async fn abort_stale_concats(&self, prefix: &str) -> StoreResult<usize> {
+    pub async fn abort_stale_concats(&self, layout: &Layout) -> StoreResult<usize> {
+        let prefix = &layout.dir();
         let mut markers: Option<(String, String)> = None;
         let mut aborted = 0;
         loop {
@@ -564,7 +565,12 @@ impl S3Store {
                     })
                 })
                 .await?;
-            for u in &page.uploads {
+            // Only this disk's: another disk may be nested under the prefix.
+            for u in page
+                .uploads
+                .iter()
+                .filter(|u| layout.zone_of(&u.key).is_some())
+            {
                 self.abort_multipart(&u.key, &self.object_url(&u.key), &u.upload_id)
                     .await?;
                 aborted += 1;

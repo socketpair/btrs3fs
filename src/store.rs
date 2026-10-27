@@ -197,12 +197,12 @@ impl Store {
         }
     }
 
-    /// Aborts concatenations under `prefix` a crash left unfinished; how many.
-    pub async fn abort_stale_concats(&self, prefix: &str) -> StoreResult<usize> {
+    /// Aborts concatenations of the disk a crash left unfinished; how many.
+    pub async fn abort_stale_concats(&self, layout: &Layout) -> StoreResult<usize> {
         self.interleave().await;
         match self {
             Store::Mem(_) => Ok(0),
-            Store::S3(s) => s.abort_stale_concats(prefix).await,
+            Store::S3(s) => s.abort_stale_concats(layout).await,
         }
     }
 }
@@ -427,6 +427,24 @@ impl Layout {
     pub fn parse_finished_key(&self, key: &str) -> Option<u64> {
         self.parse_zone_key(key.strip_suffix(FINISHED_SUFFIX)?)
     }
+
+    /// Byte offset of the zone if `key` is any object of a zone of this
+    /// disk: what deleting by prefix may touch. Objects of another disk
+    /// nested under this prefix (`<prefix>/x/...`) are not.
+    pub fn zone_of(&self, key: &str) -> Option<u64> {
+        self.parse_zone_key(key)
+            .or_else(|| self.parse_segment_key(key).map(|(zone, _)| zone))
+            .or_else(|| self.parse_finished_key(key))
+            .or_else(|| self.parse_meta_key(key))
+    }
+
+    /// Prefixes of the disks this one would nest in: `a` and `a/b` for `a/b/c`.
+    pub fn ancestors(&self) -> Vec<&str> {
+        self.prefix
+            .match_indices('/')
+            .map(|(i, _)| &self.prefix[..i])
+            .collect()
+    }
 }
 
 const FINISHED_SUFFIX: &str = ".finished";
@@ -435,6 +453,29 @@ const META_SUFFIX: &str = ".meta";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keys_of_the_disk_and_nested_disks() {
+        let l = Layout::new("a/b").unwrap();
+        assert_eq!(l.ancestors(), ["a"]);
+        assert!(Layout::new("a").unwrap().ancestors().is_empty());
+        for key in [
+            "a/b/0000000001000000",
+            "a/b/0000000001000000-00001000",
+            "a/b/0000000001000000.finished",
+            "a/b/0000000001000000.meta",
+        ] {
+            assert_eq!(l.zone_of(key), Some(1 << 24), "{key}");
+        }
+        for key in [
+            "a/b/disk.json",
+            "a/b/c/0000000001000000",
+            "a/b/c/disk.json",
+            "a/b/0000000001000000-x",
+        ] {
+            assert_eq!(l.zone_of(key), None, "{key}");
+        }
+    }
 
     fn body(data: &[u8]) -> Body {
         Body::new(vec![Bytes::copy_from_slice(data)])

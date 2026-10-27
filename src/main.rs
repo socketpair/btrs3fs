@@ -893,6 +893,15 @@ fn cmd_create(a: CreateArgs) -> anyhow::Result<i32> {
     let s3 = S3Store::new(&creds, &a.disk.transport, RetryPolicy::from_config(&cfg))?;
     let rt = runtime()?;
     rt.block_on(async {
+        // Deleting by prefix would reach into a disk nested under another.
+        for parent in layout.ancestors() {
+            let key = Layout::new(parent)?.config_key();
+            match s3.get(&key).await {
+                Ok(_) => bail!("{key} exists: a disk cannot lie inside another disk's prefix"),
+                Err(store::StoreError::NotFound(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         let existing = s3.list(&layout.dir()).await?;
         if !existing.is_empty() {
             bail!(
@@ -997,11 +1006,23 @@ fn cmd_destroy(a: DestroyArgs) -> anyhow::Result<i32> {
     let creds = config::Creds::load(&a.disk.creds)?;
     let layout = Layout::new(&a.disk.prefix)?;
     let s3 = S3Store::new(&creds, &a.disk.transport, RetryPolicy::default())?;
-    let deleted = destroy_prefix(&runtime()?, &s3, &layout)?;
+    let rt = runtime()?;
+    match rt.block_on(s3.get(&layout.config_key())) {
+        Ok(_) => {}
+        Err(store::StoreError::NotFound(_)) => bail!(
+            "no disk at {}: {} not found",
+            layout.dir(),
+            layout.config_key()
+        ),
+        Err(e) => return Err(e.into()),
+    }
+    let deleted = destroy_prefix(&rt, &s3, &layout)?;
     info!("destroyed {}: {deleted} zone objects deleted", layout.dir());
     Ok(0)
 }
 
+/// Deletes the disk's zone objects, unfinished concatenations and config;
+/// disks nested under its prefix stay.
 fn destroy_prefix(rt: &Runtime, s3: &S3Store, layout: &Layout) -> anyhow::Result<usize> {
     rt.block_on(async {
         let config_key = layout.config_key();
@@ -1010,8 +1031,9 @@ fn destroy_prefix(rt: &Runtime, s3: &S3Store, layout: &Layout) -> anyhow::Result
             .await?
             .into_iter()
             .map(|o| o.key)
-            .filter(|k| *k != config_key)
+            .filter(|k| layout.zone_of(k).is_some())
             .collect();
+        s3.abort_stale_concats(layout).await?;
         s3.delete_many(&keys).await?;
         // The config goes last so an interrupted destroy can be repeated.
         s3.delete(&config_key).await?;

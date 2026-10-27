@@ -78,7 +78,7 @@ btrs3fs destroy --creds $C --prefix disks/data --yes               # удали�
 | `run --memory --size S` | Устройство в RAM без S3 — для экспериментов. |
 | `detach [--dev-id 0]` | Остановить несмонтированное устройство или убрать устройство с умершим демоном. |
 | `detach --force [--dev-id N]` | SIGKILL демону даже при смонтированной ФС — как выдернуть питание; дальше `umount <точка>`. |
-| `destroy --creds F --prefix P --yes` | Удалить все объекты диска. Сначала размонтируйте: команда этого не проверяет. |
+| `destroy --creds F --prefix P --yes` | Удалить все объекты диска (только его: диск под префиксом `P/…` не трогается). Нужен `P/disk.json`. Сначала размонтируйте: команда этого не проверяет. |
 | `measure --creds F --prefix P` | Измерить связь с S3 с этой машины и напечатать флаги `--s3-*` для `mount`/`run` (§5.1). Около 20 с, временные объекты под `P/measure-…/` удаляются. root не нужен. |
 
 `--dev-id`: устройство — `/dev/ublkb<N>`; у `mount` номер по умолчанию выбирает ядро, у `run` и
@@ -219,6 +219,7 @@ sudo systemctl enable --now btrs3fs@main
 |---|---|
 | `disk … not found, create it first` | Неверный `--prefix` или диск не создан. |
 | `prefix … already holds N objects` при `create` | Там уже диск: другой префикс или `destroy`. |
+| `… disk.json exists: a disk cannot lie inside another disk's prefix` при `create` | Префикс внутри другого диска: выберите префикс рядом, а не внутри. |
 | `… is already mounted` | Точка занята: `umount` или другая точка. |
 | `umount`: ФС занята | Закрыть файлы, выйти из каталога (`fuser -vm /mnt/data`). |
 | ФС «пропала», в журнале ядра ошибки ввода-вывода или `emergency shutdown` | Демон умер. `sudo btrs3fs umount <точка>`, затем `mount`. |

@@ -449,7 +449,7 @@ impl Engine {
             info!("deleted {} leftover objects", leftovers.len());
         }
         if segments {
-            let aborted = store.abort_stale_concats(&layout.dir()).await?;
+            let aborted = store.abort_stale_concats(&layout).await?;
             if aborted > 0 {
                 info!("aborted {aborted} unfinished concatenations");
             }
@@ -1058,7 +1058,7 @@ impl Engine {
         let rest: Vec<String> = listed?
             .into_iter()
             .map(|o| o.key)
-            .filter(|k| *k != first)
+            .filter(|k| *k != first && self.layout.zone_of(k) == Some(zone_start))
             .collect();
         match rest.as_slice() {
             [] => {}
@@ -1125,8 +1125,8 @@ impl Engine {
         }
     }
 
-    /// RESET_ALL: everything of the disk but its config, the objects at zone
-    /// starts first as in a RESET, in DeleteObjects batches of up to 1000
+    /// RESET_ALL: every zone object of the disk (not its config, not disks
+    /// nested under its prefix), the objects at zone starts first as in a RESET, in DeleteObjects batches of up to 1000
     /// keys instead of one DELETE per zone (SPEC.md §4).
     pub async fn reset_all(&self) -> ZResult<()> {
         // Every `upload` lock, so nothing creates an object between the
@@ -1157,12 +1157,11 @@ impl Engine {
     }
 
     async fn delete_all_objects(&self) -> ZResult<usize> {
-        let config_key = self.layout.config_key();
         let listed = self.store.list(&self.layout.dir()).await?;
         let (first, rest): (Vec<String>, Vec<String>) = listed
             .into_iter()
             .map(|o| o.key)
-            .filter(|k| *k != config_key)
+            .filter(|k| self.layout.zone_of(k).is_some())
             .partition(|k| {
                 if self.segments {
                     self.layout
@@ -2243,6 +2242,29 @@ mod tests {
         assert!(keys(&store, "t/").await.is_empty());
         segment_writes(&e, 3, 7, 1).await;
         assert_eq!(read(&e, 3 * ZS, B).await, blk(7, 1).to_vec());
+    }
+
+    #[tokio::test]
+    async fn resets_leave_disks_nested_under_the_prefix() {
+        let store = mem();
+        let e = segments_engine(store.clone()).await;
+        let nested = [
+            "t/x/disk.json",
+            "t/x/0000000000000000-00000000",
+            "t/0000000000100000x/0000000000000000",
+        ];
+        for k in nested {
+            store.put(k, Body::default()).await.unwrap();
+        }
+        segment_writes(&e, 1, 1, 2).await;
+        e.reset_zone(ZS).await.unwrap();
+        segment_writes(&e, 0, 1, 2).await;
+        e.reset_all().await.unwrap();
+        assert_eq!(keys(&store, "t/").await, {
+            let mut k = nested.to_vec();
+            k.sort();
+            k
+        });
     }
 
     #[tokio::test]
