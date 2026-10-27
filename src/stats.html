@@ -514,6 +514,13 @@ function zoneView(b, f) {
   return `<div class="title">Zone ${num(b.index)}, at ${bytes(b.start)} on the disk</div>` + zoneBar(b) +
     `<div class="zcols"><section>${zoneBlock(b)}</section><section>${zoneFs(f)}</section></div>`;
 }
+/* What a zone condition means (ZBC): "closed" is often taken for "finished". */
+const COND_MEANS = {
+  empty: "nothing written",
+  open: "being written now",
+  closed: "holds data but is not open now; a write at the pointer opens it again (zones restored at start are closed)",
+  full: "no more writes until a reset: written to the end or finished early",
+};
 function zoneBlock(b) {
   const markers = b.objects.filter(o => o.to === o.from);
   const objects = b.objects.filter(o => o.to > o.from);
@@ -522,7 +529,7 @@ function zoneBlock(b) {
       objects.map(o => `<tr><td>${esc(o.key)}</td><td>${bytes(o.from)} – ${bytes(o.to)}</td></tr>`).join("") + `</table></div>`
     : "";
   return `<h3>Block device</h3>` + kv([
-    ["condition", esc(b.cond)],
+    ["condition", `${esc(b.cond)}<br><span class="note">${COND_MEANS[b.cond.split(" ")[0]] || ""}</span>`],
     ["kind", esc(b.kind)],
     ["write pointer", bytes(b.write_pointer)],
     ["last write", b.secs_since_write === null ? "none since the daemon started" : `${span(b.secs_since_write)} ago`],
