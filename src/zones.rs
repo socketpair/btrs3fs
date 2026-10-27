@@ -18,7 +18,7 @@ use crate::store::{Body, Layout, PendingConcat, Store, StoreError};
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt};
 use log::{debug, info, warn};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -301,6 +301,9 @@ pub struct Engine {
     layout: Layout,
     store: Arc<Store>,
     zones: Vec<Zone>,
+    /// Zones with buffered data, so uploads need not scan every zone.
+    /// Changed only under the zone's `state` lock, taken after it.
+    buffered_zones: Mutex<BTreeSet<usize>>,
     dirty: AtomicU64,
     /// Signalled when buffered data shrinks.
     room: Notify,
@@ -469,6 +472,7 @@ impl Engine {
             layout,
             store,
             zones,
+            buffered_zones: Mutex::new(BTreeSet::new()),
             dirty: AtomicU64::new(0),
             room: Notify::new(),
             kick: Notify::new(),
@@ -596,6 +600,9 @@ impl Engine {
             }
             Cond::ImpOpen | Cond::ExpOpen => {}
             Cond::Full => unreachable!(),
+        }
+        if st.buffered() == 0 {
+            self.buffered_zones.lock().unwrap().insert(zi);
         }
         st.chunks.push_back(data);
         st.wp += len;
@@ -899,6 +906,9 @@ impl Engine {
             // Only the holder of `upload` removes chunks, so the front ones are ours.
             st.chunks.drain(..nr_chunks);
             st.flushed = from + len;
+            if st.buffered() == 0 {
+                self.buffered_zones.lock().unwrap().remove(&zi);
+            }
             let stored = Stored {
                 start: if self.segments { from } else { 0 },
                 from,
@@ -921,9 +931,7 @@ impl Engine {
 
     /// Uploads every zone with buffered data; fails if any upload failed.
     pub async fn flush_all(&self, reason: Reason) -> ZResult<()> {
-        let dirty: Vec<usize> = (0..self.zones.len())
-            .filter(|&i| self.zones[i].state.lock().unwrap().buffered() > 0)
-            .collect();
+        let dirty = self.buffered_zone_list();
         if matches!(reason, Reason::Flush) {
             STATS.zones_per_flush.record(dirty.len() as u64);
         }
@@ -1089,6 +1097,7 @@ impl Engine {
             st.flushed = 0;
             st.chunks.clear();
             st.objects.clear();
+            self.buffered_zones.lock().unwrap().remove(&zi);
             st.marker = false;
             st.kind = Kind::Unknown;
             st.meta_marker = false;
@@ -1114,6 +1123,7 @@ impl Engine {
             st.chunks.clear();
             st.data_end = st.flushed;
             st.objects.clear();
+            self.buffered_zones.lock().unwrap().remove(&zi);
             st.broken = true;
             (dropped, had_object)
         };
@@ -1289,7 +1299,8 @@ impl Engine {
     /// first and always; open ones only when `over_limit`, the largest buffer
     /// first.
     fn background_pick(&self, busy: &[bool], over_limit: bool) -> Option<(usize, u64, Reason)> {
-        (0..self.zones.len())
+        self.buffered_zone_list()
+            .into_iter()
             .filter(|&i| !busy[i])
             .filter_map(|i| {
                 let st = self.zones[i].state.lock().unwrap();
@@ -1721,6 +1732,17 @@ impl Engine {
     }
 
     /// Zones that still hold data not confirmed by the store: (zone, bytes).
+    /// Zones with buffered data now (a copy: the set is not held while
+    /// zones are locked).
+    fn buffered_zone_list(&self) -> Vec<usize> {
+        self.buffered_zones
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect()
+    }
+
     pub fn unflushed(&self) -> Vec<(usize, u64)> {
         (0..self.zones.len())
             .map(|i| (i, self.zones[i].state.lock().unwrap().buffered()))
@@ -2532,6 +2554,14 @@ mod tests {
                 }
             }
             models = shared.iter().map(|m| m.lock().unwrap().clone()).collect();
+            let with_data: Vec<usize> = (0..e.zones.len())
+                .filter(|&i| e.zones[i].state.lock().unwrap().buffered() > 0)
+                .collect();
+            assert_eq!(
+                e.buffered_zone_list(),
+                with_data,
+                "set of zones with buffered data"
+            );
             drop(e);
         }
         let ops: Vec<u64> = STRESS_OPS
