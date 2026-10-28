@@ -464,13 +464,15 @@ fn serve_disk(
                 "stats.json" => serde_json::to_string(&snapshot()).ok(),
                 "btrfs.json" => serde_json::to_string(&json_fs.info()).ok(),
                 "zones.json" => serde_json::to_string(&map_engine.zone_map()).ok(),
-                // One zone in full, on a click on the zone map.
+                // One zone in full, on a click on the zone map; its block
+                // level part alone, refreshed while the zone is shown.
                 name => {
-                    let zi: usize = name
-                        .strip_prefix("zone-")?
-                        .strip_suffix(".json")?
-                        .parse()
-                        .ok()?;
+                    let name = name.strip_prefix("zone-")?;
+                    if let Some(zi) = name.strip_suffix("-block.json") {
+                        let block = map_engine.zone_detail(zi.parse().ok()?)?;
+                        return serde_json::to_string(&block).ok();
+                    }
+                    let zi: usize = name.strip_suffix(".json")?.parse().ok()?;
                     let block = map_engine.zone_detail(zi)?;
                     let fs = json_fs.zone(block.start, block.size);
                     serde_json::to_string(&serde_json::json!({ "block": block, "fs": fs })).ok()

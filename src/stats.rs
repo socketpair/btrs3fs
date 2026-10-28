@@ -262,6 +262,12 @@ impl Drop for InFlightGuard<'_> {
     }
 }
 
+impl Default for InFlight {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InFlight {
     const fn new() -> Self {
         Self {
@@ -274,6 +280,10 @@ impl InFlight {
         let now = self.current.fetch_add(1, Relaxed) + 1;
         self.max.fetch_max(now, Relaxed);
         InFlightGuard(self)
+    }
+
+    pub fn current(&self) -> u64 {
+        self.current.load(Relaxed)
     }
 }
 

@@ -13,7 +13,7 @@
 
 use crate::config::{AppendMode, BLOCK_SIZE, DiskConfig};
 use crate::readahead::{ReadAhead, ReadCache};
-use crate::stats::{Reason, STATS, ZoneCounts};
+use crate::stats::{InFlight, Reason, STATS, ZoneCounts};
 use crate::store::{Body, Layout, PendingConcat, Store, StoreError};
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -157,7 +157,6 @@ pub struct ZoneDetail {
     pub start: u64,
     pub size: u64,
     pub cond: &'static str,
-    pub write_pointer: u64,
     /// Bytes written by the kernel (stored or in RAM).
     pub written: u64,
     /// Bytes confirmed by S3.
@@ -174,11 +173,17 @@ pub struct ZoneDetail {
     pub compaction_queued: bool,
     /// A RESET failed: I/O is refused until one succeeds.
     pub broken: bool,
+    /// GETs of the zone's objects in progress.
+    pub gets: u64,
+    /// Writing S3 requests on the zone in progress, by what they do.
+    pub writing: Vec<&'static str>,
 }
 
 #[derive(serde::Serialize)]
 pub struct ObjectDetail {
     pub key: String,
+    /// Object size; 0 for markers.
+    pub size: u64,
     /// Zone bytes `[from, to)` the object serves.
     pub from: u64,
     pub to: u64,
@@ -325,6 +330,17 @@ struct Zone {
     start: u64,
     state: Mutex<ZoneState>,
     upload: tokio::sync::Mutex<()>,
+    requests: ZoneRequests,
+}
+
+/// S3 requests on one zone in progress, for the zone page (SPEC.md §9.3).
+#[derive(Default)]
+struct ZoneRequests {
+    gets: InFlight,
+    uploads: InFlight,
+    concats: InFlight,
+    markers: InFlight,
+    deletes: InFlight,
 }
 
 pub struct Engine {
@@ -486,6 +502,7 @@ impl Engine {
                     broken: false,
                 }),
                 upload: tokio::sync::Mutex::new(()),
+                requests: ZoneRequests::default(),
             });
         }
         // Leftovers of interrupted concatenations and RESETs (SPEC.md §5),
@@ -756,7 +773,7 @@ impl Engine {
                     self.read_windows(c, (zone, generation), zone_offset, len)
                         .await
                 }
-                _ => match self.get_parts(&key, offset, len).await {
+                _ => match self.get_parts(zone, &key, offset, len).await {
                     // A segment concatenated and deleted meanwhile: plan anew.
                     Err(ZoneError::Store(StoreError::NotFound(_))) if self.segments => {
                         self.read_stored(zone, zone_offset, len).await
@@ -776,11 +793,11 @@ impl Engine {
     }
 
     /// `[offset, offset + len)` of an object as parallel GETs of `get_part`.
-    async fn get_parts(&self, key: &str, offset: u64, len: u64) -> ZResult<Vec<Bytes>> {
+    async fn get_parts(&self, zi: usize, key: &str, offset: u64, len: u64) -> ZResult<Vec<Bytes>> {
         let end = offset + len;
         let parts = (offset..end)
             .step_by(self.get_part as usize)
-            .map(|from| self.get(key, from, self.get_part.min(end - from)));
+            .map(|from| self.get(zi, key, from, self.get_part.min(end - from)));
         futures_util::future::try_join_all(parts).await
     }
 
@@ -808,7 +825,7 @@ impl Engine {
             };
             let futures: Vec<_> = parts
                 .iter()
-                .map(|(key, offset, n)| self.get_parts(key, *offset, *n))
+                .map(|(key, offset, n)| self.get_parts(zi, key, *offset, *n))
                 .collect();
             match in_order(futures).await {
                 Ok(out) => return Ok(out),
@@ -833,10 +850,11 @@ impl Engine {
         }
     }
 
-    /// One GET, counted in the statistics; waits for one of `reads` slots.
-    async fn get(&self, key: &str, offset: u64, len: u64) -> ZResult<Bytes> {
+    /// One GET of zone `zi`, counted in the statistics; waits for one of `reads` slots.
+    async fn get(&self, zi: usize, key: &str, offset: u64, len: u64) -> ZResult<Bytes> {
         // Never closed, so acquiring cannot fail.
         let _slot = self.get_slots.acquire().await.unwrap();
+        let _in_flight = self.zones[zi].requests.gets.enter();
         let started = Instant::now();
         let data = self
             .store
@@ -922,7 +940,7 @@ impl Engine {
         let uploaded = {
             // Never closed, so acquiring cannot fail.
             let _slot = self.upload_slots.acquire().await.unwrap();
-            let _in_flight = STATS.uploads.enter();
+            let _in_flight = (STATS.uploads.enter(), zone.requests.uploads.enter());
             if self.segments {
                 let key = self.layout.segment_key(zone.start, from);
                 self.store.put(&key, body).await
@@ -1048,9 +1066,12 @@ impl Engine {
         }
         self.flush_locked(zi, Reason::Finish).await?;
         zone.state.lock().unwrap().marker = true;
-        self.store
-            .put(&self.layout.finished_key(zone.start), Body::default())
-            .await?;
+        {
+            let _in_flight = zone.requests.markers.enter();
+            self.store
+                .put(&self.layout.finished_key(zone.start), Body::default())
+                .await?;
+        }
 
         let compaction = {
             let mut st = zone.state.lock().unwrap();
@@ -1086,7 +1107,11 @@ impl Engine {
             st.generation += 1;
             st.marker
         };
-        if let Err(e) = self.delete_zone_objects(zone.start, marker).await {
+        let deleted = {
+            let _in_flight = zone.requests.deletes.enter();
+            self.delete_zone_objects(zone.start, marker).await
+        };
+        if let Err(e) = deleted {
             self.break_locked(zi);
             warn!("zone {zi}: RESET failed; I/O to the zone is refused until a RESET succeeds");
             return Err(e);
@@ -1430,6 +1455,7 @@ impl Engine {
             if !unmarked(&zone.state.lock().unwrap()) {
                 continue;
             }
+            let _in_flight = zone.requests.markers.enter();
             match self
                 .store
                 .put(&self.layout.meta_key(zone.start), Body::default())
@@ -1613,6 +1639,7 @@ impl Engine {
             })
             .collect();
         let base = self.layout.segment_key(zone.start, 0);
+        let _in_flight = zone.requests.concats.enter();
         let pending = self.store.begin_concat(&base, &sources).await?;
         Ok(Some(CompactJob {
             generation,
@@ -1641,6 +1668,7 @@ impl Engine {
             debug!("zone {zi} changed during its concatenation; dropped it");
             return Ok(false);
         }
+        let _in_flight = zone.requests.concats.enter();
         self.store.finish_concat(job.pending).await?;
         {
             let mut st = zone.state.lock().unwrap();
@@ -1720,6 +1748,7 @@ impl Engine {
             .iter()
             .map(|o| ObjectDetail {
                 key: self.object_key(zone.start, o),
+                size: o.to - o.start,
                 from: o.from,
                 to: o.to,
             })
@@ -1728,6 +1757,7 @@ impl Engine {
             if present {
                 objects.push(ObjectDetail {
                     key,
+                    size: 0,
                     from: 0,
                     to: 0,
                 });
@@ -1746,7 +1776,6 @@ impl Engine {
                 Cond::Closed => "closed",
                 Cond::Full => "full",
             },
-            write_pointer: st.wp,
             written: st.data_end,
             stored: st.flushed,
             buffered: st.buffered(),
@@ -1760,6 +1789,17 @@ impl Engine {
             write_interval_secs: st.write_interval,
             compaction_queued: queued,
             broken: st.broken,
+            gets: zone.requests.gets.current(),
+            writing: [
+                (&zone.requests.uploads, "upload of buffered data"),
+                (&zone.requests.concats, "concatenation"),
+                (&zone.requests.markers, "marker"),
+                (&zone.requests.deletes, "deletion (RESET)"),
+            ]
+            .into_iter()
+            .filter(|(n, _)| n.current() > 0)
+            .map(|(_, what)| what)
+            .collect(),
         })
     }
 
@@ -1946,6 +1986,31 @@ mod tests {
             e.write(wp, blk(first + i, 1), false).unwrap();
             e.flush_zone(zone as usize, Reason::Explicit).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn zone_detail_gives_object_sizes_and_requests() {
+        let e = segments_engine(mem()).await;
+        segment_writes(&e, 1, 1, 2).await;
+        e.write(ZS + 2 * B, blk(3, 1), false).unwrap();
+        e.finish_zone(ZS).await.unwrap();
+        read(&e, ZS, 3 * B).await;
+        let d = e.zone_detail(1).unwrap();
+        let sizes: Vec<_> = d.objects.iter().map(|o| (o.key.as_str(), o.size)).collect();
+        assert_eq!(
+            sizes,
+            [
+                ("t/0000000000100000-00000000", B),
+                ("t/0000000000100000-00001000", B),
+                ("t/0000000000100000-00002000", B),
+                ("t/0000000000100000.finished", 0),
+            ]
+        );
+        // Every request is over: its count went back.
+        assert_eq!(d.gets, 0);
+        assert!(d.writing.is_empty());
+        e.compact_zone(1).await.unwrap();
+        assert_eq!(e.zone_detail(1).unwrap().objects[0].size, 3 * B);
     }
 
     #[tokio::test]

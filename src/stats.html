@@ -417,6 +417,7 @@ async function tickZones() {
     zmap = await r.json();
     drawZones();
   } catch (e) { say(`Cannot read the zone map: ${e.message}`); }
+  if (zsel !== null && tab === "zones") refreshZone(zsel);
 }
 function drawZones() {
   if (!zmap || tab !== "zones") return;
@@ -491,6 +492,19 @@ async function showZone(i) {
     box.innerHTML = `<div class="title">Zone ${num(i)}</div><p class="note">Cannot read zone-${i}.json: ${esc(e.message)}. Click the cell again to retry.</p>`;
   }
 }
+/* The block level part changes by the second (buffer, requests): redrawn with
+   the zone map; the btrfs part stays as read on the click, scroll and all. */
+async function refreshZone(i) {
+  if (!$("zblock")) return;
+  try {
+    const r = await fetch(`zone-${i}-block.json`, { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const b = await r.json();
+    if (zsel !== i || !$("zblock")) return;
+    $("zbarbox").innerHTML = zoneBar(b);
+    $("zblock").innerHTML = zoneBlock(b);
+  } catch (e) { say(`Cannot read zone-${i}-block.json: ${e.message}`); }
+}
 /* The clicked cell stretched along the zone: S3 objects, RAM, the unwritten rest. */
 function zoneBar(b) {
   const pct = v => (v / b.size * 100).toFixed(3) + "%";
@@ -504,15 +518,13 @@ function zoneBar(b) {
   const said = [];
   if (b.stored) said.push(`${bytes(b.stored)} in ${num(objects)} S3 object${objects === 1 ? "" : "s"}`);
   if (b.buffered) said.push(`${bytes(b.buffered)} in RAM`);
-  if (b.written < b.size)
-    said.push(b.cond === "full" ? `${bytes(b.size - b.written)} never to be written (finished early)`
-      : `${bytes(b.size - b.written)} not written yet`);
+  if (b.cond === "full" && b.written < b.size) said.push(`${bytes(b.size - b.written)} never to be written (finished early)`);
   if (!said.length) said.push("nothing written");
   return `<div class="zbar" role="img" aria-label="${esc(said.join(", "))}">${parts.join("")}</div><p class="note">${said.join(", ")}.</p>`;
 }
 function zoneView(b, f) {
-  return `<div class="title">Zone ${num(b.index)}, at ${bytes(b.start)} on the disk</div>` + zoneBar(b) +
-    `<div class="zcols"><section>${zoneBlock(b)}</section><section>${zoneFs(f)}</section></div>`;
+  return `<div class="title">Zone ${num(b.index)}, at ${bytes(b.start)} on the disk</div><div id="zbarbox">${zoneBar(b)}</div>` +
+    `<div class="zcols"><section id="zblock">${zoneBlock(b)}</section><section>${zoneFs(f)}</section></div>`;
 }
 /* What a zone condition means (ZBC): "closed" is often taken for "finished". */
 const COND_MEANS = {
@@ -525,13 +537,15 @@ function zoneBlock(b) {
   const markers = b.objects.filter(o => o.to === o.from);
   const objects = b.objects.filter(o => o.to > o.from);
   const list = objects.length
-    ? `<h4>S3 objects</h4><div class="zlist"><table class="grid"><tr><th>key</th><th>zone bytes</th></tr>` +
-      objects.map(o => `<tr><td>${esc(o.key)}</td><td>${bytes(o.from)} – ${bytes(o.to)}</td></tr>`).join("") + `</table></div>`
+    ? `<h4>S3 objects</h4><div class="zlist"><table class="grid"><tr><th>key</th><th>size</th></tr>` +
+      objects.map(o => `<tr><td>${esc(o.key)}</td><td>${bytes(o.size)}</td></tr>`).join("") + `</table></div>`
     : "";
   return `<h3>Block device</h3>` + kv([
     ["condition", `${esc(b.cond)}<br><span class="note">${COND_MEANS[b.cond.split(" ")[0]] || ""}</span>`],
     ["kind", esc(b.kind)],
-    ["write pointer", bytes(b.write_pointer)],
+    ["in RAM, waiting for upload to S3", b.buffered ? bytes(b.buffered) : "nothing"],
+    ["S3 reads now", b.gets ? `${num(b.gets)} GET${b.gets === 1 ? "" : "s"}` : "none"],
+    ["S3 write now", b.writing.length ? esc(b.writing.join(", ")) : "none"],
     ["last write", b.secs_since_write === null ? "none since the daemon started" : `${span(b.secs_since_write)} ago`],
     ["average interval between writes", b.write_interval_secs === null ? "–" : span(b.write_interval_secs)],
     ["waiting for concatenation", b.compaction_queued ? "yes" : "no"],
