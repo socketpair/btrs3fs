@@ -67,7 +67,7 @@ pub fn announce(bdev: &str, serial: Option<&str>) {
     };
     let hex = base16(&properties(serial));
     let path = format!("/sys/block/{name}/uevent");
-    match std::fs::write(&path, format!("change {EVENT_UUID} BTRS3FS={hex}")) {
+    match crate::device::write_sysfs(&path, format!("change {EVENT_UUID} BTRS3FS={hex}")) {
         Ok(()) => debug!("{path}: identity sent to udev"),
         Err(e) => warn!("cannot send the device identity to udev via {path}: {e}"),
     }

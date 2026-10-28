@@ -214,12 +214,28 @@ fn disable_wbt(bdev: &str) {
         return;
     };
     let path = format!("/sys/block/{name}/queue/wbt_lat_usec");
-    match std::fs::write(&path, "0") {
+    match write_sysfs(&path, "0") {
         Ok(()) => debug!("{path}: writeback throttling disabled"),
-        // Kernel built without wbt: nothing to disable.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!("{path} is missing: the kernel has no writeback throttling to disable")
+        }
         Err(e) => warn!("cannot disable writeback throttling in {path}: {e}"),
     }
+}
+
+/// Writes a sysfs attribute. Like `std::fs::write`, but opens it without
+/// `O_CREAT`: sysfs cannot create files and answers `EACCES` to `O_CREAT` on
+/// a missing one, while a plain open tells it apart as `NotFound`.
+pub fn write_sysfs(
+    path: impl AsRef<std::path::Path>,
+    value: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)?
+        .write_all(value.as_ref())
 }
 
 /// Raises the largest request the kernel sends to the device to the zone
@@ -232,7 +248,7 @@ fn set_max_request(bdev: &str, bytes: u64) {
         return;
     };
     let path = format!("/sys/block/{name}/queue/max_sectors_kb");
-    match std::fs::write(&path, (bytes >> 10).to_string()) {
+    match write_sysfs(&path, (bytes >> 10).to_string()) {
         Ok(()) => info!("{path}: requests up to {bytes} bytes"),
         Err(e) => warn!("cannot set request size in {path}: {e}"),
     }
@@ -265,7 +281,7 @@ fn keep_fs_readahead(name: &str, bytes: u64) {
                 continue;
             }
             let path = fs.join("bdi/read_ahead_kb");
-            match std::fs::write(&path, &want) {
+            match write_sysfs(&path, &want) {
                 Ok(()) => info!("{}: btrfs readahead set to {bytes} bytes", path.display()),
                 Err(e) => warn!("cannot set btrfs readahead in {}: {e}", path.display()),
             }
@@ -618,6 +634,20 @@ fn report_zones(engine: &Engine, cdev: RawFd, pos: u64, offset: u64, max: usize)
 mod tests {
     use super::*;
     use std::os::unix::net::UnixDatagram;
+
+    #[test]
+    fn sysfs_writes_never_create_files() {
+        let dir = std::env::temp_dir().join(format!("btrs3fs-sysfs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("wbt_lat_usec");
+        let err = write_sysfs(&missing, "0").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(!missing.exists());
+        std::fs::write(&missing, "2000").unwrap();
+        write_sysfs(&missing, "0").unwrap();
+        assert_eq!(std::fs::read_to_string(&missing).unwrap(), "0");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn pwritev_more_than_iov_max() {
