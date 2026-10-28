@@ -1,5 +1,5 @@
 //! The btrfs on the device, for the statistics page (SPEC.md §9.3): figures
-//! from sysfs and ioctls, and the actions `balance -dusage=0` and `syncfs()`.
+//! from sysfs and ioctls, and the actions `balance -dusage=0 -musage=0` and `syncfs()`.
 //! No external programs are run.
 
 use log::{info, warn};
@@ -52,6 +52,10 @@ const BTRFS_IOC_BALANCE_V2: libc::c_ulong = 0xc400_9420;
 const BTRFS_IOC_BALANCE_PROGRESS: libc::c_ulong = 0x8400_9422;
 /// `BTRFS_BALANCE_DATA`: balance data block groups.
 const BALANCE_DATA: u64 = 1 << 0;
+/// `BTRFS_BALANCE_SYSTEM`: balance system block groups.
+const BALANCE_SYSTEM: u64 = 1 << 1;
+/// `BTRFS_BALANCE_METADATA`: balance metadata block groups.
+const BALANCE_METADATA: u64 = 1 << 2;
 /// `BTRFS_BALANCE_ARGS_USAGE`: only block groups used up to `usage` percent.
 const BALANCE_ARGS_USAGE: u64 = 1 << 1;
 /// `BTRFS_BALANCE_STATE_RUNNING`.
@@ -260,7 +264,7 @@ impl Btrfs {
     /// another action runs or when the filesystem is not mounted.
     pub fn start(self: &Arc<Self>, name: &str) -> Result<(), String> {
         let run: fn(&Path) -> Result<String, String> = match name {
-            "balance" => balance_empty_data,
+            "balance" => balance_empty,
             "syncfs" => sync_fs,
             _ => return Err(format!("unknown action {name}")),
         };
@@ -333,14 +337,17 @@ fn open_dir(path: &Path) -> Result<std::fs::File, String> {
     std::fs::File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))
 }
 
-/// `btrfs balance start -dusage=0`: relocates (that is, deletes) the data
-/// block groups nothing lives in.
-fn balance_empty_data(mountpoint: &Path) -> Result<String, String> {
+/// `btrfs balance start -dusage=0 -musage=0`: relocates (that is, deletes)
+/// the block groups nothing lives in. As in `btrfs`, system block groups go
+/// with metadata under the same filter.
+fn balance_empty(mountpoint: &Path) -> Result<String, String> {
     let dir = open_dir(mountpoint)?;
     let mut args = IoctlBalanceArgs::zeroed();
-    args.flags = BALANCE_DATA;
+    args.flags = BALANCE_DATA | BALANCE_METADATA | BALANCE_SYSTEM;
     args.data.flags = BALANCE_ARGS_USAGE;
     args.data.usage = 0;
+    args.meta = args.data;
+    args.sys = args.data;
     // SAFETY: the ioctl reads and writes one btrfs_ioctl_balance_args we own.
     let r = unsafe { libc::ioctl(dir.as_raw_fd(), BTRFS_IOC_BALANCE_V2, &mut args) };
     if r < 0 {
@@ -348,7 +355,7 @@ fn balance_empty_data(mountpoint: &Path) -> Result<String, String> {
     }
     let [_, considered, completed] = args.stat;
     Ok(format!(
-        "{completed} empty data block groups relocated of {considered} considered"
+        "{completed} empty block groups relocated of {considered} considered"
     ))
 }
 

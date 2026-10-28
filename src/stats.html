@@ -234,11 +234,11 @@
   <h2>Operations</h2>
   <div class="panel">
     <div class="actions" style="margin-top:0">
-      <button class="btn" data-fsact="balance">Remove empty data block groups</button>
+      <button class="btn" data-fsact="balance">Remove empty block groups</button>
       <button class="btn" data-fsact="syncfs">Commit the filesystem</button>
     </div>
     <div id="b-action" class="note" style="margin-top:8px"></div>
-    <p class="note">Removing empty block groups is <code>btrfs balance start -dusage=0</code>: their zones are reset and
+    <p class="note">Removing empty block groups is <code>btrfs balance start -dusage=0 -musage=0</code> (data, metadata and system): their zones are reset and
       their S3 objects deleted. Committing is <code>syncfs()</code>: btrfs writes its transaction, so every written file
       is stored in S3.</p>
   </div>

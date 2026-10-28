@@ -482,8 +482,10 @@ io_uring (`libublk::ops::submit_sqe`). Состояние зон — общий 
   типам (`allocation/*`: выделено, занято, zone unusable, pinned/reserved/may_use/readonly,
   на диске, порог и счётчики reclaim), ошибки устройства (`devinfo/*/error_stats`), текущая
   исключительная операция и прогресс balance (`BTRFS_IOC_BALANCE_PROGRESS`).
-  Действия `POST /balance` — `BTRFS_IOC_BALANCE_V2` с фильтром данных `usage=0` (удаление пустых
-  групп, как `btrfs balance start -dusage=0`), `POST /syncfs` — `syncfs()` на точке монтирования.
+  Действия `POST /balance` — `BTRFS_IOC_BALANCE_V2` с фильтром `usage=0` для данных, метаданных
+  и системных групп (удаление пустых групп, как `btrfs balance start -dusage=0 -musage=0`: `btrfs`
+  при `-m` так же берёт системные группы с тем же фильтром), `POST /syncfs` — `syncfs()` на точке
+  монтирования. Оба — системные вызовы из потока демона, без запуска программ.
   Оба долгие: идут в отдельном потоке, одновременно — одно; страница видит, что идёт и чем
   кончилось последнее.
 
