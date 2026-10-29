@@ -294,21 +294,20 @@ fn keep_fs_tuned(name: &str, readahead: Option<u64>) {
     }
 }
 
-/// Turns on dynamic and periodic reclaim for data and metadata (SPEC.md
-/// §11): btrfs picks the threshold itself by the free space left, and looks
-/// for block groups to reclaim periodically, not only when space is freed.
+/// Turns on periodic reclaim for data and metadata (SPEC.md §11): btrfs
+/// looks for block groups to reclaim periodically, among those not written
+/// to since its previous look, not only when space is freed. Dynamic reclaim
+/// stays off (user's decision): it waits until fewer than 10 zones are left.
 fn enable_reclaim(fs: &std::path::Path) {
     for kind in ["data", "metadata"] {
-        for knob in ["dynamic_reclaim", "periodic_reclaim"] {
-            let path = fs.join("allocation").join(kind).join(knob);
-            match write_sysfs(&path, "1") {
-                Ok(()) => info!("{}: enabled", path.display()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => info!(
-                    "{} is missing: the kernel has no {knob} (6.12+)",
-                    path.display()
-                ),
-                Err(e) => warn!("cannot enable {knob} in {}: {e}", path.display()),
-            }
+        let path = fs.join("allocation").join(kind).join("periodic_reclaim");
+        match write_sysfs(&path, "1") {
+            Ok(()) => info!("{}: enabled", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => info!(
+                "{} is missing: the kernel has no periodic reclaim (6.12+)",
+                path.display()
+            ),
+            Err(e) => warn!("cannot enable periodic reclaim in {}: {e}", path.display()),
         }
     }
 }
