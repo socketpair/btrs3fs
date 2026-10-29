@@ -174,12 +174,12 @@ pub fn serve(
         crate::ident::announce(&bdev, serial.as_deref());
         disable_wbt(&bdev);
         set_max_request(&bdev, zone_size);
-        if let (Some(bytes), Some(name)) = (fs_readahead, bdev.strip_prefix("/dev/")) {
+        if let Some(name) = bdev.strip_prefix("/dev/") {
             let name = name.to_string();
             // Lives until the process exits, like the device.
             let _ = std::thread::Builder::new()
                 .name("btrs3fs-fs-tune".into())
-                .spawn(move || keep_fs_readahead(&name, bytes));
+                .spawn(move || keep_fs_tuned(&name, fs_readahead));
         }
         if on_ready(&bdev) {
             loop {
@@ -255,17 +255,18 @@ fn set_max_request(bdev: &str, bytes: u64) {
 }
 
 /// How often the daemon looks for its filesystem being mounted. Judgement
-/// call: until then btrfs reads ahead its own 4 MiB, which a second costs
-/// next to nothing; the check is a directory listing.
+/// call: until then btrfs reads ahead its own 4 MiB and reclaims as it does
+/// by default, which a second costs next to nothing; the check is a
+/// directory listing.
 const FS_TUNE_POLL: Duration = Duration::from_secs(1);
 
-/// Sets the btrfs readahead window (`/sys/fs/btrfs/<fsid>/bdi/read_ahead_kb`)
-/// whenever a btrfs filesystem on the device `name` gets mounted — by
-/// `mount` or by fstab alike (SPEC.md §6.1). The window belongs to the mounted
-/// filesystem, not to the device, so it cannot be set before. Each mount is
-/// set once: a value the admin changes afterwards stays.
-fn keep_fs_readahead(name: &str, bytes: u64) {
-    let want = (bytes >> 10).to_string();
+/// Tunes a btrfs filesystem on the device `name` whenever it gets mounted —
+/// by `mount` or by fstab alike: the readahead window
+/// (`/sys/fs/btrfs/<fsid>/bdi/read_ahead_kb`, SPEC.md §6.1), when given, and
+/// reclaim (SPEC.md §11). Both belong to the mounted filesystem, not
+/// to the device, so they cannot be set before. Each mount is set once:
+/// values the admin changes afterwards stay.
+fn keep_fs_tuned(name: &str, readahead: Option<u64>) {
     let mut done: std::collections::HashSet<std::path::PathBuf> = Default::default();
     loop {
         let mounted: Vec<std::path::PathBuf> = std::fs::read_dir("/sys/fs/btrfs")
@@ -280,13 +281,35 @@ fn keep_fs_readahead(name: &str, bytes: u64) {
             if !done.insert(fs.clone()) {
                 continue;
             }
-            let path = fs.join("bdi/read_ahead_kb");
-            match write_sysfs(&path, &want) {
-                Ok(()) => info!("{}: btrfs readahead set to {bytes} bytes", path.display()),
-                Err(e) => warn!("cannot set btrfs readahead in {}: {e}", path.display()),
+            if let Some(bytes) = readahead {
+                let path = fs.join("bdi/read_ahead_kb");
+                match write_sysfs(&path, (bytes >> 10).to_string()) {
+                    Ok(()) => info!("{}: btrfs readahead set to {bytes} bytes", path.display()),
+                    Err(e) => warn!("cannot set btrfs readahead in {}: {e}", path.display()),
+                }
             }
+            enable_reclaim(&fs);
         }
         std::thread::sleep(FS_TUNE_POLL);
+    }
+}
+
+/// Turns on dynamic and periodic reclaim for data and metadata (SPEC.md
+/// §11): btrfs picks the threshold itself by the free space left, and looks
+/// for block groups to reclaim periodically, not only when space is freed.
+fn enable_reclaim(fs: &std::path::Path) {
+    for kind in ["data", "metadata"] {
+        for knob in ["dynamic_reclaim", "periodic_reclaim"] {
+            let path = fs.join("allocation").join(kind).join(knob);
+            match write_sysfs(&path, "1") {
+                Ok(()) => info!("{}: enabled", path.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => info!(
+                    "{} is missing: the kernel has no {knob} (6.12+)",
+                    path.display()
+                ),
+                Err(e) => warn!("cannot enable {knob} in {}: {e}", path.display()),
+            }
+        }
     }
 }
 

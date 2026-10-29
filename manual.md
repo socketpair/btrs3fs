@@ -251,25 +251,30 @@ sudo systemctl enable --now btrs3fs@main
 Настройки в `/sys/fs/btrfs/<FSID>/` (`<FSID>` — `findmnt -no UUID /mnt/data`), действуют до
 размонтирования:
 
-| Файл | По умолчанию | Смысл |
-|---|---|---|
-| `bg_reclaim_threshold` | 75 | Переработка запускается, только когда распределено ≥ N % диска. **0 выключает её — в zoned так нельзя.** |
-| `allocation/{data,metadata}/bg_reclaim_threshold` | 75 | Перерабатывается зона, заполненная живыми данными меньше чем на N %. |
-| `allocation/{data,metadata}/dynamic_reclaim` | 0 | Порог считается сам: 0, пока свободно ≥ 10 зон, и растёт до 99 % по мере исчерпания. |
-| `allocation/{data,metadata}/periodic_reclaim` | 0 | Проверять все зоны периодически, а не только при освобождении места. |
+| Файл | Ядро по умолчанию | btrs3fs | Смысл |
+|---|---|---|---|
+| `bg_reclaim_threshold` | 75 | 75 | Переработка запускается, только когда распределено ≥ N % диска. **0 выключает её — в zoned так нельзя.** |
+| `allocation/{data,metadata}/bg_reclaim_threshold` | 75 | 75 | Перерабатывается зона, заполненная живыми данными меньше чем на N %; при `dynamic_reclaim=1` не действует. |
+| `allocation/{data,metadata}/dynamic_reclaim` | 0 | **1** | Порог считается сам: 0, пока свободно ≥ 10 зон, и растёт до 99 % по мере исчерпания. |
+| `allocation/{data,metadata}/periodic_reclaim` | 0 | **1** | Проверять все зоны периодически, а не только при освобождении места. |
 
-**Рекомендация** — динамическая и периодическая переработка для данных и метаданных:
+Демон включает `dynamic_reclaim` и `periodic_reclaim` сам — при каждом монтировании своей ФС
+(и `btrs3fs mount`, и fstab), один раз: если потом поменять их вручную, демон их не трогает до
+следующего монтирования. В логе — строки `…/dynamic_reclaim: enabled`; на ядре старше 6.12
+файлов нет, и демон пишет об этом информационное сообщение.
+
+С `dynamic_reclaim` переработка начинается поздно — когда свободно меньше 10 зон (160 МБ).
+Нужен запас на большом диске — статический порог после монтирования:
 
 ```bash
 A=/sys/fs/btrfs/$(findmnt -no UUID /mnt/data)/allocation
-echo 1 | sudo tee $A/{data,metadata}/{dynamic,periodic}_reclaim
+echo 0  | sudo tee $A/{data,metadata}/dynamic_reclaim
+echo 30 | sudo tee $A/{data,metadata}/bg_reclaim_threshold
 ```
 
-С `dynamic_reclaim` переработка начинается поздно — когда свободно меньше 10 зон (160 МБ).
-Нужен запас на большом диске — статический порог: `dynamic_reclaim=0`, `periodic_reclaim=1`,
-`bg_reclaim_threshold` групп 25–30 (на освобождённый мегабайт ≤ 0,3–0,4 МБ переноса).
-Выведено из исходников btrfs 7.2, под нагрузкой не проверялось. Наблюдать —
-`allocation/*/reclaim_count`, `reclaim_bytes`, `sudo btrfs filesystem usage /mnt/data`.
+Порог групп 25–30 — на освобождённый мегабайт ≤ 0,3–0,4 МБ переноса. Выведено из исходников
+btrfs 7.2, под нагрузкой не проверялось. Наблюдать — `allocation/*/reclaim_count`,
+`reclaim_bytes`, `sudo btrfs filesystem usage /mnt/data`.
 
 ## 14. Статистика
 
