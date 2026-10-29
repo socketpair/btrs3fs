@@ -110,6 +110,9 @@ pub enum ZoneError {
     Invalid(String),
     #[error("store error: {0}")]
     Store(#[from] StoreError),
+    /// A change to a disk served read-only (SPEC.md §9.2).
+    #[error("the disk is read-only")]
+    ReadOnly,
 }
 
 pub type ZResult<T> = Result<T, ZoneError>;
@@ -381,6 +384,8 @@ pub struct Engine {
     meta_pending: std::sync::atomic::AtomicBool,
     /// Wakes the marker loop of the compactor.
     meta_kick: Notify,
+    /// Served read-only: changes are refused, the store only read (SPEC.md §9.2).
+    read_only: bool,
 }
 
 impl Engine {
@@ -388,6 +393,33 @@ impl Engine {
     /// size is the write pointer, a `<zone>.finished` marker a zone closed by
     /// FINISH.
     pub async fn open(cfg: &DiskConfig, layout: Layout, store: Arc<Store>) -> anyhow::Result<Self> {
+        Self::restore(cfg, layout, store, false).await
+    }
+
+    /// `open` for a disk served read-only (SPEC.md §9.2): the store is only
+    /// read, leftovers are left in place, every change is refused.
+    pub async fn open_read_only(
+        cfg: &DiskConfig,
+        layout: Layout,
+        store: Arc<Store>,
+    ) -> anyhow::Result<Self> {
+        Self::restore(cfg, layout, store, true).await
+    }
+
+    /// Refuses a change to a disk served read-only.
+    fn writable(&self) -> ZResult<()> {
+        if self.read_only {
+            return Err(ZoneError::ReadOnly);
+        }
+        Ok(())
+    }
+
+    async fn restore(
+        cfg: &DiskConfig,
+        layout: Layout,
+        store: Arc<Store>,
+        read_only: bool,
+    ) -> anyhow::Result<Self> {
         let started = boottime();
         let nr_zones = cfg.nr_zones() as usize;
         let segments = cfg.append == AppendMode::Segments;
@@ -505,17 +537,28 @@ impl Engine {
                 requests: ZoneRequests::default(),
             });
         }
-        // Leftovers of interrupted concatenations and RESETs (SPEC.md §5),
-        // gone before any new data can join them.
-        if !leftovers.is_empty() {
-            store.delete_many(&leftovers).await?;
-            info!("deleted {} leftover objects", leftovers.len());
-        }
-        // In every append mode: whatever wrote the disk before, no
-        // unfinished upload of its zones outlives a start.
-        let aborted = store.abort_stale_concats(&layout).await?;
-        if aborted > 0 {
-            info!("aborted {aborted} unfinished concatenations");
+        if read_only {
+            // Not part of any zone above; nothing can join them on a disk
+            // that is never written.
+            if !leftovers.is_empty() {
+                info!(
+                    "read-only: {} leftover objects left in place",
+                    leftovers.len()
+                );
+            }
+        } else {
+            // Leftovers of interrupted concatenations and RESETs (SPEC.md §5),
+            // gone before any new data can join them.
+            if !leftovers.is_empty() {
+                store.delete_many(&leftovers).await?;
+                info!("deleted {} leftover objects", leftovers.len());
+            }
+            // In every append mode: whatever wrote the disk before, no
+            // unfinished upload of its zones outlives a start.
+            let aborted = store.abort_stale_concats(&layout).await?;
+            if aborted > 0 {
+                info!("aborted {aborted} unfinished concatenations");
+            }
         }
 
         let engine = Self {
@@ -544,6 +587,7 @@ impl Engine {
             compact_kick: Notify::new(),
             meta_pending: std::sync::atomic::AtomicBool::new(false),
             meta_kick: Notify::new(),
+            read_only,
         };
         // Zones restored with several segments: concatenate them.
         for (zi, zone) in engine.zones.iter().enumerate() {
@@ -625,6 +669,7 @@ impl Engine {
         append: bool,
         meta: bool,
     ) -> ZResult<u64> {
+        self.writable()?;
         let len = data.len() as u64;
         if len == 0 || !len.is_multiple_of(BLOCK_SIZE) {
             return invalid(format!(
@@ -1009,6 +1054,7 @@ impl Engine {
     }
 
     pub fn open_zone(&self, offset: u64) -> ZResult<()> {
+        self.writable()?;
         let (zi, _) = self.locate(offset)?;
         let mut st = self.zones[zi].state.lock().unwrap();
         match st.cond {
@@ -1021,6 +1067,7 @@ impl Engine {
     }
 
     pub fn close_zone(&self, offset: u64) -> ZResult<()> {
+        self.writable()?;
         let (zi, _) = self.locate(offset)?;
         let mut st = self.zones[zi].state.lock().unwrap();
         match st.cond {
@@ -1047,6 +1094,7 @@ impl Engine {
     /// without data is a leftover of a RESET, and the zone is EMPTY again
     /// after a restart.
     pub async fn finish_zone(&self, offset: u64) -> ZResult<()> {
+        self.writable()?;
         let (zi, _) = self.locate(offset)?;
         let zone = &self.zones[zi];
         let _upload = zone.upload.lock().await;
@@ -1088,6 +1136,7 @@ impl Engine {
 
     /// RESET: deletes the zone's objects and markers, drops buffered data.
     pub async fn reset_zone(&self, offset: u64) -> ZResult<()> {
+        self.writable()?;
         let (zi, _) = self.locate(offset)?;
         self.reset_index(zi).await
     }
@@ -1218,6 +1267,7 @@ impl Engine {
     /// nested under its prefix), the objects at zone starts first as in a RESET, in DeleteObjects batches of up to 1000
     /// keys instead of one DELETE per zone (SPEC.md §4).
     pub async fn reset_all(&self) -> ZResult<()> {
+        self.writable()?;
         // Every `upload` lock, so nothing creates an object between the
         // delete and the state change. Taken in zone order; nothing else holds
         // two of them, so this cannot deadlock.
@@ -1442,7 +1492,7 @@ impl Engine {
     /// RESET, which deletes everything under the zone prefix, cannot run
     /// between the check and the PUT and leave a marker on an empty zone.
     async fn store_meta_markers(&self) {
-        if !self.segments {
+        if !self.segments || self.read_only {
             return;
         }
         for zi in 0..self.zones.len() {
@@ -1483,9 +1533,10 @@ impl Engine {
 
     /// Queues every zone served by more than one object for concatenation
     /// at once, below the threshold too (the statistics page button).
-    /// Returns how many were queued; none on a disk without segments.
+    /// Returns how many were queued; none on a disk without segments or
+    /// served read-only.
     pub fn compact_all(&self) -> usize {
-        if !self.segments {
+        if !self.segments || self.read_only {
             return 0;
         }
         let fragmented: Vec<usize> = (0..self.zones.len())
@@ -2254,6 +2305,45 @@ mod tests {
         assert_eq!(keys(&store, "t/").await, ["t/0000000000000000-00000000"]);
         assert_eq!(read(&e, 0, B).await, blk(7, 1).to_vec());
         assert_eq!(e.report(0, 1)[0].wp, B);
+    }
+
+    #[tokio::test]
+    async fn read_only_disk_reads_and_changes_nothing() {
+        let store = mem();
+        let e = segments_engine(store.clone()).await;
+        segment_writes(&e, 1, 1, 2).await;
+        // A leftover: a FINISH marker without data, as an interrupted RESET leaves.
+        store
+            .put("t/0000000000300000.finished", Body::default())
+            .await
+            .unwrap();
+        drop(e);
+        let before = keys(&store, "t/").await;
+
+        let mut cfg = DiskConfig::new(8 * ZS, ZS);
+        cfg.append = AppendMode::Segments;
+        let e = Engine::open_read_only(&cfg, Layout::new("t").unwrap(), store.clone())
+            .await
+            .unwrap();
+        assert_eq!(read(&e, ZS, 2 * B).await, [blk(1, 1), blk(2, 1)].concat());
+        // The leftover is not taken for data: zone 3 is empty.
+        assert_eq!(e.report(3, 1)[0].cond, Cond::Empty);
+        let refused = [
+            e.write(ZS + 2 * B, blk(3, 1), false).err(),
+            e.open_zone(2 * ZS).err(),
+            e.close_zone(ZS).err(),
+            e.finish_zone(ZS).await.err(),
+            e.reset_zone(ZS).await.err(),
+            e.reset_all().await.err(),
+        ];
+        assert!(
+            refused
+                .iter()
+                .all(|r| matches!(r, Some(ZoneError::ReadOnly)))
+        );
+        assert_eq!(e.compact_all(), 0);
+        assert_eq!(e.dirty_bytes(), 0);
+        assert_eq!(keys(&store, "t/").await, before);
     }
 
     #[tokio::test]

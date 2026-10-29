@@ -64,6 +64,8 @@ pub struct DeviceOptions {
     /// `<bucket>/<prefix>`, the serial number lsblk shows (SPEC.md §2);
     /// `None` for a RAM disk.
     pub serial: Option<String>,
+    /// Read-only device (SPEC.md §9.2): the kernel refuses writes to it.
+    pub read_only: bool,
 }
 
 struct Ctx {
@@ -126,11 +128,15 @@ pub fn serve(
     let disk_size = cfg.disk_size;
     let zone_sectors = (cfg.zone_size >> SECTOR_SHIFT) as u32;
     let depth = opts.queue_depth;
+    let read_only = opts.read_only;
     let tgt_init = move |dev: &mut UblkDev| {
         dev.set_default_params(disk_size);
         let p = &mut dev.tgt.params;
         p.types |= sys::UBLK_PARAM_TYPE_ZONED;
         p.basic.attrs = sys::UBLK_ATTR_VOLATILE_CACHE | sys::UBLK_ATTR_FUA;
+        if read_only {
+            p.basic.attrs |= sys::UBLK_ATTR_READ_ONLY;
+        }
         p.basic.logical_bs_shift = BLOCK_SHIFT;
         p.basic.physical_bs_shift = BLOCK_SHIFT;
         p.basic.io_min_shift = BLOCK_SHIFT;
@@ -179,7 +185,7 @@ pub fn serve(
             // Lives until the process exits, like the device.
             let _ = std::thread::Builder::new()
                 .name("btrs3fs-fs-tune".into())
-                .spawn(move || keep_fs_tuned(&name, fs_readahead));
+                .spawn(move || keep_fs_tuned(&name, fs_readahead, !read_only));
         }
         if on_ready(&bdev) {
             loop {
@@ -263,10 +269,11 @@ const FS_TUNE_POLL: Duration = Duration::from_secs(1);
 /// Tunes a btrfs filesystem on the device `name` whenever it gets mounted —
 /// by `mount` or by fstab alike: the readahead window
 /// (`/sys/fs/btrfs/<fsid>/bdi/read_ahead_kb`, SPEC.md §6.1), when given, and
-/// reclaim (SPEC.md §11). Both belong to the mounted filesystem, not
+/// periodic reclaim when `reclaim` (not on a read-only disk; SPEC.md §11).
+/// Both belong to the mounted filesystem, not
 /// to the device, so they cannot be set before. Each mount is set once:
 /// values the admin changes afterwards stay.
-fn keep_fs_tuned(name: &str, readahead: Option<u64>) {
+fn keep_fs_tuned(name: &str, readahead: Option<u64>, reclaim: bool) {
     let mut done: std::collections::HashSet<std::path::PathBuf> = Default::default();
     loop {
         let mounted: Vec<std::path::PathBuf> = std::fs::read_dir("/sys/fs/btrfs")
@@ -288,7 +295,9 @@ fn keep_fs_tuned(name: &str, readahead: Option<u64>) {
                     Err(e) => warn!("cannot set btrfs readahead in {}: {e}", path.display()),
                 }
             }
-            enable_reclaim(&fs);
+            if reclaim {
+                enable_reclaim(&fs);
+            }
         }
         std::thread::sleep(FS_TUNE_POLL);
     }
@@ -369,12 +378,16 @@ async fn io_task(q: &UblkQueue, tag: u16, ctx: &Ctx) -> Result<(), UblkError> {
                     iod.start_sector,
                     iod.nr_sectors
                 );
-                if !matches!(e, ZoneError::Invalid(_)) {
-                    error!("I/O error: {e}");
-                    STATS.req_errors.inc();
-                    STATS.err_io.record(&e);
+                match e {
+                    ZoneError::ReadOnly => (-libc::EROFS, 0),
+                    ZoneError::Invalid(_) => (-libc::EIO, 0),
+                    ZoneError::Store(_) => {
+                        error!("I/O error: {e}");
+                        STATS.req_errors.inc();
+                        STATS.err_io.record(&e);
+                        (-libc::EIO, 0)
+                    }
                 }
-                (-libc::EIO, 0)
             }
         };
         q.submit_io_commit_cmd(tag, BufDesc::ZonedAppendLba(lba), res)

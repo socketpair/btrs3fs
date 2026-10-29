@@ -555,6 +555,8 @@ pub struct Snapshot {
     pub get_part: Option<u64>,
     /// GETs allowed at once.
     pub reads_limit: u64,
+    /// The disk is served read-only: no uploads, no actions.
+    pub disk_read_only: bool,
     pub last_errors: LastErrors,
     /// Problems to point out, worst first.
     pub alerts: Vec<Alert>,
@@ -576,6 +578,8 @@ pub struct DiskState {
     pub reads_limit: u64,
     /// The filesystem on the device is mounted read-only (`None`: not mounted).
     pub read_only: Option<bool>,
+    /// The disk is served read-only (SPEC.md §9.2).
+    pub disk_read_only: bool,
 }
 
 impl Stats {
@@ -583,7 +587,8 @@ impl Stats {
     fn alerts(&self, d: &DiskState, e: &LastErrors) -> Vec<Alert> {
         let mut out = Vec::new();
         let mut push = |level, text: String| out.push(Alert { level, text });
-        if d.read_only == Some(true) {
+        // On a disk served read-only the filesystem is read-only by design.
+        if d.read_only == Some(true) && !d.disk_read_only {
             push(
                 "bad",
                 "The filesystem is mounted read-only: btrfs stopped writing after an error. \
@@ -644,6 +649,7 @@ impl Stats {
             uploads_limit: d.uploads_limit,
             get_part: d.get_part,
             reads_limit: d.reads_limit,
+            disk_read_only: d.disk_read_only,
             last_errors,
             alerts,
             disk: d.disk,
@@ -861,6 +867,7 @@ mod tests {
             get_part: Some(2 << 20),
             reads_limit: 19,
             read_only,
+            disk_read_only: false,
         };
         let err = |secs_ago, text: &str| {
             Some(ErrorInfo {
@@ -872,6 +879,12 @@ mod tests {
         assert!(STATS.alerts(&disk(Some(false)), &quiet).is_empty());
         let ro = STATS.alerts(&disk(Some(true)), &quiet);
         assert_eq!(ro[0].level, "bad");
+        // Served read-only: a read-only filesystem is expected, no alert.
+        let served_ro = DiskState {
+            disk_read_only: true,
+            ..disk(Some(true))
+        };
+        assert!(STATS.alerts(&served_ro, &quiet).is_empty());
         let errors = LastErrors {
             upload: err(5, "timeout"),
             read: err(3600, "old"),

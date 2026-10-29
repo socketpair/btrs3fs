@@ -267,6 +267,7 @@
 const HISTORY = 300;  // chart length in samples: 5 minutes at one sample per second
 const series = { up: [], rd: [], dirty: [], par: [] };
 let prev = null, prevTime = 0, last = null, rates = null, delta = () => 0, tab = "overview";
+let diskRO = false;  // the disk is served read-only: nothing to upload, no actions
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -629,6 +630,7 @@ function renderZones(s) {
   const z = s.zones;
   $("zkinds").textContent = `${num(z.meta_zones)} metadata zones · ${num(z.data_zones + z.unknown_zones)} data zones`;
   $("btn-compact").hidden = s.append !== "SEGMENTS";
+  for (const b of document.querySelectorAll("[data-act]")) b.disabled = diskRO;
 }
 
 /* ---------- details ---------- */
@@ -701,7 +703,7 @@ async function tickBtrfs() {
 }
 function renderBtrfs(b) {
   const busy = !!b.running;
-  for (const btn of document.querySelectorAll("[data-fsact]")) btn.disabled = busy || !b.mounted;
+  for (const btn of document.querySelectorAll("[data-fsact]")) btn.disabled = busy || !b.mounted || diskRO;
   const l = b.last;
   $("b-action").innerHTML = busy ? `${esc(b.running)} is running for ${span(b.running_secs)}.`
     : l ? `Last: ${esc(l.name)} ${l.ok ? "finished" : '<span style="color:var(--bad)">failed</span>'} in ${num(l.secs)} s — ${esc(l.message)}` : "";
@@ -712,7 +714,7 @@ function renderBtrfs(b) {
   }
   const c = b.commits || {}, errs = Object.values(b.errors || {}).reduce((a, x) => a + x, 0);
   $("b-facts").innerHTML =
-    panel("Filesystem", kv([["mounted on", esc(b.mountpoint)], ["writes", b.read_only ? "read-only — remount it" : "allowed", b.read_only],
+    panel("Filesystem", kv([["mounted on", esc(b.mountpoint)], ["writes", diskRO ? "read-only: the disk is served read-only" : b.read_only ? "read-only — remount it" : "allowed", b.read_only && !diskRO],
       ["label", esc(b.label || "none")], ["generation", num(b.generation)], ["fsid", `<span class="note">${esc(b.fsid)}</span>`]])) +
     panel("Transaction commits", kv([["commits", num(c.commits)], ["last", `${num(c.last_commit_ms)} ms`], ["longest", `${num(c.max_commit_ms)} ms`],
       ["average", c.commits ? `${num(c.total_commit_ms / c.commits)} ms` : "–"], ["running now", c.cur_commit_ms ? `${num(c.cur_commit_ms)} ms` : "no"]])) +
@@ -771,7 +773,8 @@ function update(s, p, dt) {
 }
 function draw(s) {
   $("disk").textContent = s.disk;
-  $("meta").textContent = `on ${s.device} · ${s.append} · up ${span(s.uptime_secs)}`;
+  diskRO = !!s.disk_read_only;
+  $("meta").textContent = `on ${s.device} · ${s.append}${diskRO ? " · read-only" : ""} · up ${span(s.uptime_secs)}`;
   document.title = `${s.alerts && s.alerts.length ? "⚠ " : ""}btrs3fs ${s.disk}`;
   if (tab === "overview") renderOverview(s);
   if (tab === "zones") renderZones(s);

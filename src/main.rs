@@ -129,6 +129,10 @@ struct MountArgs {
     /// Extra mount options, appended to nosuid,nodev,noatime,lazytime,commit=300.
     #[arg(short = 'o', long)]
     options: Option<String>,
+    /// Serve the disk read-only and mount it ro,rescue=nologreplay: works with
+    /// credentials that may only read the bucket.
+    #[arg(short = 'r', long)]
+    read_only: bool,
     /// ublk device id; -1 lets the kernel choose.
     #[arg(long, default_value_t = -1, allow_hyphen_values = true)]
     dev_id: i32,
@@ -235,6 +239,10 @@ struct RunArgs {
     /// Override nr_queues from disk.json.
     #[arg(long)]
     queues: Option<u16>,
+    /// Serve the disk read-only (mount it with -o ro,rescue=nologreplay):
+    /// works with credentials that may only read the bucket.
+    #[arg(short = 'r', long, conflicts_with = "memory")]
+    read_only: bool,
     #[command(flatten)]
     stats: StatsArgs,
     #[command(flatten)]
@@ -350,6 +358,7 @@ fn serve_disk(
         stats: stats_opt,
         link,
         read_cache,
+        read_only,
     } = serve;
     if let Some(q) = queues {
         cfg.nr_queues = q;
@@ -376,7 +385,13 @@ fn serve_disk(
         cfg.zone_size
     );
     let disk = layout.dir();
-    let engine = rt.block_on(Engine::open(&cfg, layout, Arc::new(store)))?;
+    let store = Arc::new(store);
+    let engine = if read_only {
+        info!("serving the disk read-only");
+        rt.block_on(Engine::open_read_only(&cfg, layout, store))?
+    } else {
+        rt.block_on(Engine::open(&cfg, layout, store))?
+    };
     let read_ahead = tuning.map_or(ReadAhead::DISABLED, |t| ReadAhead {
         window: t.unit,
         cache: read_cache,
@@ -389,14 +404,18 @@ fn serve_disk(
             .with_get_part(t.unit);
     }
     let engine = Arc::new(engine);
-    rt.spawn(engine.clone().background_flusher());
-    rt.spawn(engine.clone().compactor());
+    // A read-only disk has nothing to upload, concatenate or mark.
+    if !read_only {
+        rt.spawn(engine.clone().background_flusher());
+        rt.spawn(engine.clone().compactor());
+    }
     let opts = device::DeviceOptions {
         dev_id,
         nr_queues: cfg.nr_queues,
         queue_depth: cfg.queue_depth,
         fs_readahead: tuning.map(|t| t.fs_readahead),
         serial,
+        read_only,
     };
 
     // The statistics page starts once the device number is known.
@@ -434,10 +453,14 @@ fn serve_disk(
                     get_part: stats_engine.get_part(),
                     reads_limit: stats_engine.reads_limit() as u64,
                     read_only: snap_fs.read_only(),
+                    disk_read_only: read_only,
                 })
             };
             let act_rt = act_rt.clone();
             let action = move |name: &str| match name {
+                "balance" | "syncfs" | "compact" | "flush" if read_only => {
+                    Some(serde_json::json!({ "error": "the disk is read-only" }).to_string())
+                }
                 "balance" | "syncfs" => Some(match fs.start(name) {
                     Ok(()) => r#"{"started":true}"#.to_string(),
                     Err(e) => serde_json::json!({ "error": e }).to_string(),
@@ -503,17 +526,26 @@ struct ServeOptions {
     /// default uploads, whole-object GETs, btrfs readahead untouched.
     link: Option<Link>,
     read_cache: u64,
+    /// Serve the disk read-only (SPEC.md §9.2).
+    read_only: bool,
 }
 
 impl ServeOptions {
     /// A device of `run` or `mount`, tuned for the given link.
-    fn device(dev_id: i32, queues: Option<u16>, stats: StatsArgs, link: &LinkArgs) -> Self {
+    fn device(
+        dev_id: i32,
+        queues: Option<u16>,
+        stats: StatsArgs,
+        link: &LinkArgs,
+        read_only: bool,
+    ) -> Self {
         Self {
             dev_id,
             queues,
             stats: Some(stats),
             link: Some(link.link()),
             read_cache: link.read_cache,
+            read_only,
         }
     }
 }
@@ -577,16 +609,23 @@ fn cmd_run(a: RunArgs) -> anyhow::Result<i32> {
         device::sd_notify("READY=1");
         true
     });
-    let serve = ServeOptions::device(a.dev_id, a.queues, a.stats, &a.link);
+    let serve = ServeOptions::device(a.dev_id, a.queues, a.stats, &a.link, a.read_only);
     serve_until_stopped(&rt, cfg, layout, store, serve, on_ready)?;
     Ok(0)
 }
 
-fn mount_options(extra: Option<&str>) -> String {
-    match extra.map(str::trim).filter(|e| !e.is_empty()) {
-        Some(e) => format!("{MOUNT_OPTIONS},{e}"),
-        None => MOUNT_OPTIONS.to_string(),
+/// Options of `mount`: ours, read-only ones for a read-only disk (SPEC.md
+/// §9.2: a fsync log cannot be replayed on a read-only device), then `extra`.
+fn mount_options(extra: Option<&str>, read_only: bool) -> String {
+    let mut options = MOUNT_OPTIONS.to_string();
+    if read_only {
+        options.push_str(",ro,rescue=nologreplay");
     }
+    if let Some(e) = extra.map(str::trim).filter(|e| !e.is_empty()) {
+        options.push(',');
+        options.push_str(e);
+    }
+    options
 }
 
 fn pipe() -> anyhow::Result<(File, File)> {
@@ -613,7 +652,7 @@ fn cmd_mount(a: MountArgs, keep_stderr: bool) -> anyhow::Result<i32> {
     }
     let creds = std::fs::canonicalize(&a.disk.creds)
         .with_context(|| format!("credentials file {}", a.disk.creds.display()))?;
-    let options = mount_options(a.options.as_deref());
+    let options = mount_options(a.options.as_deref(), a.read_only);
 
     // Fork before any thread exists (tokio and ublk queues start in the child).
     let (mut status_rx, status_tx) = pipe()?;
@@ -688,7 +727,7 @@ fn mount_daemon(a: &MountArgs, creds: &Path, status: File, keep_stderr: bool) ->
             }
             true
         });
-        let serve = ServeOptions::device(a.dev_id, a.queues, a.stats, &a.link);
+        let serve = ServeOptions::device(a.dev_id, a.queues, a.stats, &a.link, a.read_only);
         serve_until_stopped(&rt, cfg, layout, store, serve, on_ready)
     })();
     match res {
@@ -1001,6 +1040,7 @@ fn format_disk(
             // mkfs reads next to nothing.
             link: None,
             read_cache: 0,
+            read_only: false,
         },
         on_ready,
     )?;
@@ -1082,16 +1122,20 @@ mod tests {
     #[test]
     fn options() {
         assert_eq!(
-            mount_options(None),
+            mount_options(None, false),
             "nosuid,nodev,noatime,lazytime,commit=300"
         );
         assert_eq!(
-            mount_options(Some(" ")),
+            mount_options(Some(" "), false),
             "nosuid,nodev,noatime,lazytime,commit=300"
         );
         assert_eq!(
-            mount_options(Some("compress=zstd")),
+            mount_options(Some("compress=zstd"), false),
             "nosuid,nodev,noatime,lazytime,commit=300,compress=zstd"
+        );
+        assert_eq!(
+            mount_options(Some("subvol=a"), true),
+            "nosuid,nodev,noatime,lazytime,commit=300,ro,rescue=nologreplay,subvol=a"
         );
     }
 }
