@@ -511,11 +511,11 @@ impl Engine {
             store.delete_many(&leftovers).await?;
             info!("deleted {} leftover objects", leftovers.len());
         }
-        if segments {
-            let aborted = store.abort_stale_concats(&layout).await?;
-            if aborted > 0 {
-                info!("aborted {aborted} unfinished concatenations");
-            }
+        // In every append mode: whatever wrote the disk before, no
+        // unfinished upload of its zones outlives a start.
+        let aborted = store.abort_stale_concats(&layout).await?;
+        if aborted > 0 {
+            info!("aborted {aborted} unfinished concatenations");
         }
 
         let engine = Self {
@@ -1640,7 +1640,17 @@ impl Engine {
             .collect();
         let base = self.layout.segment_key(zone.start, 0);
         let _in_flight = zone.requests.concats.enter();
-        let pending = self.store.begin_concat(&base, &sources).await?;
+        let pending = match self.store.begin_concat(&base, &sources).await {
+            Ok(p) => p,
+            // A RESET meanwhile deleted the parts (the upload is aborted):
+            // no failure of the concatenation, nothing to concatenate.
+            Err(e) if zone.state.lock().unwrap().generation != generation => {
+                debug!("zone {zi} was reset during its concatenation ({e}); dropped it");
+                STATS.compact_aborted.inc();
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        };
         Ok(Some(CompactJob {
             generation,
             parts,
@@ -2244,6 +2254,26 @@ mod tests {
         assert_eq!(keys(&store, "t/").await, ["t/0000000000000000-00000000"]);
         assert_eq!(read(&e, 0, B).await, blk(7, 1).to_vec());
         assert_eq!(e.report(0, 1)[0].wp, B);
+    }
+
+    #[tokio::test]
+    async fn concatenation_broken_by_a_reset_is_no_failure() {
+        let store = mem();
+        let e = segments_engine(store.clone()).await;
+        segment_writes(&e, 0, 1, 3).await;
+        // While the parts are copied, a RESET bumps the generation and the
+        // copies fail (their sources are gone).
+        let (done, ()) = tokio::join!(e.compact_zone(0), async {
+            e.zones[0].state.lock().unwrap().generation += 1;
+            mem_store(&store).set_fail(true);
+        });
+        mem_store(&store).set_fail(false);
+        done.unwrap();
+        // The same failure without a RESET is one.
+        mem_store(&store).set_fail(true);
+        let failed = e.compact_zone(0).await;
+        mem_store(&store).set_fail(false);
+        assert!(failed.is_err());
     }
 
     #[tokio::test]
