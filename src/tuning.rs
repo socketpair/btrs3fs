@@ -29,6 +29,9 @@ const READAHEAD_MAX: u64 = 256 * MIB;
 /// a few zones serial; S3 was measured up to 64 at once (SPEC.md §12).
 const UPLOADS_MIN: usize = 4;
 const UPLOADS_MAX: usize = 64;
+/// Upper bound of parallel GETs, as measured for uploads; it also keeps
+/// absurd link flags from asking for thousands of connections.
+const READS_MAX: usize = 64;
 
 /// Characteristics of the link to S3; rates are bytes per second.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -83,7 +86,7 @@ impl Link {
             .clamp(UPLOADS_MIN, UPLOADS_MAX);
         // The same for GETs of one unit (user decision).
         let one_get = unit as f64 / (latency + unit as f64 / self.read_stream as f64);
-        let reads = ((self.read_total as f64 / one_get).ceil() as usize).max(1);
+        let reads = ((self.read_total as f64 / one_get).ceil() as usize).clamp(1, READS_MAX);
         Tuning {
             unit,
             fs_readahead,
@@ -208,6 +211,12 @@ mod tests {
         assert_eq!(t.unit, 4 * MIB); // never above the zone
         assert_eq!(t.fs_readahead, READAHEAD_MAX);
         assert_eq!(t.uploads, UPLOADS_MIN);
+        let absurd = Link {
+            latency: Duration::from_secs(1000),
+            read_total: u64::MAX,
+            ..slow
+        };
+        assert_eq!(absurd.tuning(4096).reads, READS_MAX);
         assert_eq!(pow2_round(3.0 * MIB as f64), 4 * MIB);
         assert_eq!(pow2_round(1.4 * MIB as f64), MIB);
     }
