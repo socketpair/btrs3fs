@@ -472,7 +472,12 @@ async fn handle_io(q: &UblkQueue, tag: u16, ctx: &Ctx, efd: &Arc<OwnedFd>) -> ZR
             if !engine.try_reserve(len) {
                 let e = engine.clone();
                 let _waiting = STATS.writes_waiting.enter();
-                on_tokio(ctx, efd, async move { e.reserve(len).await }).await?;
+                on_tokio(ctx, efd, async move {
+                    e.reserve(len).await;
+                    Reserved(e, len)
+                })
+                .await?
+                .keep();
             }
             let append = op == sys::UBLK_IO_OP_ZONE_APPEND;
             // btrfs writes metadata with plain WRITE and flags it META (SPEC.md §5).
@@ -526,6 +531,25 @@ async fn handle_io(q: &UblkQueue, tag: u16, ctx: &Ctx, efd: &Arc<OwnedFd>) -> ZR
             Ok((0, 0))
         }
         _ => Ok((-libc::EOPNOTSUPP, 0)),
+    }
+}
+
+/// Room reserved on the tokio runtime: released when dropped, so a waiter
+/// that fails (`on_tokio` lost the answer) does not keep it forever.
+struct Reserved(Arc<Engine>, u64);
+
+impl Reserved {
+    /// The request takes the room over.
+    fn keep(mut self) {
+        self.1 = 0;
+    }
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        if self.1 > 0 {
+            self.0.unreserve(self.1);
+        }
     }
 }
 
