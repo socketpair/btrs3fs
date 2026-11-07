@@ -21,7 +21,7 @@ use libublk::{UblkError, UblkFlags, UblkRuntime, ops, sys};
 use log::{debug, error, info, trace, warn};
 use std::future::Future;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -107,11 +107,19 @@ pub fn serve(
         .fold(0u64, |acc, (flag, _)| acc | *flag as u64);
 
     // Register before the device appears so a signal never kills us mid-setup.
-    let mut signals = signal_hook::iterator::Signals::new([
+    const STOP_SIGNALS: [i32; 3] = [
         signal_hook::consts::SIGTERM,
         signal_hook::consts::SIGINT,
         signal_hook::consts::SIGHUP,
-    ])?;
+    ];
+    let mut signals = signal_hook::iterator::Signals::new(STOP_SIGNALS)?;
+    // Once the device stops, nothing reads the signals any more: from then
+    // on they act as by default, so a second Ctrl-C ends a stop or a
+    // `create` cleanup that hangs on S3.
+    let stopping = Arc::new(AtomicBool::new(false));
+    for sig in STOP_SIGNALS {
+        signal_hook::flag::register_conditional_default(sig, stopping.clone())?;
+    }
 
     let ctrl = UblkCtrlBuilder::default()
         .name("btrs3fs")
@@ -201,6 +209,7 @@ pub fn serve(
                 std::thread::sleep(STOP_POLL);
             }
         }
+        stopping.store(true, Ordering::SeqCst);
         if let Err(e) = ctrl.kill_dev() {
             warn!("stopping device failed: {e:?}");
         }
