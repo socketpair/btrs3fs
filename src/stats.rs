@@ -19,9 +19,10 @@ pub const BASE_PORT: u16 = 9470;
 
 const PAGE: &str = include_str!("stats.html");
 
-/// Bucket slots of a histogram: enough for every `u64` on every scale (bit
-/// length 0..=64 for powers of two; 1-2-5 steps up to 5·10^19).
-const SLOTS: usize = 65;
+/// Bucket slots of a histogram: enough for every `u64` on every scale
+/// (powers of two: 0, then bit length of value - 1 plus one, i.e. 0..=65;
+/// 1-2-5 steps up to 5·10^19).
+const SLOTS: usize = 66;
 
 /// How a histogram cuts values into buckets (SPEC.md §9.3). The scale, not a
 /// list of bounds, decides: no upper bound is written down anywhere.
@@ -810,12 +811,17 @@ mod tests {
         assert_eq!(bounds(Scale::Count), [0, 1, 2, 4, 8, 16, 32, 64]);
         assert_eq!(bounds(Scale::Millis), [1, 2, 5, 10, 20, 50, 100, 200]);
         for sc in [Scale::Bytes, Scale::Millis, Scale::Count] {
-            for v in [0, 1, 2, 3, 4, 5, 99, 4096, 4097, 1 << 40, u64::MAX] {
+            for v in [0, 1, 2, 3, 4, 5, 99, 4096, 4097, 1 << 40, (1 << 63) + 1, u64::MAX] {
                 let b = sc.bucket(v);
                 assert!(v <= sc.bound(b), "{sc:?} {v}");
                 assert!(b == 0 || v > sc.bound(b - 1), "{sc:?} {v}");
             }
         }
+        // The largest values land in the last slot instead of past it.
+        static BIG: Histogram = Histogram::new(Scale::Count);
+        BIG.record((1 << 63) + 1);
+        BIG.record(u64::MAX);
+        assert_eq!(BIG.snapshot().count, 2);
     }
 
     #[test]
