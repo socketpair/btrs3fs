@@ -518,7 +518,8 @@ impl S3Store {
 
     /// CompleteMultipartUpload: the concatenated object replaces `dst`. A
     /// repeat after a lost answer finds no upload (404): it completed if `dst`
-    /// has the concatenated size.
+    /// has the concatenated size. On failure the upload is aborted (a
+    /// completed upload ignores the abort).
     pub async fn finish_concat(&self, p: PendingConcat) -> StoreResult<()> {
         let url = format!(
             "{}?uploadId={}",
@@ -536,10 +537,20 @@ impl S3Store {
                 body_error(&answer, &p.dst)
             })
             .await;
-        match done {
-            Err(StoreError::NotFound(_)) if self.head_size(&p.dst).await? == p.size => Ok(()),
+        let res = match done {
+            Err(StoreError::NotFound(_)) => match self.head_size(&p.dst).await {
+                Ok(size) if size == p.size => Ok(()),
+                Ok(_) => done,
+                Err(e) => Err(e),
+            },
             other => other,
+        };
+        if res.is_err() {
+            // Else the copied parts stay stored until the next start, one
+            // more copy of the zone with every retry of the concatenation.
+            self.abort_concat(p).await;
         }
+        res
     }
 
     /// AbortMultipartUpload (best effort: a leftover only costs storage and
