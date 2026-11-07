@@ -991,7 +991,7 @@ fn cmd_create(a: CreateArgs) -> anyhow::Result<i32> {
         cfg.zone_size
     );
 
-    if let Err(e) = format_disk(&rt, &cfg, &layout, &s3) {
+    if let Err(e) = format_disk(&cfg, &layout, &s3) {
         warn!("formatting failed, removing the new disk {}", layout.dir());
         if let Err(re) = destroy_prefix(&rt, &s3, &layout) {
             error!("cleanup of {} failed: {re:#}", layout.dir());
@@ -1003,12 +1003,12 @@ fn cmd_create(a: CreateArgs) -> anyhow::Result<i32> {
 }
 
 /// Brings up a temporary device, runs mkfs.btrfs on it and stores the result.
-fn format_disk(
-    rt: &Runtime,
-    cfg: &DiskConfig,
-    layout: &Layout,
-    s3: &S3Store,
-) -> anyhow::Result<()> {
+/// On a runtime of its own: when it returns, the engine's background tasks
+/// (uploads, concatenation) are gone, so a cleanup after a failure lists
+/// everything the disk will ever hold.
+fn format_disk(cfg: &DiskConfig, layout: &Layout, s3: &S3Store) -> anyhow::Result<()> {
+    let rt = runtime()?;
+    let rt = &rt;
     let mkfs_result = Arc::new(Mutex::new(None));
     let result = mkfs_result.clone();
     let on_ready: device::OnReady = Box::new(move |bdev| {
@@ -1048,6 +1048,7 @@ fn format_disk(
     // Formatting is part of creating the disk: store it even without a FLUSH.
     let flushed = rt.block_on(engine.flush_all(stats::Reason::Explicit));
     device::delete(&ctrl);
+    drop(engine);
     mkfs_result
         .lock()
         .unwrap()
