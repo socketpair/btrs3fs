@@ -24,9 +24,18 @@ fn main() {
         None => pkg.to_string(),
     };
     println!("cargo:rustc-env=BTRS3FS_VERSION={version}");
-    // A new commit moves HEAD or the branch it points to; the index changes
-    // with `git add` and with the dirty state of tracked files.
-    for f in [".git/HEAD", ".git/index", ".git/refs/heads"] {
+    // A new commit moves HEAD or the branch it points to, `git add` changes
+    // the index. Editing a tracked file touches neither, so the sources the
+    // binary is built from are watched too: an edit makes it `-dirty`.
+    for f in [
+        ".git/HEAD",
+        ".git/index",
+        ".git/refs/heads",
+        "src",
+        "build.rs",
+        "Cargo.toml",
+        "Cargo.lock",
+    ] {
         println!("cargo:rerun-if-changed={f}");
     }
 }
