@@ -1,15 +1,20 @@
 #!/bin/bash
 # tools/crash-test.sh CREDS PREFIX ROUNDS "LINK FLAGS": parallel fsync writers, kill -9 of
 # the daemon under load, remount, check every file whose fsync returned.
-# Disk experiments run on the test VM (CLAUDE.md); needs sudo for btrs3fs.
+# Needs sudo for btrs3fs; BTRS3FS overrides the binary (default target/debug/btrs3fs,
+# on the VM ~/btrs3fs/btrs3fs). The fresh filesystem root is given to the user running it.
 # The disk must hold nothing of value: files are written and deleted at will.
+# Exits 1 if a round damaged a file or checked none.
 set -u
 export LC_ALL=C
 CREDS=$1 PREFIX=$2 ROUNDS=$3 LINK=$4
-B=target/debug/btrs3fs M=/mnt/btrs3fs
+B=${BTRS3FS:-target/debug/btrs3fs} M=/mnt/btrs3fs
 SP=target/crash-test
 mkdir -p $SP; : > $SP/acked; : > $SP/deleted
-mnt() { sudo -n $B mount --creds $CREDS --prefix $PREFIX $LINK $M >/dev/null || { echo "MOUNT FAILED"; exit 1; }; sudo -n chown mmarkk $M; }
+mnt() {
+    sudo -n $B mount --creds $CREDS --prefix $PREFIX $LINK $M >/dev/null || { echo "MOUNT FAILED"; exit 1; }
+    sudo -n chown "$(id -un)" $M || { echo "chown $M failed"; exit 1; }
+}
 writer() { # writer ID ROUND
     local i=0 f
     mkdir -p $M/w$1 2>/dev/null || return
@@ -28,6 +33,7 @@ deleter() { # deletes files of earlier rounds, logged before deleting
     done
 }
 findmnt $M >/dev/null || mnt
+failed=0
 for r in $(seq 1 $ROUNDS); do
     pids=()
     for w in 1 2 3 4; do writer $w $r & pids+=($!); done
@@ -44,4 +50,8 @@ for r in $(seq 1 $ROUNDS); do
     done < $SP/acked
     restore=$(journalctl -t btrs3fs --since "-40s" --no-pager | grep -E "restored|deleted .* segments|aborted|past the zone" | sed 's/^.*btrs3fs\[[0-9]*\]: //' | tr '\n' ';')
     echo "round $r: killed after ${t}s; fsynced files intact $ok, damaged $bad; $restore"
+    # No file fsynced this round means the writers never ran: nothing was tested.
+    new=$(grep -c "/r$r-" $SP/acked)
+    [ $bad -eq 0 ] && [ $new -gt 0 ] || { echo "round $r FAILED ($new files fsynced this round)"; failed=1; }
 done
+exit $failed
