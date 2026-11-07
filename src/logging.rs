@@ -61,18 +61,58 @@ fn system_logger() -> Option<Box<dyn Log>> {
             Err(e) => eprintln!("{IDENTIFIER}: cannot log to journald: {e}"),
         }
     }
-    let formatter = syslog::Formatter3164 {
-        facility: syslog::Facility::LOG_DAEMON,
-        hostname: None,
-        process: IDENTIFIER.into(),
-        pid: std::process::id(),
-    };
-    match syslog::unix(formatter) {
-        Ok(l) => Some(Box::new(syslog::BasicLogger::new(l))),
+    match Syslog::connect() {
+        Ok(l) => Some(Box::new(l)),
         Err(e) => {
             eprintln!("{IDENTIFIER}: cannot log to journald or /dev/log: {e}");
             None
         }
+    }
+}
+
+/// syslog through /dev/log. The pid is part of every record, and `mount`
+/// forks the daemon after logging starts: a record from another process than
+/// the connection was made for reconnects with its own pid.
+struct Syslog(std::sync::Mutex<(u32, syslog::BasicLogger)>);
+
+impl Syslog {
+    fn connect() -> syslog::Result<Self> {
+        let pid = std::process::id();
+        Ok(Self(std::sync::Mutex::new((pid, Self::logger(pid)?))))
+    }
+
+    fn logger(pid: u32) -> syslog::Result<syslog::BasicLogger> {
+        let formatter = syslog::Formatter3164 {
+            facility: syslog::Facility::LOG_DAEMON,
+            hostname: None,
+            process: IDENTIFIER.into(),
+            pid,
+        };
+        Ok(syslog::BasicLogger::new(syslog::unix(formatter)?))
+    }
+}
+
+impl Log for Syslog {
+    fn enabled(&self, _: &Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &Record) {
+        let mut l = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let pid = std::process::id();
+        if l.0 != pid {
+            match Self::logger(pid) {
+                Ok(new) => l.1 = new,
+                // Once: the old connection, with the old pid, goes on.
+                Err(e) => eprintln!("{IDENTIFIER}: cannot reconnect to /dev/log: {e}"),
+            }
+            l.0 = pid;
+        }
+        l.1.log(record);
+    }
+
+    fn flush(&self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).1.flush();
     }
 }
 
