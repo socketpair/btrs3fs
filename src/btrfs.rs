@@ -163,11 +163,7 @@ impl Btrfs {
     }
 
     fn find(&self) -> Option<Found> {
-        let sysfs = std::fs::read_dir("/sys/fs/btrfs")
-            .ok()?
-            .flatten()
-            .map(|e| e.path())
-            .find(|fs| fs.join("devices").join(&self.device).exists())?;
+        let sysfs = sysfs_dirs(&self.device).into_iter().next()?;
         let (mountpoint, read_only) = mount_of(&format!("/dev/{}", self.device))?;
         Some(Found {
             sysfs,
@@ -311,26 +307,23 @@ impl Btrfs {
 
 /// Mount point and read-only flag of the top-most mount of `source`.
 fn mount_of(source: &str) -> Option<(PathBuf, bool)> {
-    let text = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    let mut found = None;
-    for line in text.lines() {
-        let Some((left, right)) = line.split_once(" - ") else {
-            continue;
-        };
-        let left: Vec<&str> = left.split(' ').collect();
-        let right: Vec<&str> = right.split(' ').collect();
-        if right
-            .get(1)
-            .map(|s| crate::unescape_mountinfo(s))
-            .as_deref()
-            == Some(source)
-            && let (Some(point), Some(opts)) = (left.get(4), left.get(5))
-        {
-            let ro = opts.split(',').any(|o| o == "ro");
-            found = Some((PathBuf::from(crate::unescape_mountinfo(point)), ro));
-        }
-    }
-    found
+    crate::mountinfo::mounts()
+        .ok()?
+        .into_iter()
+        .rfind(|m| m.source == source)
+        .map(|m| (m.point, m.read_only))
+}
+
+/// The sysfs directories (`/sys/fs/btrfs/<fsid>`) of the mounted btrfs
+/// filesystems on the device `name` (`ublkbN`).
+pub fn sysfs_dirs(name: &str) -> Vec<PathBuf> {
+    std::fs::read_dir("/sys/fs/btrfs")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|fs| fs.join("devices").join(name).exists())
+        .collect()
 }
 
 fn open_dir(path: &Path) -> Result<std::fs::File, String> {

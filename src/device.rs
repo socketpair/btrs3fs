@@ -286,13 +286,7 @@ const FS_TUNE_POLL: Duration = Duration::from_secs(1);
 fn keep_fs_tuned(name: &str, readahead: Option<u64>, reclaim: bool) {
     let mut done: std::collections::HashSet<std::path::PathBuf> = Default::default();
     loop {
-        let mounted: Vec<std::path::PathBuf> = std::fs::read_dir("/sys/fs/btrfs")
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|fs| fs.join("devices").join(name).exists())
-            .collect();
+        let mounted = crate::btrfs::sysfs_dirs(name);
         done.retain(|fs| mounted.contains(fs));
         for fs in mounted {
             if !done.insert(fs.clone()) {

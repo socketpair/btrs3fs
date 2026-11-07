@@ -5,6 +5,7 @@ mod device;
 mod ident;
 mod logging;
 mod measure;
+mod mountinfo;
 mod readahead;
 mod s3;
 mod stats;
@@ -777,43 +778,10 @@ fn wait_for_path(path: &Path, timeout: Duration) -> anyhow::Result<()> {
 
 /// Source of the top-most mount on `mountpoint`, from /proc/self/mountinfo.
 fn find_mount(mountpoint: &Path) -> anyhow::Result<Option<String>> {
-    let info = std::fs::read_to_string("/proc/self/mountinfo")?;
-    let target = mountpoint.to_string_lossy();
-    let mut found = None;
-    for line in info.lines() {
-        let Some((left, right)) = line.split_once(" - ") else {
-            continue;
-        };
-        let point = left.split(' ').nth(4).map(unescape_mountinfo);
-        let source = right.split(' ').nth(1);
-        if let (Some(point), Some(source)) = (point, source)
-            && point == target
-        {
-            found = Some(unescape_mountinfo(source));
-        }
-    }
-    Ok(found)
-}
-
-/// Decodes `\040`-style escapes used in mountinfo: a backslash and three
-/// octal digits (value = d1·64 + d2·8 + d3), e.g. `\040` is a space.
-fn unescape_mountinfo(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'\\'
-            && i + 3 < b.len()
-            && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
-        {
-            out.push((b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + (b[i + 3] - b'0'));
-            i += 4;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
+    Ok(mountinfo::mounts()?
+        .into_iter()
+        .rfind(|m| m.point == mountpoint)
+        .map(|m| m.source))
 }
 
 fn cmd_umount(a: UmountArgs) -> anyhow::Result<i32> {
@@ -1129,13 +1097,6 @@ fn destroy_prefix(rt: &Runtime, s3: &S3Store, layout: &Layout) -> anyhow::Result
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn mountinfo_unescape() {
-        assert_eq!(unescape_mountinfo(r"/mnt/my\040disk"), "/mnt/my disk");
-        assert_eq!(unescape_mountinfo(r"/mnt/plain"), "/mnt/plain");
-        assert_eq!(unescape_mountinfo(r"tail\04"), r"tail\04");
-    }
 
     #[test]
     fn options() {
