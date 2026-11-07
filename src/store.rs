@@ -20,6 +20,9 @@ pub enum StoreError {
     /// The S3 service does not implement the request (HTTP 405 or 501).
     #[error("{0}")]
     Unsupported(String),
+    /// A change asked of a store opened read-only (SPEC.md §9.2).
+    #[error("the store is read-only")]
+    ReadOnly,
     /// With the whole chain of causes: "giving up" alone says nothing.
     #[error("{0:#}")]
     Other(#[from] anyhow::Error),
@@ -67,19 +70,65 @@ pub enum PendingConcat {
 /// A source range of a concatenation: (key, offset, length).
 pub type ConcatPart = (String, u64, u64);
 
-pub enum Store {
+pub enum Backend {
     Mem(MemStore),
     S3(crate::s3::S3Store),
 }
 
+/// The object store of a disk. A read-only store refuses every change with
+/// `StoreError::ReadOnly`: a disk served read-only only GETs and LISTs
+/// (SPEC.md §9.2), whatever path asks for a change.
+pub struct Store {
+    backend: Backend,
+    read_only: bool,
+}
+
 impl Store {
+    pub fn new(backend: Backend) -> Self {
+        Self {
+            backend,
+            read_only: false,
+        }
+    }
+
+    pub fn mem(m: MemStore) -> Self {
+        Self::new(Backend::Mem(m))
+    }
+
+    pub fn s3(s: crate::s3::S3Store) -> Self {
+        Self::new(Backend::S3(s))
+    }
+
+    /// The same store, refusing every change.
+    pub fn read_only(self) -> Self {
+        Self {
+            read_only: true,
+            ..self
+        }
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    pub fn backend(&self) -> &Backend {
+        &self.backend
+    }
+
+    fn writable(&self) -> StoreResult<()> {
+        if self.read_only {
+            return Err(StoreError::ReadOnly);
+        }
+        Ok(())
+    }
+
     /// Whole object, `None` if it does not exist.
     #[cfg(test)]
     pub async fn get(&self, key: &str) -> StoreResult<Option<Bytes>> {
         self.interleave().await;
-        let res = match self {
-            Store::Mem(m) => m.get(key),
-            Store::S3(s) => s.get(key).await,
+        let res = match &self.backend {
+            Backend::Mem(m) => m.get(key),
+            Backend::S3(s) => s.get(key).await,
         };
         match res {
             Ok(b) => Ok(Some(b)),
@@ -93,66 +142,70 @@ impl Store {
     /// network; a no-op otherwise.
     async fn interleave(&self) {
         #[cfg(test)]
-        if matches!(self, Store::Mem(_)) {
+        if matches!(self.backend, Backend::Mem(_)) {
             tokio::task::yield_now().await;
         }
     }
 
     /// Creates or replaces an object.
     pub async fn put(&self, key: &str, body: Body) -> StoreResult<()> {
+        self.writable()?;
         self.interleave().await;
-        match self {
-            Store::Mem(m) => m.put(key, body),
-            Store::S3(s) => s.put(key, body).await,
+        match &self.backend {
+            Backend::Mem(m) => m.put(key, body),
+            Backend::S3(s) => s.put(key, body).await,
         }
     }
 
     /// Grows a zone object: `offset` 0 creates it, else `body` goes at
     /// `offset` = the object's size, the way the disk appends (SPEC.md §5).
     pub async fn append(&self, key: &str, offset: u64, body: Body) -> StoreResult<()> {
+        self.writable()?;
         self.interleave().await;
-        match self {
-            Store::Mem(m) if offset == 0 => m.put(key, body),
-            Store::Mem(m) => m.patch(key, offset, body),
-            Store::S3(s) => s.append(key, offset, body).await,
+        match &self.backend {
+            Backend::Mem(m) if offset == 0 => m.put(key, body),
+            Backend::Mem(m) => m.patch(key, offset, body),
+            Backend::S3(s) => s.append(key, offset, body).await,
         }
     }
 
     /// Exactly `len` bytes starting at `offset`.
     pub async fn get_range(&self, key: &str, offset: u64, len: u64) -> StoreResult<Bytes> {
         self.interleave().await;
-        match self {
-            Store::Mem(m) => m.get_range(key, offset, len),
-            Store::S3(s) => s.get_range(key, offset, len).await,
+        match &self.backend {
+            Backend::Mem(m) => m.get_range(key, offset, len),
+            Backend::S3(s) => s.get_range(key, offset, len).await,
         }
     }
 
     /// Deletes an object; deleting a missing object is not an error.
     pub async fn delete(&self, key: &str) -> StoreResult<()> {
+        self.writable()?;
         self.interleave().await;
-        match self {
-            Store::Mem(m) => m.delete(key),
-            Store::S3(s) => s.delete(key).await,
+        match &self.backend {
+            Backend::Mem(m) => m.delete(key),
+            Backend::S3(s) => s.delete(key).await,
         }
     }
 
     /// Deletes many objects with few requests; missing objects are not an error.
     pub async fn delete_many(&self, keys: &[String]) -> StoreResult<()> {
+        self.writable()?;
         self.interleave().await;
-        match self {
+        match &self.backend {
             // DeleteObjects keeps no order; backwards is the worst case for a
             // zone, its start (the lowest key) going last.
-            Store::Mem(m) => keys.iter().rev().try_for_each(|k| m.delete(k)),
-            Store::S3(s) => s.delete_many(keys).await,
+            Backend::Mem(m) => keys.iter().rev().try_for_each(|k| m.delete(k)),
+            Backend::S3(s) => s.delete_many(keys).await,
         }
     }
 
     /// All objects whose key starts with `prefix`.
     pub async fn list(&self, prefix: &str) -> StoreResult<Vec<ObjectInfo>> {
         self.interleave().await;
-        match self {
-            Store::Mem(m) => m.list(prefix),
-            Store::S3(s) => s.list(prefix).await,
+        match &self.backend {
+            Backend::Mem(m) => m.list(prefix),
+            Backend::S3(s) => s.list(prefix).await,
         }
     }
 
@@ -163,9 +216,10 @@ impl Store {
         dst: &str,
         parts: &[ConcatPart],
     ) -> StoreResult<PendingConcat> {
+        self.writable()?;
         self.interleave().await;
-        match self {
-            Store::Mem(m) => {
+        match &self.backend {
+            Backend::Mem(m) => {
                 let mut data = Vec::new();
                 for (key, offset, len) in parts {
                     data.extend_from_slice(&m.get_range(key, *offset, *len)?);
@@ -175,34 +229,36 @@ impl Store {
                     data,
                 })
             }
-            Store::S3(s) => Ok(PendingConcat::S3(s.begin_concat(dst, parts).await?)),
+            Backend::S3(s) => Ok(PendingConcat::S3(s.begin_concat(dst, parts).await?)),
         }
     }
 
     pub async fn finish_concat(&self, pending: PendingConcat) -> StoreResult<()> {
+        self.writable()?;
         self.interleave().await;
-        match (self, pending) {
-            (Store::Mem(m), PendingConcat::Mem { dst, data }) => {
+        match (&self.backend, pending) {
+            (Backend::Mem(m), PendingConcat::Mem { dst, data }) => {
                 m.put(&dst, Body::new(vec![Bytes::from(data)]))
             }
-            (Store::S3(s), PendingConcat::S3(p)) => s.finish_concat(p).await,
+            (Backend::S3(s), PendingConcat::S3(p)) => s.finish_concat(p).await,
             _ => unreachable!("a concatenation belongs to its store"),
         }
     }
 
     /// Drops a concatenation that must not complete (best effort).
     pub async fn abort_concat(&self, pending: PendingConcat) {
-        if let (Store::S3(s), PendingConcat::S3(p)) = (self, pending) {
+        if let (Backend::S3(s), PendingConcat::S3(p)) = (&self.backend, pending) {
             s.abort_concat(p).await;
         }
     }
 
     /// Aborts concatenations of the disk a crash left unfinished; how many.
     pub async fn abort_stale_concats(&self, layout: &Layout) -> StoreResult<usize> {
+        self.writable()?;
         self.interleave().await;
-        match self {
-            Store::Mem(_) => Ok(0),
-            Store::S3(s) => s.abort_stale_concats(layout).await,
+        match &self.backend {
+            Backend::Mem(_) => Ok(0),
+            Backend::S3(s) => s.abort_stale_concats(layout).await,
         }
     }
 }

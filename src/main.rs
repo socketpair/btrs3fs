@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use store::{Body, Layout, MemStore, Store};
+use store::{Backend, Body, Layout, MemStore, Store};
 use tokio::runtime::Runtime;
 use tuning::Link;
 use zones::Engine;
@@ -340,7 +340,7 @@ fn open_s3_disk(
     let s3 = s3
         .with_retry(RetryPolicy::from_config(&cfg))
         .with_append(cfg.append);
-    Ok((cfg, layout, Store::S3(s3)))
+    Ok((cfg, layout, Store::s3(s3)))
 }
 
 /// Restores the zones and serves the device until it stops.
@@ -364,9 +364,9 @@ fn serve_disk(
         cfg.nr_queues = q;
     }
     cfg.validate()?;
-    let serial = match &store {
-        Store::S3(s) => Some(format!("{}/{}", s.bucket(), layout.prefix())),
-        Store::Mem(_) => None,
+    let serial = match store.backend() {
+        Backend::S3(s) => Some(format!("{}/{}", s.bucket(), layout.prefix())),
+        Backend::Mem(_) => None,
     };
     let tuning = match link {
         Some(l) => {
@@ -385,13 +385,13 @@ fn serve_disk(
         cfg.zone_size
     );
     let disk = layout.dir();
-    let store = Arc::new(store);
-    let engine = if read_only {
+    let store = if read_only {
         info!("serving the disk read-only");
-        rt.block_on(Engine::open_read_only(&cfg, layout, store))?
+        store.read_only()
     } else {
-        rt.block_on(Engine::open(&cfg, layout, store))?
+        store
     };
+    let engine = rt.block_on(Engine::open(&cfg, layout, Arc::new(store)))?;
     let read_ahead = tuning.map_or(ReadAhead::DISABLED, |t| ReadAhead {
         window: t.unit,
         cache: read_cache,
@@ -458,8 +458,9 @@ fn serve_disk(
             };
             let act_rt = act_rt.clone();
             let action = move |name: &str| match name {
-                "balance" | "syncfs" | "compact" | "flush" if read_only => {
-                    Some(serde_json::json!({ "error": "the disk is read-only" }).to_string())
+                // Every action changes the disk.
+                _ if read_only => {
+                    Some(serde_json::json!({ "error": "the disk is served read-only" }).to_string())
                 }
                 "balance" | "syncfs" => Some(match fs.start(name) {
                     Ok(()) => r#"{"started":true}"#.to_string(),
@@ -596,7 +597,7 @@ fn cmd_run(a: RunArgs) -> anyhow::Result<i32> {
             a.zone_size.unwrap_or(DiskConfig::DEFAULT_ZONE_SIZE),
         );
         cfg.validate()?;
-        (cfg, Layout::new("memory")?, Store::Mem(MemStore::default()))
+        (cfg, Layout::new("memory")?, Store::mem(MemStore::default()))
     } else {
         open_s3_disk(
             &rt,
@@ -1032,7 +1033,7 @@ fn format_disk(
         rt,
         cfg.clone(),
         layout.clone(),
-        Store::S3(s3.clone()),
+        Store::s3(s3.clone()),
         ServeOptions {
             dev_id: -1,
             queues: None,

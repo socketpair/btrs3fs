@@ -10,6 +10,7 @@
 use crate::config::{BLOCK_SIZE, DiskConfig};
 use crate::logging::REQUESTS_TARGET;
 use crate::stats::{Reason, STATS};
+use crate::store::StoreError;
 use crate::zones::{Cond, Engine, Piece, ZResult, ZoneError};
 use anyhow::{Context, bail};
 use bytes::Bytes;
@@ -379,7 +380,9 @@ async fn io_task(q: &UblkQueue, tag: u16, ctx: &Ctx) -> Result<(), UblkError> {
                     iod.nr_sectors
                 );
                 match e {
-                    ZoneError::ReadOnly => (-libc::EROFS, 0),
+                    // ublk turns the result into a block status, which has no
+                    // "read-only": any errno outside its short list is EIO.
+                    ZoneError::ReadOnly | ZoneError::Store(StoreError::ReadOnly) => (-libc::EIO, 0),
                     ZoneError::Invalid(_) => (-libc::EIO, 0),
                     ZoneError::Store(_) => {
                         error!("I/O error: {e}");
@@ -412,6 +415,20 @@ async fn handle_io(q: &UblkQueue, tag: u16, ctx: &Ctx, efd: &Arc<OwnedFd>) -> ZR
         iod.op_flags & !0xff
     );
 
+    // A read-only disk refuses changes before any room is reserved or data
+    // copied out of the request.
+    if matches!(
+        op,
+        sys::UBLK_IO_OP_WRITE
+            | sys::UBLK_IO_OP_ZONE_APPEND
+            | sys::UBLK_IO_OP_ZONE_OPEN
+            | sys::UBLK_IO_OP_ZONE_CLOSE
+            | sys::UBLK_IO_OP_ZONE_FINISH
+            | sys::UBLK_IO_OP_ZONE_RESET
+            | sys::UBLK_IO_OP_ZONE_RESET_ALL
+    ) {
+        engine.writable()?;
+    }
     match op {
         sys::UBLK_IO_OP_READ => {
             STATS.req_read.inc();

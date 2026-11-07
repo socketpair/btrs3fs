@@ -48,6 +48,12 @@
   nav button:hover { background: var(--bg); color: var(--ink); }
   nav button[aria-selected="true"] { color: var(--ink); background: var(--bg); border-left-color: var(--flow); font-weight: 600; }
   #feedback { color: var(--muted); font-size: 13px; min-height: 1.4em; margin-bottom: 8px; }
+  /* Outcome of a button: a toast in the corner, wherever the page is scrolled. */
+  #toast { position: fixed; right: 16px; bottom: 16px; max-width: min(460px, calc(100vw - 32px)); z-index: 10;
+           background: var(--surface); border: 1px solid var(--rule); border-left: 4px solid var(--ok);
+           border-radius: 0 6px 6px 0; padding: 10px 14px; box-shadow: 0 4px 16px rgba(0,0,0,.18); }
+  #toast.bad { border-left-color: var(--bad); }
+  #toast[hidden] { display: none; }
 
   main { max-width: 1200px; width: 100%; padding: 18px 24px 40px; }
   h2 { font-size: 16px; font-weight: 650; margin: 28px 0 10px; }
@@ -192,6 +198,7 @@
 </aside>
 <main>
 <div id="feedback" role="status"></div>
+<div id="toast" hidden></div>
 <section id="tab-overview">
   <div class="alerts" id="alerts"></div>
   <h2>Writes</h2>
@@ -267,7 +274,7 @@
 const HISTORY = 300;  // chart length in samples: 5 minutes at one sample per second
 const series = { up: [], rd: [], dirty: [], par: [] };
 let prev = null, prevTime = 0, last = null, rates = null, delta = () => 0, tab = "overview";
-let diskRO = false;  // the disk is served read-only: nothing to upload, no actions
+let diskRO = false;  // the disk is served read-only: nothing to upload, actions refused
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -294,6 +301,17 @@ function span(s) {
 const kv = rows => `<table class="kv">${rows.map(([k, v, bad]) => `<tr class="${bad ? "bad" : ""}"><td>${k}</td><td>${v}</td></tr>`).join("")}</table>`;
 const panel = (title, body) => `<div class="panel"><div class="title">${title}</div>${body}</div>`;
 const say = text => { $("feedback").textContent = text; };
+let toastTimer = 0;
+/* What a button did; an error stays longer and is announced at once. */
+function toast(text, bad) {
+  const t = $("toast");
+  t.textContent = text;
+  t.className = bad ? "bad" : "";
+  t.setAttribute("role", bad ? "alert" : "status");
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.hidden = true; }, bad ? 10000 : 5000);
+}
 
 /* ---------- tabs ---------- */
 function showTab(t) {
@@ -630,7 +648,6 @@ function renderZones(s) {
   const z = s.zones;
   $("zkinds").textContent = `${num(z.meta_zones)} metadata zones · ${num(z.data_zones + z.unknown_zones)} data zones`;
   $("btn-compact").hidden = s.append !== "SEGMENTS";
-  for (const b of document.querySelectorAll("[data-act]")) b.disabled = diskRO;
 }
 
 /* ---------- details ---------- */
@@ -703,7 +720,7 @@ async function tickBtrfs() {
 }
 function renderBtrfs(b) {
   const busy = !!b.running;
-  for (const btn of document.querySelectorAll("[data-fsact]")) btn.disabled = busy || !b.mounted || diskRO;
+  for (const btn of document.querySelectorAll("[data-fsact]")) btn.disabled = busy || !b.mounted;
   const l = b.last;
   $("b-action").innerHTML = busy ? `${esc(b.running)} is running for ${span(b.running_secs)}.`
     : l ? `Last: ${esc(l.name)} ${l.ok ? "finished" : '<span style="color:var(--bad)">failed</span>'} in ${num(l.secs)} s — ${esc(l.message)}` : "";
@@ -733,24 +750,27 @@ function renderBtrfs(b) {
 }
 
 /* ---------- actions ---------- */
+/* The answer of an action; a refusal ({"error": ...}) is thrown like a failure. */
 async function post(name) {
   const r = await fetch(name, { method: "POST" });
   if (!r.ok) throw new Error("HTTP " + r.status);
-  return r.json();
+  const j = await r.json();
+  if (j.error) throw new Error(j.error);
+  return j;
 }
 for (const b of document.querySelectorAll("[data-act]")) b.onclick = async () => {
   try {
     const j = await post(b.dataset.act);
-    say(b.dataset.act === "compact" ? `Queued ${num(j.queued)} fragmented zones for concatenation.`
+    toast(b.dataset.act === "compact" ? `Queued ${num(j.queued)} fragmented zones for concatenation.`
       : `Uploading ${bytes(j.bytes)} held in RAM for ${num(j.zones)} zones.`);
     tickZones();
-  } catch (e) { say(`${b.textContent} failed: ${e.message}`); }
+  } catch (e) { toast(`${b.textContent} failed: ${e.message}`, true); }
 };
 for (const b of document.querySelectorAll("[data-fsact]")) b.onclick = async () => {
   try {
-    const j = await post(b.dataset.fsact);
-    say(j.error ? `${b.textContent}: ${j.error}` : `${b.textContent}: started.`);
-  } catch (e) { say(`${b.textContent} failed: ${e.message}`); }
+    await post(b.dataset.fsact);
+    toast(`${b.textContent}: started.`);
+  } catch (e) { toast(`${b.textContent} failed: ${e.message}`, true); }
   tickBtrfs();
 };
 

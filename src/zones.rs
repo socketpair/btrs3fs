@@ -389,37 +389,20 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Restores zone state from the objects present in the store: the object
-    /// size is the write pointer, a `<zone>.finished` marker a zone closed by
-    /// FINISH.
-    pub async fn open(cfg: &DiskConfig, layout: Layout, store: Arc<Store>) -> anyhow::Result<Self> {
-        Self::restore(cfg, layout, store, false).await
-    }
-
-    /// `open` for a disk served read-only (SPEC.md §9.2): the store is only
-    /// read, leftovers are left in place, every change is refused.
-    pub async fn open_read_only(
-        cfg: &DiskConfig,
-        layout: Layout,
-        store: Arc<Store>,
-    ) -> anyhow::Result<Self> {
-        Self::restore(cfg, layout, store, true).await
-    }
-
     /// Refuses a change to a disk served read-only.
-    fn writable(&self) -> ZResult<()> {
+    pub fn writable(&self) -> ZResult<()> {
         if self.read_only {
             return Err(ZoneError::ReadOnly);
         }
         Ok(())
     }
 
-    async fn restore(
-        cfg: &DiskConfig,
-        layout: Layout,
-        store: Arc<Store>,
-        read_only: bool,
-    ) -> anyhow::Result<Self> {
+    /// Restores zone state from the objects present in the store: the object
+    /// size is the write pointer, a `<zone>.finished` marker a zone closed by
+    /// FINISH. A read-only store (SPEC.md §9.2) makes the disk read-only:
+    /// leftovers stay in place and every change is refused.
+    pub async fn open(cfg: &DiskConfig, layout: Layout, store: Arc<Store>) -> anyhow::Result<Self> {
+        let read_only = store.is_read_only();
         let started = boottime();
         let nr_zones = cfg.nr_zones() as usize;
         let segments = cfg.append == AppendMode::Segments;
@@ -469,6 +452,11 @@ impl Engine {
         }
 
         let mut leftovers = Vec::new();
+        let fate = if read_only {
+            "leaving it in place"
+        } else {
+            "deleting it"
+        };
         let (mut full, mut empty, mut closed) = (0, 0, 0);
         let mut zones = Vec::with_capacity(nr_zones);
         let finished_found = finished;
@@ -486,7 +474,7 @@ impl Engine {
                 if g >= end {
                     warn!(
                         "zone {i}: {key} lies past the zone's data at {end:#x}, \
-                         left by an interrupted RESET; deleting it"
+                         left by an interrupted RESET; {fate}"
                     );
                 }
                 leftovers.push(key);
@@ -500,9 +488,7 @@ impl Engine {
             }
             let finished = finished && size > 0;
             if finished_found[i] && !finished {
-                warn!(
-                    "zone {i}: FINISH marker without data, left by an interrupted RESET; deleting it"
-                );
+                warn!("zone {i}: FINISH marker without data, left by an interrupted RESET; {fate}");
                 leftovers.push(layout.finished_key(start));
             }
             let (cond, wp) = if finished || size == cfg.zone_size {
@@ -1492,7 +1478,7 @@ impl Engine {
     /// RESET, which deletes everything under the zone prefix, cannot run
     /// between the check and the PUT and leave a marker on an empty zone.
     async fn store_meta_markers(&self) {
-        if !self.segments || self.read_only {
+        if !self.segments {
             return;
         }
         for zi in 0..self.zones.len() {
@@ -1549,6 +1535,10 @@ impl Engine {
     }
 
     fn queue_compaction(&self, zi: usize, urgent: bool, why: CompactWhy) {
+        if self.read_only {
+            // Nothing concatenates on a disk that is never written.
+            return;
+        }
         let mut q = self.compact_queue.lock().unwrap();
         if q.queued[zi] {
             if !urgent || q.urgent.contains(&zi) {
@@ -1992,7 +1982,7 @@ pub fn zeros(len: u64) -> impl Iterator<Item = Bytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::MemStore;
+    use crate::store::{Backend, MemStore};
 
     const ZS: u64 = 1 << 20;
     const B: u64 = BLOCK_SIZE;
@@ -2006,13 +1996,13 @@ mod tests {
     }
 
     fn mem() -> Arc<Store> {
-        Arc::new(Store::Mem(MemStore::default()))
+        Arc::new(Store::mem(MemStore::default()))
     }
 
     fn mem_store(s: &Store) -> &MemStore {
-        match s {
-            Store::Mem(m) => m,
-            Store::S3(_) => unreachable!(),
+        match s.backend() {
+            Backend::Mem(m) => m,
+            Backend::S3(_) => unreachable!(),
         }
     }
 
@@ -2322,7 +2312,8 @@ mod tests {
 
         let mut cfg = DiskConfig::new(8 * ZS, ZS);
         cfg.append = AppendMode::Segments;
-        let e = Engine::open_read_only(&cfg, Layout::new("t").unwrap(), store.clone())
+        let store = Arc::new(Arc::into_inner(store).unwrap().read_only());
+        let e = Engine::open(&cfg, Layout::new("t").unwrap(), store.clone())
             .await
             .unwrap();
         assert_eq!(read(&e, ZS, 2 * B).await, [blk(1, 1), blk(2, 1)].concat());
@@ -2342,8 +2333,15 @@ mod tests {
                 .all(|r| matches!(r, Some(ZoneError::ReadOnly)))
         );
         assert_eq!(e.compact_all(), 0);
+        // Zone 1 has two segments, yet nothing waits for a concatenation.
+        assert_eq!(e.zone_summary().0.compact_queued, 0);
         assert_eq!(e.dirty_bytes(), 0);
         assert_eq!(keys(&store, "t/").await, before);
+        // The store itself refuses changes, whoever asks.
+        assert!(matches!(
+            store.delete("t/disk.json").await,
+            Err(StoreError::ReadOnly)
+        ));
     }
 
     #[tokio::test]

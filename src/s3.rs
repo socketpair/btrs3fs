@@ -1325,7 +1325,7 @@ mod bucket_tests {
         cfg.validate().unwrap();
         let block = |b: u8, n: usize| Bytes::from(vec![b; n * 4096]);
         {
-            let store = Arc::new(Store::S3(s3.clone()));
+            let store = Arc::new(Store::s3(s3.clone()));
             let e = Engine::open(&cfg, layout.clone(), store).await.unwrap();
             e.write(0, block(1, 2), false).unwrap();
             e.write(1 << 20, block(2, 3), true).unwrap();
@@ -1333,7 +1333,7 @@ mod bucket_tests {
             e.write(2 * 4096, block(3, 1), false).unwrap();
             e.flush_all(Reason::Explicit).await.unwrap(); // PATCH zone 0
         }
-        let store = Arc::new(Store::S3(s3.clone()));
+        let store = Arc::new(Store::s3(s3.clone()));
         let e = Engine::open(&cfg, layout.clone(), store).await.unwrap();
         let r = e.report(0, 2);
         assert_eq!((r[0].wp, r[1].wp), (3 * 4096, (1 << 20) + 3 * 4096));
@@ -1352,7 +1352,7 @@ mod bucket_tests {
                 .is_empty()
         );
         drop(e);
-        let e = Engine::open(&cfg, layout.clone(), Arc::new(Store::S3(s3.clone())))
+        let e = Engine::open(&cfg, layout.clone(), Arc::new(Store::s3(s3.clone())))
             .await
             .unwrap();
         let r = e.report(0, 3);
