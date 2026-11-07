@@ -233,22 +233,31 @@ fn cover(mut found: Vec<(u64, u64)>) -> (Vec<Stored>, Vec<u64>) {
     found.sort_unstable();
     let mut chosen: Vec<Stored> = Vec::new();
     let mut end = 0;
-    while let Some(&(start, size)) = found
-        .iter()
-        .filter(|&&(start, size)| start <= end && start + size > end)
-        .max_by_key(|&&(start, size)| start + size)
-    {
+    // One pass: the objects starting by `end` are scanned once; one that
+    // does not reach past the current best never will, since `end` only grows.
+    let mut next = 0;
+    loop {
+        let mut best: Option<(u64, u64)> = None;
+        while let Some(&(start, size)) = found.get(next).filter(|o| o.0 <= end) {
+            let to = start + size;
+            if to > end && best.is_none_or(|(_, b)| to >= b) {
+                best = Some((start, to));
+            }
+            next += 1;
+        }
+        let Some((start, to)) = best else { break };
         chosen.push(Stored {
             start,
             from: end,
-            to: start + size,
+            to,
         });
-        end = start + size;
+        end = to;
     }
+    let used: std::collections::HashSet<u64> = chosen.iter().map(|c| c.start).collect();
     let leftovers = found
         .iter()
-        .filter(|&&(start, _)| !chosen.iter().any(|c| c.start == start))
         .map(|&(start, _)| start)
+        .filter(|start| !used.contains(start))
         .collect();
     (chosen, leftovers)
 }
@@ -1993,6 +2002,41 @@ mod tests {
         Engine::open(&cfg, Layout::new("t").unwrap(), store)
             .await
             .unwrap()
+    }
+
+    /// The one-pass `cover` picks what the plain greedy search picks.
+    #[test]
+    fn cover_matches_greedy() {
+        fn greedy(mut found: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+            found.sort_unstable();
+            let (mut chosen, mut end) = (Vec::new(), 0);
+            while let Some(&(start, size)) = found
+                .iter()
+                .filter(|&&(start, size)| start <= end && start + size > end)
+                .max_by_key(|&&(start, size)| start + size)
+            {
+                chosen.push((start, start + size));
+                end = start + size;
+            }
+            chosen
+        }
+        let mut seed = 1u64;
+        let mut rnd = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for _ in 0..2000 {
+            let mut starts: Vec<u64> = (0..rnd(8)).map(|_| rnd(16)).collect();
+            starts.sort_unstable();
+            starts.dedup();
+            let found: Vec<(u64, u64)> = starts.iter().map(|&s| (s, 1 + rnd(8))).collect();
+            let (chosen, leftovers) = cover(found.clone());
+            let picked: Vec<(u64, u64)> = chosen.iter().map(|c| (c.start, c.to)).collect();
+            assert_eq!(picked, greedy(found.clone()), "{found:?}");
+            assert_eq!(chosen.len() + leftovers.len(), found.len());
+        }
     }
 
     fn mem() -> Arc<Store> {

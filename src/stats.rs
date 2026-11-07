@@ -811,7 +811,20 @@ mod tests {
         assert_eq!(bounds(Scale::Count), [0, 1, 2, 4, 8, 16, 32, 64]);
         assert_eq!(bounds(Scale::Millis), [1, 2, 5, 10, 20, 50, 100, 200]);
         for sc in [Scale::Bytes, Scale::Millis, Scale::Count] {
-            for v in [0, 1, 2, 3, 4, 5, 99, 4096, 4097, 1 << 40, (1 << 63) + 1, u64::MAX] {
+            for v in [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                99,
+                4096,
+                4097,
+                1 << 40,
+                (1 << 63) + 1,
+                u64::MAX,
+            ] {
                 let b = sc.bucket(v);
                 assert!(v <= sc.bound(b), "{sc:?} {v}");
                 assert!(b == 0 || v > sc.bound(b - 1), "{sc:?} {v}");
