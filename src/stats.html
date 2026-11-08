@@ -35,7 +35,7 @@
   aside { background: var(--surface); border-right: 1px solid var(--rule); padding: 18px 12px; }
   aside .ident { padding: 0 8px 14px; border-bottom: 1px solid var(--rule); margin-bottom: 10px; }
   aside h1 { font-size: 18px; font-weight: 650; margin: 0; overflow-wrap: anywhere; }
-  aside .meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  aside .meta { color: var(--muted); font-size: 13px; margin-top: 2px; overflow-wrap: anywhere; }
   #live { display: block; color: var(--muted); font-size: 13px; margin-top: 8px; }
   #live::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%;
                   background: var(--muted); margin-right: 6px; vertical-align: 1px; }
@@ -199,6 +199,7 @@
 <aside>
   <div class="ident">
     <h1 id="disk">btrs3fs</h1>
+    <div class="meta" id="where"></div>
     <div class="meta" id="meta">connecting to the device server…</div>
     <span id="live">waiting</span>
   </div>
@@ -675,11 +676,20 @@ window.addEventListener("resize", drawZones);
 
 /* What concatenation does right now; SEGMENTS disks only. A fragmented open zone is normal:
    every upload adds a segment, and the zone is concatenated once it has many. */
+/* How zone objects grow, for the header: SEGMENTS also says how it concatenates. */
+function appendMode(s) {
+  if (s.append !== "SEGMENTS") return s.append;
+  return s.copy_min_part ? `SEGMENTS, parts under ${bytes(s.copy_min_part)} read` : "SEGMENTS, all parts copied";
+}
+
 function concatLine(s) {
   if (s.append !== "SEGMENTS") return "";
   const z = s.zones, d = delta;
   const busy = s.compacting || z.compact_queued;
-  return `<p class="note" style="margin-bottom:0">Concatenation: ${busy ? `${num(s.compacting)} running, ${num(z.compact_queued)} waiting` : "idle"}` +
+  const parts = s.copy_min_part
+    ? `pieces under ${bytes(s.copy_min_part)} are read and uploaded again (${bytes(s.compact_read_bytes)} since start), larger ones copied on the server`
+    : "every piece is copied on the server";
+  return `<p class="note" style="margin-bottom:0">Concatenation (${parts}): ${busy ? `${num(s.compacting)} running, ${num(z.compact_queued)} waiting` : "idle"}` +
     ` · ${num(d("compactions"))}/s, ${num(d("compacted_segments"))} segments/s merged · ${num(s.compactions)} done since start` +
     (s.compact_errors ? ` · <span style="color:var(--bad)">${num(s.compact_errors)} failed</span>` : "") + `</p>`;
 }
@@ -972,8 +982,12 @@ function update(s, p, dt) {
 }
 function draw(s) {
   $("disk").textContent = s.disk;
+  // Where the disk lives: prefix in the bucket, the bucket, the S3 service.
+  $("where").textContent = s.bucket
+    ? `prefix ${s.prefix}/ in bucket ${s.bucket} at ${s.endpoint}`
+    : "in RAM, no S3";
   diskRO = !!s.disk_read_only;
-  $("meta").textContent = `on ${s.device} · ${s.append}${diskRO ? " · read-only" : ""} · up ${span(s.uptime_secs)}`;
+  $("meta").textContent = `on ${s.device} · ${appendMode(s)}${diskRO ? " · read-only" : ""} · up ${span(s.uptime_secs)}`;
   document.title = `${s.alerts && s.alerts.length ? "⚠ " : ""}btrs3fs ${s.disk}`;
   if (tab === "overview") renderOverview(s);
   if (tab === "zones") renderZones(s);

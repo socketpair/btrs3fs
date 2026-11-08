@@ -376,6 +376,12 @@ fn serve_disk(
         Backend::S3(s) => Some(format!("{}/{}", s.bucket(), layout.prefix())),
         Backend::Mem(_) => None,
     };
+    // Where the disk lives, for the statistics page.
+    let (endpoint, bucket) = match store.backend() {
+        Backend::S3(s) => (Some(s.endpoint().to_string()), Some(s.bucket().to_string())),
+        Backend::Mem(_) => (None, None),
+    };
+    let prefix = layout.prefix().to_string();
     if let Some(m) = &link {
         tuning::validate(m, cfg.zone_size)?;
     }
@@ -430,7 +436,7 @@ fn serve_disk(
     let started = Instant::now();
     let stats_engine = engine.clone();
     let act_rt = rt.handle().clone();
-    let append = cfg.append;
+    let (append, copy_min_part) = (cfg.append, cfg.copy_min_part);
     stats::set_zone_size(cfg.zone_size);
     let on_ready: device::OnReady = Box::new(move |bdev| {
         let port = stats_opt.filter(|o| !o.no_stats).and_then(|o| {
@@ -451,6 +457,10 @@ fn serve_disk(
                     disk: disk.clone(),
                     device: device.clone(),
                     append,
+                    copy_min_part,
+                    endpoint: endpoint.clone(),
+                    bucket: bucket.clone(),
+                    prefix: prefix.clone(),
                     uptime_secs: started.elapsed().as_secs(),
                     dirty_bytes: stats_engine.dirty_bytes(),
                     dirty_limit: stats_engine.dirty_limit(),

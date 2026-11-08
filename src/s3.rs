@@ -90,6 +90,7 @@ pub struct S3Store {
     append: AppendMode,
     /// The longest silence in the body of an answer (`STALL`).
     stall: Duration,
+    endpoint: String,
 }
 
 /// A transfer with no byte moving this long is dead (user decision; SPEC.md
@@ -125,6 +126,11 @@ impl S3Store {
         &self.bucket
     }
 
+    /// `https://host[:port]` of the S3 service, as in the credentials.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     pub fn new(creds: &Creds, transport: &Transport, retry: RetryPolicy) -> anyhow::Result<Self> {
         let mut builder = reqwest::Client::builder()
             .tcp_nodelay(true)
@@ -148,6 +154,7 @@ impl S3Store {
                 encode_path(&creds.bucket)
             ),
             bucket: creds.bucket.clone(),
+            endpoint: creds.endpoint.trim_end_matches('/').to_string(),
             region: creds.region.clone(),
             credentials: Credentials::new(
                 &creds.access_key,

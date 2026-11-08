@@ -500,6 +500,14 @@ pub struct Snapshot {
     pub device: String,
     /// How zone objects grow; concatenation exists only with `SEGMENTS`.
     pub append: crate::config::AppendMode,
+    /// SEGMENTS: pieces below this concatenation reads and uploads instead
+    /// of copying them on the server (SPEC.md §5); 0: any are copied.
+    pub copy_min_part: u64,
+    /// The S3 service and bucket of the disk (`None` for a RAM disk) and its
+    /// prefix in the bucket.
+    pub endpoint: Option<String>,
+    pub bucket: Option<String>,
+    pub prefix: String,
     pub uptime_secs: u64,
     pub dirty_bytes: u64,
     /// Background uploads start above `dirty_limit`; writes wait at `dirty_hard_limit`.
@@ -581,10 +589,18 @@ pub struct Snapshot {
 }
 
 /// State of the disk that is not a counter, filled in by the caller.
+#[derive(Default)]
 pub struct DiskState {
     pub disk: String,
     pub device: String,
     pub append: crate::config::AppendMode,
+    /// SEGMENTS: pieces below this concatenation reads instead of copying.
+    pub copy_min_part: u64,
+    /// Where the disk lives: S3 service, bucket (`None` for a RAM disk) and
+    /// prefix.
+    pub endpoint: Option<String>,
+    pub bucket: Option<String>,
+    pub prefix: String,
     pub uptime_secs: u64,
     pub dirty_bytes: u64,
     pub dirty_limit: u64,
@@ -675,6 +691,10 @@ impl Stats {
             disk: d.disk,
             device: d.device,
             append: d.append,
+            copy_min_part: d.copy_min_part,
+            endpoint: d.endpoint,
+            bucket: d.bucket,
+            prefix: d.prefix,
             uptime_secs: d.uptime_secs,
             dirty_bytes: d.dirty_bytes,
             dirty_limit: d.dirty_limit,
@@ -925,12 +945,36 @@ mod tests {
         assert_eq!((empty.count, empty.avg, empty.p50), (0, None, None));
     }
 
+    /// The page shows how zone objects grow and, for SEGMENTS, the part size
+    /// below which concatenation reads pieces instead of copying them.
+    #[test]
+    fn snapshot_carries_the_append_mode() {
+        let d = DiskState {
+            append: crate::config::AppendMode::Segments,
+            copy_min_part: 5 << 20,
+            endpoint: Some("https://s3.example".into()),
+            bucket: Some("b".into()),
+            prefix: "disks/a".into(),
+            ..DiskState::default()
+        };
+        let json = serde_json::to_value(STATS.snapshot(d)).unwrap();
+        assert_eq!(json["append"], "SEGMENTS");
+        assert_eq!(json["copy_min_part"], 5 << 20);
+        assert_eq!(json["endpoint"], "https://s3.example");
+        assert_eq!(json["bucket"], "b");
+        assert_eq!(json["prefix"], "disks/a");
+    }
+
     #[test]
     fn alerts_point_out_problems() {
         let disk = |read_only| DiskState {
             disk: "t/".into(),
             device: "/dev/ublkb9".into(),
             append: Default::default(),
+            copy_min_part: 0,
+            endpoint: None,
+            bucket: None,
+            prefix: "t".into(),
             uptime_secs: 1,
             dirty_bytes: 512 << 20,
             dirty_limit: 256 << 20,
