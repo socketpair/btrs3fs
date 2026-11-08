@@ -1065,12 +1065,15 @@ fn cmd_measure(a: DiskArgs) -> anyhow::Result<i32> {
         "measuring the link to S3 (reading {} objects of the disk)…",
         reads.len()
     );
+    let dir = measure::temp_dir(&layout);
     let plan = measure::Plan {
         reads,
-        write_dir: Some(measure::temp_dir(&layout)),
+        write_dir: Some(dir.clone()),
         budget: None,
     };
-    let measured = rt.block_on(measure::run(&s3, plan))?;
+    let measured = rt.block_on(measure::run(&s3, plan));
+    rt.block_on(measure::cleanup(&s3, &dir))?;
+    let measured = measured?;
     print!("{}", measure::report(&measured));
     Ok(0)
 }

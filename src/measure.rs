@@ -139,20 +139,23 @@ fn pick(reads: &[(String, u64)], len: u64) -> Option<(&str, u64, u64)> {
     Some((key, offset, len))
 }
 
-/// Measures the link. Temporary objects are deleted even if a phase fails.
+/// Deletes the temporary objects of a measurement under `dir`.
+pub async fn cleanup(s3: &S3Store, dir: &str) -> anyhow::Result<()> {
+    let keys: Vec<String> = s3
+        .list(&format!("{dir}/"))
+        .await?
+        .into_iter()
+        .map(|o| o.key)
+        .collect();
+    s3.delete_many(&keys).await?;
+    Ok(())
+}
+
+/// Measures the link; the caller deletes the temporary objects (`cleanup`),
+/// also when this fails.
 pub async fn run(s3: &S3Store, plan: Plan) -> anyhow::Result<Measured> {
     let started = Instant::now();
-    let result = phases(s3, &plan, started).await;
-    if let Some(dir) = &plan.write_dir {
-        let keys: Vec<String> = s3
-            .list(&format!("{dir}/"))
-            .await?
-            .into_iter()
-            .map(|o| o.key)
-            .collect();
-        s3.delete_many(&keys).await?;
-    }
-    let (chars, latency_p90) = result?;
+    let (chars, latency_p90) = phases(s3, &plan, started).await?;
     let skipped = PHASE_NAMES
         .iter()
         .zip([

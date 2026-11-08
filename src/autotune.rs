@@ -22,6 +22,40 @@ const TICK: Duration = Duration::from_millis(100);
 const TICKS_PER_STEP: u32 = 10;
 /// A step is saturated when all slots were busy at this share of its ticks.
 const SATURATED_SHARE: f64 = 0.8;
+/// How long a measurement waits for the S3 operations in flight: new ones
+/// queue behind it meanwhile, so it gives up rather than stall the disk.
+const PAUSE_WAIT: Duration = Duration::from_secs(10);
+/// Deleting the temporary objects runs after the pause, but not forever:
+/// what is left is deleted at the next start.
+const CLEANUP_TIME: Duration = Duration::from_secs(30);
+
+/// Waits until no S3 operation is in flight and holds new ones back;
+/// `waiting` hears how many are still in flight. Gives up after `limit`,
+/// which lets the queued operations go on.
+async fn pause_within<'a>(
+    store: &'a crate::store::Store,
+    limit: Duration,
+    mut waiting: impl FnMut(usize),
+) -> Result<tokio::sync::RwLockWriteGuard<'a, ()>, String> {
+    let deadline = tokio::time::Instant::now() + limit;
+    let pause = store.pause();
+    tokio::pin!(pause);
+    loop {
+        tokio::select! {
+            guard = &mut pause => return Ok(guard),
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                waiting(store.in_flight());
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "S3 is busy: {} S3 operations still in flight after {} s",
+                        store.in_flight(),
+                        limit.as_secs_f64()
+                    ));
+                }
+            }
+        }
+    }
+}
 
 /// Byte and request counters of S3 traffic since the start.
 #[derive(Clone, Copy, Debug, Default)]
@@ -500,28 +534,34 @@ impl Autotune {
             .s3_store()
             .ok_or_else(|| anyhow::anyhow!("a measurement needs S3"))?
             .clone();
-        let pause = store.pause();
-        tokio::pin!(pause);
-        let _paused = loop {
-            tokio::select! {
-                guard = &mut pause => break guard,
-                _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                    self.st.lock().unwrap().measure.waiting_ops = store.in_flight();
-                }
-            }
-        };
+        let paused = pause_within(&store, PAUSE_WAIT, |n| {
+            self.st.lock().unwrap().measure.waiting_ops = n;
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
         {
             let mut st = self.st.lock().unwrap();
             st.measure.state = "measuring";
             st.measure.waiting_ops = 0;
         }
         info!("measuring the link to S3; S3 operations wait meanwhile");
+        let write_dir = (!self.read_only).then(|| measure::temp_dir(self.engine.layout()));
         let plan = measure::Plan {
             reads: self.engine.measure_candidates(),
-            write_dir: (!self.read_only).then(|| measure::temp_dir(self.engine.layout())),
+            write_dir: write_dir.clone(),
             budget: Some(measure::BUDGET),
         };
-        measure::run(&s3, plan).await
+        let measured = measure::run(&s3, plan).await;
+        drop(paused);
+        // Only the measurement's own objects: no need to hold the disk back.
+        if let Some(dir) = write_dir {
+            match tokio::time::timeout(CLEANUP_TIME, measure::cleanup(&s3, &dir)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("cannot delete the measurement objects under {dir}/: {e:#}"),
+                Err(_) => warn!("deleting the measurement objects under {dir}/ timed out"),
+            }
+        }
+        measured
     }
 
     fn finish(&self, result: anyhow::Result<measure::Measured>) {
@@ -577,6 +617,7 @@ mod tests {
     use super::*;
     use crate::config::DiskConfig;
     use crate::store::{Layout, MemStore, Store};
+    use std::time::Duration;
 
     const ZS: u64 = 16 << 20;
 
@@ -692,6 +733,29 @@ mod tests {
         t.set_all(&pairs(&[("uploads", "8"), ("reads", "3")]))
             .unwrap();
         assert_eq!((t.engine.uploads_limit(), t.engine.reads_limit()), (8, 3));
+    }
+
+    /// Operations in flight that do not finish (long retries) must not keep
+    /// every other S3 operation queued behind the measurement.
+    #[tokio::test]
+    async fn pause_gives_up_on_busy_store() {
+        let store = Store::mem(MemStore::default());
+        let busy = store.op().await;
+        let mut waiting = Vec::new();
+        let got = pause_within(&store, Duration::from_millis(100), |n| waiting.push(n)).await;
+        assert!(got.is_err());
+        assert!(got.unwrap_err().contains("1 S3 operations"));
+        // The queued writer is gone: new operations go through at once.
+        tokio::time::timeout(Duration::from_millis(100), store.list("t/"))
+            .await
+            .expect("no writer left in the queue")
+            .unwrap();
+        drop(busy);
+        assert!(
+            pause_within(&store, Duration::from_millis(100), |_| {})
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
