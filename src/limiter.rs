@@ -76,6 +76,7 @@ impl Limiter {
     }
 
     /// Requests waiting for a slot.
+    #[cfg(test)]
     pub fn waiting(&self) -> usize {
         self.waiting.load(Ordering::SeqCst)
     }

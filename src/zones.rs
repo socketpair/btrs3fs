@@ -632,6 +632,7 @@ impl Engine {
     }
 
     /// The read-ahead window; `None`: read-ahead off.
+    #[cfg(test)]
     pub fn read_ahead_window(&self) -> Option<u64> {
         self.read_cache().map(|c| c.window())
     }

@@ -261,9 +261,37 @@ impl Autotune {
     }
 
     /// Sets one value by hand; `auto` gives it back to the daemon.
+    #[cfg(test)]
     pub fn set(&self, key: &str, value: &str) -> Result<(), String> {
+        self.set_all(&[(key.to_string(), value.to_string())])
+    }
+
+    /// Sets values by hand, in order; nothing applies if one is refused.
+    pub fn set_all(&self, pairs: &[(String, String)]) -> Result<(), String> {
         let mut st = self.st.lock().unwrap();
         let mut manual = st.manual;
+        for (key, value) in pairs {
+            manual = Self::with(manual, key, value)?;
+        }
+        tuning::validate(&manual, self.zone_size).map_err(|e| format!("{e:#}"))?;
+        if manual.read_cache.is_some() {
+            let d = tuning::resolve(&manual, &Self::auto(&st), self.zone_size).derived;
+            let ra = ReadAhead {
+                window: d.read_unit,
+                cache: manual.read_cache.unwrap_or(0),
+            };
+            ra.validate(self.zone_size).map_err(|e| format!("{e:#}"))?;
+        }
+        for (key, value) in pairs {
+            info!("statistics page: {key} = {value}");
+        }
+        st.manual = manual;
+        self.apply(&mut st, "set by hand");
+        Ok(())
+    }
+
+    /// `manual` with `key` set to `value` (file syntax) or `auto`.
+    fn with(mut manual: Manual, key: &str, value: &str) -> Result<Manual, String> {
         let one = if value == "auto" {
             linkconf::parse(&format!("{key}: null"))
         } else if value.is_empty() || !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
@@ -287,19 +315,7 @@ impl Autotune {
             "read_cache" => manual.read_cache = one.read_cache,
             _ => return Err(format!("unknown key {key}")),
         }
-        tuning::validate(&manual, self.zone_size).map_err(|e| format!("{e:#}"))?;
-        if manual.read_cache.is_some() {
-            let d = tuning::resolve(&manual, &Self::auto(&st), self.zone_size).derived;
-            let ra = ReadAhead {
-                window: d.read_unit,
-                cache: manual.read_cache.unwrap_or(0),
-            };
-            ra.validate(self.zone_size).map_err(|e| format!("{e:#}"))?;
-        }
-        info!("statistics page: {key} = {value}");
-        st.manual = manual;
-        self.apply(&mut st, "set by hand");
-        Ok(())
+        Ok(manual)
     }
 
     pub fn snapshot(&self) -> LinkState {
@@ -642,6 +658,24 @@ mod tests {
         assert!(t.set("uploads", "8\nreads: 3").is_err());
         assert!(t.set("read_unit", "3M").is_err());
         assert_eq!(t.engine.uploads_limit(), 1); // nothing applied
+    }
+
+    #[tokio::test]
+    async fn set_all_is_all_or_nothing() {
+        let t = tuner(Manual::default()).await;
+        let pairs = |p: &[(&str, &str)]| -> Vec<(String, String)> {
+            p.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        assert!(
+            t.set_all(&pairs(&[("uploads", "8"), ("reads", "0")]))
+                .is_err()
+        );
+        assert_eq!(t.engine.uploads_limit(), 1);
+        t.set_all(&pairs(&[("uploads", "8"), ("reads", "3")]))
+            .unwrap();
+        assert_eq!((t.engine.uploads_limit(), t.engine.reads_limit()), (8, 3));
     }
 
     #[tokio::test]

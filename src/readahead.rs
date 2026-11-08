@@ -22,6 +22,7 @@ pub struct ReadAhead {
 }
 
 impl ReadAhead {
+    #[cfg(test)]
     pub const DISABLED: ReadAhead = ReadAhead {
         window: 0,
         cache: 0,

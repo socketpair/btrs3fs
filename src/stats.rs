@@ -733,13 +733,13 @@ impl Stats {
 }
 
 /// Serves the statistics page on 127.0.0.1:`port` in a background thread.
-/// Serves the page, `GET /<name>.json` and the actions `POST /<name>`:
-/// `json` and `action` get the name and answer with a JSON body, or `None`
-/// for an unknown one.
+/// Serves the page, `GET /<name>.json` and the actions `POST /<name>?<query>`:
+/// `json` gets the name, `action` the name and the raw query (decode it with
+/// `query_pairs`); both answer with a JSON body, or `None` for an unknown name.
 pub fn serve_http(
     port: u16,
     json: impl Fn(&str) -> Option<String> + Send + 'static,
-    action: impl Fn(&str) -> Option<String> + Send + 'static,
+    action: impl Fn(&str, &str) -> Option<String> + Send + 'static,
 ) -> anyhow::Result<()> {
     let server = tiny_http::Server::http(("127.0.0.1", port))
         .map_err(|e| anyhow!("cannot listen on 127.0.0.1:{port}: {e}"))?;
@@ -747,18 +747,18 @@ pub fn serve_http(
         .name("btrs3fs-stats".into())
         .spawn(move || {
             for req in server.incoming_requests() {
-                let path = req.url().split('?').next().unwrap_or_default();
+                let (path, query) = req.url().split_once('?').unwrap_or((req.url(), ""));
                 let post = *req.method() == tiny_http::Method::Post;
                 let (status, body, content_type) = match path {
                     _ if !from_our_page(&req) => {
                         (403, "forbidden\n".into(), "text/plain; charset=utf-8")
                     }
                     // POST only: links and browser prefetch must not start actions.
-                    p if post => match action(p.trim_start_matches('/')) {
+                    p if post => match action(p.trim_start_matches('/'), query) {
                         Some(json) => (200, json, "application/json"),
                         None => (404, "no such action\n".into(), "text/plain; charset=utf-8"),
                     },
-                    "/compact" | "/flush" | "/balance" | "/syncfs" => {
+                    "/compact" | "/flush" | "/balance" | "/syncfs" | "/link" | "/measure" => {
                         (405, "use POST\n".into(), "text/plain; charset=utf-8")
                     }
                     "/" | "/index.html" => (200, PAGE.to_string(), "text/html; charset=utf-8"),
@@ -779,6 +779,41 @@ pub fn serve_http(
         })?;
     info!("statistics on http://127.0.0.1:{port}/");
     Ok(())
+}
+
+/// `%XX` and `+` of a URL query decoded; a broken escape stays as written.
+pub fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < b.len() => match (hex(b[i + 1]), hex(b[i + 2])) {
+                (Some(h), Some(l)) => {
+                    out.push((h * 16 + l) as u8);
+                    i += 2;
+                }
+                _ => out.push(b'%'),
+            },
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `a=1&b=2` as decoded pairs, in order; empty parts are skipped.
+pub fn query_pairs(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let (k, v) = p.split_once('=').unwrap_or((p, ""));
+            (percent_decode(k), percent_decode(v))
+        })
+        .collect()
 }
 
 /// Only pages and tools of this host may use the server, which runs as
@@ -942,6 +977,21 @@ mod tests {
     }
 
     #[test]
+    fn query_pairs_decode() {
+        assert_eq!(percent_decode("38%6Ds"), "38ms");
+        assert_eq!(percent_decode("a+b%20c"), "a b c");
+        assert_eq!(percent_decode("bad%zz"), "bad%zz");
+        assert_eq!(
+            query_pairs("latency=38%6Ds&uploads=auto&&x"),
+            [
+                ("latency".to_string(), "38ms".to_string()),
+                ("uploads".to_string(), "auto".to_string()),
+                ("x".to_string(), String::new())
+            ]
+        );
+    }
+
+    #[test]
     fn serves_page_and_json() {
         // Port 0 cannot be used with a fixed URL; pick a high fixed test port.
         let port = 39470;
@@ -956,7 +1006,11 @@ mod tests {
                     .unwrap()
                 })
             },
-            |name| (name == "compact").then(|| "{\"queued\":3}".to_string()),
+            |name, query| match name {
+                "compact" => Some("{\"queued\":3}".to_string()),
+                "link" => Some(format!("{{\"query\":\"{query}\"}}")),
+                _ => None,
+            },
         )
         .unwrap();
         let ours = format!("127.0.0.1:{port}");
@@ -985,6 +1039,12 @@ mod tests {
         let posted = send("POST", "/compact");
         assert!(posted.starts_with("HTTP/1.1 200") && posted.ends_with("{\"queued\":3}"));
         assert!(send("POST", "/nope").starts_with("HTTP/1.1 404"));
+        // The query reaches the action, decoded.
+        let linked = send("POST", "/link?latency=38%6Ds&uploads=8");
+        assert!(
+            linked.ends_with("{\"query\":\"latency=38%6Ds&uploads=8\"}"),
+            "{linked}"
+        );
         // The page itself posts with its own origin; localhost works too.
         let page_origin = format!("http://{ours}");
         assert!(request("POST", "/compact", &ours, Some(&page_origin)).starts_with("HTTP/1.1 200"));

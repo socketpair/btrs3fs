@@ -423,37 +423,55 @@ fn serve_disk(
                 })
             };
             let act_rt = act_rt.clone();
-            let action = move |name: &str| match name {
-                // Every action changes the disk.
-                _ if read_only => {
-                    Some(serde_json::json!({ "error": "the disk is served read-only" }).to_string())
-                }
-                "balance" | "syncfs" => Some(match fs.start(name) {
-                    Ok(()) => r#"{"started":true}"#.to_string(),
-                    Err(e) => serde_json::json!({ "error": e }).to_string(),
-                }),
-                "compact" => Some(format!("{{\"queued\":{}}}", act_engine.compact_all())),
-                "flush" => {
-                    let pending = act_engine.unflushed();
-                    let bytes: u64 = pending.iter().map(|&(_, b)| b).sum();
-                    info!(
-                        "statistics page: uploading {bytes} buffered bytes of {} zones",
-                        pending.len()
-                    );
-                    let e = act_engine.clone();
-                    act_rt.spawn(async move {
-                        if let Err(e) = e.flush_all(stats::Reason::Manual).await {
-                            warn!("upload asked from the statistics page failed: {e}");
-                        }
-                    });
-                    Some(format!("{{\"zones\":{},\"bytes\":{bytes}}}", pending.len()))
-                }
-                _ => None,
-            };
+            let act_tune = tune.clone();
+            let json_tune = tune.clone();
+            let action =
+                move |name: &str, query: &str| match name {
+                    // Link settings and measurements: a read-only disk only reads.
+                    "link" => Some(match &act_tune {
+                        Some(t) => link_settings(t, query),
+                        None => serde_json::json!({ "error": "no link tuning on this device" })
+                            .to_string(),
+                    }),
+                    "measure" => Some(match act_tune.as_ref().map(|t| t.measure()) {
+                        Some(Ok(())) => r#"{"started":true}"#.to_string(),
+                        Some(Err(e)) => serde_json::json!({ "error": e }).to_string(),
+                        None => serde_json::json!({ "error": "no link tuning on this device" })
+                            .to_string(),
+                    }),
+                    // Every other action changes the disk.
+                    _ if read_only => Some(
+                        serde_json::json!({ "error": "the disk is served read-only" }).to_string(),
+                    ),
+                    "balance" | "syncfs" => Some(match fs.start(name) {
+                        Ok(()) => r#"{"started":true}"#.to_string(),
+                        Err(e) => serde_json::json!({ "error": e }).to_string(),
+                    }),
+                    "compact" => Some(format!("{{\"queued\":{}}}", act_engine.compact_all())),
+                    "flush" => {
+                        let pending = act_engine.unflushed();
+                        let bytes: u64 = pending.iter().map(|&(_, b)| b).sum();
+                        info!(
+                            "statistics page: uploading {bytes} buffered bytes of {} zones",
+                            pending.len()
+                        );
+                        let e = act_engine.clone();
+                        act_rt.spawn(async move {
+                            if let Err(e) = e.flush_all(stats::Reason::Manual).await {
+                                warn!("upload asked from the statistics page failed: {e}");
+                            }
+                        });
+                        Some(format!("{{\"zones\":{},\"bytes\":{bytes}}}", pending.len()))
+                    }
+                    _ => None,
+                };
             let json = move |name: &str| match name {
                 "stats.json" => serde_json::to_string(&snapshot()).ok(),
                 "btrfs.json" => serde_json::to_string(&json_fs.info()).ok(),
                 "zones.json" => serde_json::to_string(&map_engine.zone_map()).ok(),
+                "link.json" => json_tune
+                    .as_ref()
+                    .and_then(|t| serde_json::to_string(&t.snapshot()).ok()),
                 // One zone in full, on a click on the zone map; its block
                 // level part alone, refreshed while the zone is shown.
                 name => {
@@ -479,6 +497,19 @@ fn serve_disk(
     });
     let ctrl = device::serve(&cfg, engine.clone(), rt.handle().clone(), &opts, on_ready)?;
     Ok((engine, ctrl))
+}
+
+/// `POST /link?<key>=<value|auto>&…`: every pair checked first, then all
+/// applied in order; nothing applies when one is refused.
+fn link_settings(t: &autotune::Autotune, query: &str) -> String {
+    let pairs = stats::query_pairs(query);
+    if pairs.is_empty() {
+        return serde_json::json!({ "error": "nothing to set" }).to_string();
+    }
+    if let Err(e) = t.set_all(&pairs) {
+        return serde_json::json!({ "error": e }).to_string();
+    }
+    r#"{"ok":true}"#.to_string()
 }
 
 /// How `serve_disk` exposes the device.
