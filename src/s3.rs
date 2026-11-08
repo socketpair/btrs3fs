@@ -923,6 +923,12 @@ fn classify(status: StatusCode, body: &str, key: &str) -> Attempt {
         StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED => {
             Attempt::Fatal(StoreError::Unsupported(format!("{key}: {detail}")))
         }
+        // MinIO: 400 BadRequest "An unsupported API call for method: PATCH".
+        StatusCode::BAD_REQUEST
+            if xml_tag(body, "Message").is_some_and(|m| m.contains("unsupported API call")) =>
+        {
+            Attempt::Fatal(StoreError::Unsupported(format!("{key}: {detail}")))
+        }
         StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT => {
             Attempt::Retry(anyhow!(detail))
         }
@@ -1304,6 +1310,24 @@ mod tests {
         assert!(retried(
             403,
             "<Error><Code>RequestTimeTooSkewed</Code></Error>"
+        ));
+    }
+
+    /// MinIO answers a method it does not implement (PATCH) with 400
+    /// BadRequest, not 405/501: still "not supported", so `create` goes on
+    /// to the next way of appending.
+    #[test]
+    fn minio_unsupported_method() {
+        let minio = "<Error><Code>BadRequest</Code><Message>An unsupported API call for method: \
+                     PATCH at &#39;/b/k&#39;</Message></Error>";
+        assert!(matches!(
+            classify(StatusCode::BAD_REQUEST, minio, "k"),
+            Attempt::Fatal(StoreError::Unsupported(_))
+        ));
+        let other = "<Error><Code>BadRequest</Code><Message>bad digest</Message></Error>";
+        assert!(!matches!(
+            classify(StatusCode::BAD_REQUEST, other, "k"),
+            Attempt::Fatal(StoreError::Unsupported(_))
         ));
     }
 
