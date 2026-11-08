@@ -23,6 +23,15 @@ const TICKS_PER_STEP: u32 = 10;
 /// A step is saturated when all slots were busy at this share of its ticks.
 const SATURATED_SHARE: f64 = 0.8;
 
+/// Byte and request counters of S3 traffic since the start.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Totals {
+    pub read: u64,
+    pub written: u64,
+    pub gets: u64,
+    pub uploads: u64,
+}
+
 #[derive(Default)]
 struct Ticks {
     n: u32,
@@ -53,7 +62,7 @@ struct State {
     applied: Option<(Derived, u64)>,
     effective: Option<Effective>,
     ticks: Ticks,
-    last: Option<(f64, u64, u64)>,
+    last: Option<(f64, Totals)>,
     measure: MeasureState,
 }
 
@@ -162,8 +171,12 @@ impl Autotune {
             if n % TICKS_PER_STEP == 0 {
                 self.step(
                     now_secs(),
-                    STATS.read_from_s3.get(),
-                    STATS.upload_size.sum(),
+                    Totals {
+                        read: STATS.read_from_s3.get(),
+                        written: STATS.upload_size.sum(),
+                        gets: STATS.gets.get(),
+                        uploads: STATS.upload_size.count(),
+                    },
                 );
             }
         }
@@ -178,11 +191,11 @@ impl Autotune {
         st.ticks.reads_busy += busy(self.engine.get_limiter()) as u32;
     }
 
-    /// One step: `read`/`written` are byte counters since the start.
-    pub fn step(&self, now: f64, read: u64, written: u64) {
+    /// One step, with the counters since the start.
+    pub fn step(&self, now: f64, t: Totals) {
         let mut st = self.st.lock().unwrap();
         let ticks = std::mem::take(&mut st.ticks);
-        let Some((then, read0, written0)) = st.last.replace((now, read, written)) else {
+        let Some((then, t0)) = st.last.replace((now, t)) else {
             return;
         };
         let dt = (now - then).max(1e-3);
@@ -193,16 +206,18 @@ impl Autotune {
         // under a limit set otherwise.
         if e.derived.uploads == st.uploads.limit() && manual.uploads.is_none() {
             st.uploads.step(Sample {
-                bytes_per_sec: written.saturating_sub(written0) as f64 / dt,
+                bytes_per_sec: t.written.saturating_sub(t0.written) as f64 / dt,
                 saturated: saturated(ticks.uploads_busy),
+                completions: t.uploads.saturating_sub(t0.uploads),
                 retries: OBS.take_retries(Dir::Write),
                 now_secs: now,
             });
         }
         if e.derived.reads == st.reads.limit() && manual.reads.is_none() {
             st.reads.step(Sample {
-                bytes_per_sec: read.saturating_sub(read0) as f64 / dt,
+                bytes_per_sec: t.read.saturating_sub(t0.read) as f64 / dt,
                 saturated: saturated(ticks.reads_busy),
+                completions: t.gets.saturating_sub(t0.gets),
                 retries: OBS.take_retries(Dir::Read),
                 now_secs: now,
             });
@@ -612,9 +627,9 @@ mod tests {
     #[tokio::test]
     async fn saturated_steps_grow_connections() {
         let t = tuner(Manual::default()).await;
-        let (mut read, mut now) = (0u64, 0.0);
-        t.step(now, read, 0); // the first step only starts the counters
-        for _ in 0..3 {
+        let (mut totals, mut now) = (Totals::default(), 0.0);
+        t.step(now, totals); // the first step only starts the counters
+        for _ in 0..9 {
             // All GET slots busy for the whole second, the rate doubling with them.
             let held: Vec<_> = futures_util::future::join_all(
                 (0..t.engine.reads_limit()).map(|_| t.engine.get_limiter().acquire()),
@@ -625,8 +640,9 @@ mod tests {
             }
             drop(held);
             now += 1.0;
-            read += t.engine.reads_limit() as u64 * (1 << 20);
-            t.step(now, read, 0);
+            totals.read += t.engine.reads_limit() as u64 * (1 << 20);
+            totals.gets += t.engine.reads_limit() as u64;
+            t.step(now, totals);
         }
         assert_eq!(t.engine.reads_limit(), 8);
         assert_eq!(t.engine.uploads_limit(), 1); // not saturated: unchanged

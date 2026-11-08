@@ -133,6 +133,11 @@ impl Histogram {
         self.sum.load(Relaxed)
     }
 
+    /// How many values were recorded.
+    pub fn count(&self) -> u64 {
+        self.counts.iter().map(|c| c.load(Relaxed)).sum()
+    }
+
     fn snapshot(&self) -> Hist {
         let counts: Vec<u64> = self.counts.iter().map(|c| c.load(Relaxed)).collect();
         let used = || {

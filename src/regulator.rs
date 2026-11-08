@@ -13,8 +13,14 @@ const PROBE_GAIN: f64 = 1.05;
 const PROBE_EVERY: f64 = 30.0;
 /// Throughput below this share of the best at the same load: the link got worse.
 const DROP: f64 = 2.0 / 3.0;
-/// Weight of a new steady sample in the best throughput (smoothing).
+/// Weight of a new steady window in the best throughput (smoothing).
 const STEADY_WEIGHT: f64 = 0.2;
+/// A decision needs a window of at least this many saturated seconds with at
+/// least `WINDOW_COMPLETIONS` requests finished in it: bytes count when a
+/// request completes (an upload of a whole zone may take seconds), so one
+/// second alone is noise.
+const WINDOW_SECS: f64 = 3.0;
+const WINDOW_COMPLETIONS: u64 = 3;
 
 /// One step's view of the link in one direction.
 #[derive(Clone, Copy, Debug)]
@@ -22,6 +28,8 @@ pub struct Sample {
     pub bytes_per_sec: f64,
     /// All slots were busy most of the step: the limit, not the demand, set the rate.
     pub saturated: bool,
+    /// Requests that finished in the step.
+    pub completions: u64,
     pub retries: u64,
     pub now_secs: f64,
 }
@@ -46,6 +54,8 @@ pub struct Regulator {
     best: Option<(usize, f64)>,
     next_probe: f64,
     last_change: Option<(f64, String)>,
+    /// The window being gathered at the current limit: (seconds, bytes, completions).
+    window: (f64, f64, u64),
 }
 
 impl Default for Regulator {
@@ -62,6 +72,7 @@ impl Regulator {
             best: None,
             next_probe: 0.0,
             last_change: None,
+            window: (0.0, 0.0, 0),
         }
     }
 
@@ -89,6 +100,7 @@ impl Regulator {
 
     /// Starts over from `n` (after a measurement).
     pub fn restart_from(&mut self, n: usize) {
+        self.window = (0.0, 0.0, 0);
         self.limit = n.clamp(1, CONNECTIONS_MAX);
         self.phase = Phase::SlowStart { before: None };
         self.best = None;
@@ -96,6 +108,8 @@ impl Regulator {
 
     fn change(&mut self, now: f64, to: usize, why: String) {
         let to = to.clamp(1, CONNECTIONS_MAX);
+        // A new limit, a new window: the old one says nothing about it.
+        self.window = (0.0, 0.0, 0);
         if to != self.limit {
             self.last_change = Some((now, format!("{} → {to}: {why}", self.limit)));
             self.limit = to;
@@ -122,9 +136,19 @@ impl Regulator {
             return self.limit;
         }
         if !s.saturated {
+            // Demand, not the limit, set this rate: start the window over.
+            self.window = (0.0, 0.0, 0);
             return self.limit;
         }
-        let rate = s.bytes_per_sec;
+        let w = &mut self.window;
+        w.0 += 1.0;
+        w.1 += s.bytes_per_sec;
+        w.2 += s.completions;
+        if w.0 < WINDOW_SECS || w.2 < WINDOW_COMPLETIONS {
+            return self.limit;
+        }
+        let rate = w.1 / w.0;
+        self.window = (0.0, 0.0, 0);
         match self.phase {
             Phase::SlowStart { before } => {
                 if before.is_none_or(|b| rate >= b * DOUBLING_GAIN) {
@@ -204,6 +228,7 @@ mod tests {
             r.step(Sample {
                 bytes_per_sec: rate,
                 saturated: true,
+                completions: 10,
                 retries: 0,
                 now_secs: *t,
             });
@@ -219,7 +244,7 @@ mod tests {
             total: 24.0 * MIB,
         };
         let mut t = 0.0;
-        run(&mut r, &link, &mut t, 10);
+        run(&mut r, &link, &mut t, 30);
         assert!((8..=16).contains(&r.limit()), "{}", r.limit());
         let best = r.best_rate().unwrap();
         assert!((best - 24.0 * MIB).abs() < 2.4 * MIB, "{best}");
@@ -233,7 +258,7 @@ mod tests {
             total: 24.0 * MIB,
         };
         let mut t = 0.0;
-        run(&mut r, &link, &mut t, 10);
+        run(&mut r, &link, &mut t, 30);
         assert_eq!(r.limit(), 2);
     }
 
@@ -245,7 +270,7 @@ mod tests {
             total: 24.0 * MIB,
         };
         let mut t = 0.0;
-        run(&mut r, &link, &mut t, 10);
+        run(&mut r, &link, &mut t, 30);
         let mut changes = Vec::new();
         let mut last = r.limit();
         for _ in 0..120 {
@@ -272,14 +297,14 @@ mod tests {
             stream: 1.0 * MIB,
             total: 10.0 * MIB,
         };
-        run(&mut r, &link, &mut t, 10);
+        run(&mut r, &link, &mut t, 30);
         let settled = r.limit();
         assert!(settled >= 8, "{settled}");
         let link = Link {
             stream: 1.0 * MIB,
             total: 12.0 * MIB,
         };
-        run(&mut r, &link, &mut t, 70);
+        run(&mut r, &link, &mut t, 100);
         assert!(r.limit() > settled.min(10), "{} {settled}", r.limit());
     }
 
@@ -301,9 +326,9 @@ mod tests {
             stream: 3.0 * MIB,
             total: 6.0 * MIB,
         };
-        run(&mut r, &vpn, &mut t, 3);
+        run(&mut r, &vpn, &mut t, 4);
         assert!(r.limit() <= before / 2, "{} of {before}", r.limit());
-        run(&mut r, &vpn, &mut t, 10);
+        run(&mut r, &vpn, &mut t, 30);
         assert!((2..=4).contains(&r.limit()), "{}", r.limit());
         assert_eq!(r.phase(), "steady");
     }
@@ -325,6 +350,7 @@ mod tests {
         r.step(Sample {
             bytes_per_sec: 24.0 * MIB,
             saturated: true,
+            completions: 10,
             retries: 2,
             now_secs: t + 1.0,
         });
@@ -350,11 +376,55 @@ mod tests {
             r.step(Sample {
                 bytes_per_sec: 0.0,
                 saturated: false,
+                completions: 10,
                 retries: 0,
                 now_secs: t + i as f64,
             });
         }
         assert_eq!((r.limit(), r.best_rate()), (limit, best));
+    }
+
+    /// Uploads count when they complete: a slow link has saturated seconds
+    /// with nothing finished. Those say nothing, so nothing changes.
+    #[test]
+    fn steps_without_completions_are_no_evidence() {
+        let sample = |rate: f64, completions: u64, t: f64| Sample {
+            bytes_per_sec: rate,
+            saturated: true,
+            completions,
+            retries: 0,
+            now_secs: t,
+        };
+        let mut r = Regulator::new();
+        for i in 0..60 {
+            r.step(sample(0.0, 0, i as f64));
+        }
+        assert_eq!(r.limit(), 1);
+        assert_eq!(r.best_rate(), None);
+        // Once uploads complete, slow start goes on.
+        for i in 60..70 {
+            r.step(sample(3.0 * MIB, 1, i as f64));
+        }
+        assert!(r.limit() >= 2, "{}", r.limit());
+    }
+
+    /// One completion per second is noise: the rate is judged over windows
+    /// of several completions and several seconds.
+    #[test]
+    fn decisions_wait_for_a_window() {
+        let sample = |t: f64| Sample {
+            bytes_per_sec: 3.0 * MIB,
+            saturated: true,
+            completions: 5,
+            retries: 0,
+            now_secs: t,
+        };
+        let mut r = Regulator::new();
+        r.step(sample(0.0));
+        r.step(sample(1.0));
+        assert_eq!(r.limit(), 1, "decided before a whole window");
+        r.step(sample(2.0));
+        assert_eq!(r.limit(), 2);
     }
 
     #[test]
