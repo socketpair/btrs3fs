@@ -954,13 +954,21 @@ fn cmd_create(a: CreateArgs) -> anyhow::Result<i32> {
                 Err(e) => return Err(e.into()),
             }
         }
-        let existing = s3.list(&layout.dir()).await?;
+        let listed = s3.list(&layout.dir()).await?;
+        let (existing, leftovers) = existing_objects(&layout, &listed);
         if !existing.is_empty() {
             bail!(
                 "prefix {} already holds {} objects; destroy the old disk first",
                 layout.dir(),
                 existing.len()
             );
+        }
+        if !leftovers.is_empty() {
+            info!(
+                "deleting {} objects of an interrupted link measurement",
+                leftovers.len()
+            );
+            s3.delete_many(&leftovers).await?;
         }
         cfg.append = s3.detect_append(&layout.dir()).await?;
         info!("appending to zone objects with {:?}", cfg.append);
@@ -986,6 +994,15 @@ fn cmd_create(a: CreateArgs) -> anyhow::Result<i32> {
     }
     info!("disk {} is ready", layout.dir());
     Ok(0)
+}
+
+/// Objects under a prefix `create` must not overwrite, and leftovers of an
+/// interrupted `btrs3fs measure` there, which it deletes.
+fn existing_objects(layout: &Layout, listed: &[store::ObjectInfo]) -> (Vec<String>, Vec<String>) {
+    listed
+        .iter()
+        .map(|o| o.key.clone())
+        .partition(|k| !layout.is_measure_key(k))
 }
 
 /// Brings up a temporary device, runs mkfs.btrfs on it and stores the result.
@@ -1123,6 +1140,21 @@ fn destroy_prefix(rt: &Runtime, s3: &S3Store, layout: &Layout) -> anyhow::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn measurement_leftovers_do_not_block_create() {
+        let layout = Layout::new("d").unwrap();
+        let obj = |key: &str| store::ObjectInfo {
+            key: key.into(),
+            size: 1,
+        };
+        let listed = [obj("d/measure-1f/w-3"), obj("d/measure-1f/small")];
+        let (blocking, leftovers) = existing_objects(&layout, &listed);
+        assert!(blocking.is_empty());
+        assert_eq!(leftovers, ["d/measure-1f/w-3", "d/measure-1f/small"]);
+        let listed = [obj("d/measure-1f/w-3"), obj("d/0000000000000000")];
+        assert_eq!(existing_objects(&layout, &listed).0, ["d/0000000000000000"]);
+    }
 
     #[test]
     fn options() {
