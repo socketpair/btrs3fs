@@ -116,6 +116,11 @@ pub struct DiskConfig {
     pub queue_depth: u16,
     #[serde(default)]
     pub append: AppendMode,
+    /// SEGMENTS: pieces smaller than this are read and uploaded when a zone is
+    /// concatenated, not copied on the server; the minimum size of a
+    /// multipart part where the server has one (SPEC.md §5). 0: any.
+    #[serde(default)]
+    pub copy_min_part: u64,
 }
 
 impl DiskConfig {
@@ -136,6 +141,7 @@ impl DiskConfig {
             nr_queues: DEFAULT_QUEUES,
             queue_depth: DEFAULT_QUEUE_DEPTH,
             append: AppendMode::Patch,
+            copy_min_part: 0,
         }
     }
 
@@ -441,6 +447,19 @@ mod tests {
         assert!(yaml.contains("append: SEGMENTS"), "{yaml}");
         assert_eq!(DiskConfig::parse(yaml.as_bytes()).unwrap(), cfg);
         assert!(DiskConfig::parse(br#"{"version":1}"#).is_err());
+    }
+
+    /// Disks made before `copy_min_part` copied every part on the server.
+    #[test]
+    fn copy_min_part_defaults_to_zero() {
+        let mut json = serde_json::to_value(DiskConfig::new(1 << 30, 16 << 20)).unwrap();
+        assert_eq!(json["copy_min_part"], 0);
+        json.as_object_mut().unwrap().remove("copy_min_part");
+        let old = DiskConfig::parse(json.to_string().as_bytes()).unwrap();
+        assert_eq!(old.copy_min_part, 0);
+        let mut cfg = DiskConfig::new(1 << 30, 16 << 20);
+        cfg.copy_min_part = 5 << 20;
+        assert_eq!(DiskConfig::parse(cfg.to_yaml().as_bytes()).unwrap(), cfg);
     }
 
     /// Disks created before disk.yaml have a disk.json: YAML reads JSON.
