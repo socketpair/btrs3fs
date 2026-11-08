@@ -3,6 +3,7 @@ mod btrfs_zone;
 mod config;
 mod device;
 mod ident;
+mod limiter;
 mod linkconf;
 mod logging;
 mod measure;
@@ -388,12 +389,11 @@ fn serve_disk(
         window: t.read_unit,
         cache: read_cache,
     });
-    let mut engine = engine.with_read_ahead(read_ahead)?;
+    engine.set_read_ahead(read_ahead)?;
     if let Some(t) = tuning {
-        engine = engine
-            .with_uploads(t.uploads)
-            .with_reads(t.reads)
-            .with_get_part(t.read_unit);
+        engine.set_uploads(t.uploads);
+        engine.set_reads(t.reads);
+        engine.set_get_part(t.read_unit);
     }
     let engine = Arc::new(engine);
     // A read-only disk has nothing to upload, concatenate or mark.

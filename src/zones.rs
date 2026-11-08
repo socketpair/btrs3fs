@@ -12,6 +12,7 @@
 //! `Zone::state` (sync, never held across `.await`).
 
 use crate::config::{AppendMode, BLOCK_SIZE, DiskConfig};
+use crate::limiter::Limiter;
 use crate::readahead::{ReadAhead, ReadCache};
 use crate::stats::{InFlight, Reason, STATS, ZoneCounts};
 use crate::store::{Body, Layout, PendingConcat, Store, StoreError};
@@ -22,7 +23,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
 
 /// S3 requests run at once without a link to tune for: uploads of the
 /// temporary `create` device and tests. Judgement call: enough to keep a link
@@ -370,20 +371,18 @@ pub struct Engine {
     room: Notify,
     /// Wakes the background flusher.
     kick: Notify,
-    /// `None`: read-ahead disabled.
-    read_cache: Option<ReadCache>,
-    /// Uploads at once, all reasons together; also how many zones FLUSH and
-    /// the background flusher start at once.
-    uploads: usize,
-    /// `uploads` permits shared by every upload, whatever its reason
-    /// (SPEC.md §5).
-    upload_slots: Semaphore,
+    /// `None`: read-ahead disabled. Replaced whole when the window changes
+    /// (SPEC.md §6.1); readers keep the one they started with.
+    read_cache: Mutex<Option<Arc<ReadCache>>>,
+    /// Uploads at once, all reasons together, shared by every upload
+    /// whatever its reason (SPEC.md §5); its limit is also how many zones
+    /// FLUSH and the background flusher start at once. Changes at run time.
+    upload_slots: Limiter,
     /// GETs at once, every read together (SPEC.md §6.1).
-    reads: usize,
-    get_slots: Semaphore,
+    get_slots: Limiter,
     /// Store reads larger than this go out as parallel GETs of this size
-    /// (SPEC.md §6.2).
-    get_part: u64,
+    /// (SPEC.md §6.2); `u64::MAX`: not split.
+    get_part: AtomicU64,
     /// A SEGMENTS disk: every upload is a new object (SPEC.md §5).
     segments: bool,
     compact_queue: Mutex<CompactQueue>,
@@ -567,12 +566,10 @@ impl Engine {
             dirty: AtomicU64::new(0),
             room: Notify::new(),
             kick: Notify::new(),
-            read_cache: None,
-            uploads: S3_PARALLELISM,
-            upload_slots: Semaphore::new(S3_PARALLELISM),
-            reads: S3_PARALLELISM,
-            get_slots: Semaphore::new(S3_PARALLELISM),
-            get_part: u64::MAX,
+            read_cache: Mutex::new(None),
+            upload_slots: Limiter::new(S3_PARALLELISM),
+            get_slots: Limiter::new(S3_PARALLELISM),
+            get_part: AtomicU64::new(u64::MAX),
             segments,
             compact_queue: Mutex::new(CompactQueue {
                 urgent: VecDeque::new(),
@@ -596,39 +593,53 @@ impl Engine {
         Ok(engine)
     }
 
-    /// Enables read-ahead (SPEC.md §6); without this call it is off.
-    pub fn with_read_ahead(mut self, ra: ReadAhead) -> anyhow::Result<Self> {
+    /// Sets read-ahead (SPEC.md §6); off until called. A new window starts
+    /// an empty cache: the old windows are dropped.
+    pub fn set_read_ahead(&self, ra: ReadAhead) -> anyhow::Result<()> {
         ra.validate(self.zone_size)?;
-        self.read_cache = ReadCache::new(ra);
-        if let Some(c) = &self.read_cache {
+        let cache = ReadCache::new(ra).map(Arc::new);
+        if let Some(c) = &cache {
             info!(
                 "read-ahead: {} byte windows, {} bytes of cache",
                 c.window(),
                 ra.cache
             );
         }
-        Ok(self)
+        *self.read_cache.lock().unwrap() = cache;
+        Ok(())
+    }
+
+    fn read_cache(&self) -> Option<Arc<ReadCache>> {
+        self.read_cache.lock().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    fn cached_windows(&self) -> usize {
+        self.read_cache().map_or(0, |c| c.len())
     }
 
     /// Uploads at once, all reasons together (SPEC.md §6.1).
-    pub fn with_uploads(mut self, uploads: usize) -> Self {
-        self.uploads = uploads.max(1);
-        self.upload_slots = Semaphore::new(self.uploads);
-        self
+    pub fn set_uploads(&self, uploads: usize) {
+        self.upload_slots.set_limit(uploads.max(1));
     }
 
     /// GETs at once, every read together.
-    pub fn with_reads(mut self, reads: usize) -> Self {
-        self.reads = reads.max(1);
-        self.get_slots = Semaphore::new(self.reads);
-        self
+    pub fn set_reads(&self, reads: usize) {
+        self.get_slots.set_limit(reads.max(1));
     }
 
     /// Splits store reads into parallel GETs of `part` bytes (SPEC.md §6.2);
-    /// without this call a read is one GET.
-    pub fn with_get_part(mut self, part: u64) -> Self {
-        self.get_part = part.max(BLOCK_SIZE);
-        self
+    /// until called a read is one GET.
+    pub fn set_get_part(&self, part: u64) {
+        self.get_part.store(part.max(BLOCK_SIZE), Ordering::SeqCst);
+    }
+
+    pub fn upload_limiter(&self) -> &Limiter {
+        &self.upload_slots
+    }
+
+    pub fn get_limiter(&self) -> &Limiter {
+        &self.get_slots
     }
 
     /// Zone index and offset inside the zone.
@@ -804,7 +815,7 @@ impl Engine {
                 zone,
                 generation,
                 flushed,
-            } => match &self.read_cache {
+            } => match &self.read_cache() {
                 // Only small reads, and only windows wholly stored: they never change.
                 Some(c)
                     if len < c.window()
@@ -835,9 +846,10 @@ impl Engine {
     /// `[offset, offset + len)` of an object as parallel GETs of `get_part`.
     async fn get_parts(&self, zi: usize, key: &str, offset: u64, len: u64) -> ZResult<Vec<Bytes>> {
         let end = offset + len;
+        let part = self.get_part.load(Ordering::SeqCst);
         let parts = (offset..end)
-            .step_by(self.get_part as usize)
-            .map(|from| self.get(zi, key, from, self.get_part.min(end - from)));
+            .step_by(usize::try_from(part).unwrap_or(usize::MAX))
+            .map(|from| self.get(zi, key, from, part.min(end - from)));
         futures_util::future::try_join_all(parts).await
     }
 
@@ -892,8 +904,7 @@ impl Engine {
 
     /// One GET of zone `zi`, counted in the statistics; waits for one of `reads` slots.
     async fn get(&self, zi: usize, key: &str, offset: u64, len: u64) -> ZResult<Bytes> {
-        // Never closed, so acquiring cannot fail.
-        let _slot = self.get_slots.acquire().await.unwrap();
+        let _slot = self.get_slots.acquire().await;
         let _in_flight = self.zones[zi].requests.gets.enter();
         let started = Instant::now();
         let data = self
@@ -978,8 +989,7 @@ impl Engine {
         let len = body.len();
         let started = Instant::now();
         let uploaded = {
-            // Never closed, so acquiring cannot fail.
-            let _slot = self.upload_slots.acquire().await.unwrap();
+            let _slot = self.upload_slots.acquire().await;
             let _in_flight = (STATS.uploads.enter(), zone.requests.uploads.enter());
             if self.segments {
                 let key = self.layout.segment_key(zone.start, from);
@@ -1042,7 +1052,7 @@ impl Engine {
         }
         let results: Vec<ZResult<()>> = futures_util::stream::iter(dirty)
             .map(|zi| self.flush_zone(zi, reason))
-            .buffer_unordered(self.uploads)
+            .buffer_unordered(self.uploads_limit())
             .collect()
             .await;
         results.into_iter().collect()
@@ -1249,7 +1259,7 @@ impl Engine {
     /// Releases a dropped buffer and cached data of a zone.
     fn forget_data(&self, zi: usize, dropped: u64, had_object: bool) {
         // Only stored data is cached.
-        if let (Some(c), true) = (&self.read_cache, had_object) {
+        if let (Some(c), true) = (self.read_cache(), had_object) {
             c.forget_zone(zi);
         }
         if dropped > 0 {
@@ -1384,7 +1394,7 @@ impl Engine {
             if paused_until.is_some_and(|t| t <= tokio::time::Instant::now()) {
                 paused_until = None;
             }
-            while paused_until.is_none() && running.len() < self.uploads {
+            while paused_until.is_none() && running.len() < self.uploads_limit() {
                 let over = self.dirty_bytes().saturating_sub(in_flight) > self.dirty_limit;
                 let Some((zi, bytes, reason)) = self.background_pick(&busy, over) else {
                     break;
@@ -1439,7 +1449,7 @@ impl Engine {
 
     /// Segments above which a zone is concatenated (SPEC.md §5).
     fn segment_limit(&self, kind: Kind) -> usize {
-        let data = (COMPACT_READ_FACTOR * self.zone_size / self.get_part)
+        let data = (COMPACT_READ_FACTOR * self.zone_size / self.get_part.load(Ordering::SeqCst))
             .clamp(COMPACT_SEGMENTS_MIN as u64, COMPACT_SEGMENTS_MAX as u64)
             as usize;
         if kind == Kind::Meta {
@@ -1783,18 +1793,19 @@ impl Engine {
 
     /// Uploads allowed at once.
     pub fn uploads_limit(&self) -> usize {
-        self.uploads
+        self.upload_slots.limit()
     }
 
     /// GETs allowed at once.
     pub fn reads_limit(&self) -> usize {
-        self.reads
+        self.get_slots.limit()
     }
 
     /// Part size large reads are split into for parallel GETs; `None` when
     /// they are not split (no link given).
     pub fn get_part(&self) -> Option<u64> {
-        (self.get_part != u64::MAX).then_some(self.get_part)
+        let part = self.get_part.load(Ordering::SeqCst);
+        (part != u64::MAX).then_some(part)
     }
 
     /// Everything the daemon knows of zone `zi`, for the zone map of the
@@ -3008,10 +3019,8 @@ mod tests {
             window: 4 * B,
             cache: 64 * B,
         };
-        let e = engine_with(store.clone())
-            .await
-            .with_read_ahead(ra)
-            .unwrap();
+        let e = engine_with(store.clone()).await;
+        e.set_read_ahead(ra).unwrap();
         let gets = || mem_store(&store).range_gets();
         let data: Vec<u8> = (0..18 * B).map(|i| (i / B) as u8).collect();
         let blocks =
@@ -3045,6 +3054,44 @@ mod tests {
         e.write(0, blk(9, 8), false).unwrap();
         e.flush_all(Reason::Explicit).await.unwrap();
         assert_eq!(read(&e, B, B).await, blk(9, 1).to_vec());
+    }
+
+    #[tokio::test]
+    async fn read_cache_swap_on_window_change() {
+        let store = mem();
+        let e = engine_with(store.clone()).await;
+        let ra = |window| ReadAhead {
+            window,
+            cache: 64 * B,
+        };
+        e.set_read_ahead(ra(4 * B)).unwrap();
+        e.write(0, blk(5, 16), false).unwrap();
+        e.flush_all(Reason::Explicit).await.unwrap();
+        let gets = || mem_store(&store).range_gets();
+        assert_eq!(read(&e, B, B).await, blk(5, 1).to_vec());
+        assert_eq!(gets(), 1);
+        assert_eq!(e.cached_windows(), 1);
+        e.set_read_ahead(ra(8 * B)).unwrap();
+        assert_eq!(e.cached_windows(), 0); // the old windows are gone
+        assert_eq!(read(&e, B, B).await, blk(5, 1).to_vec());
+        assert_eq!(gets(), 2); // fetched again, with the new window
+        assert_eq!(read(&e, 6 * B, B).await, blk(5, 1).to_vec());
+        assert_eq!(gets(), 2); // block 6 lies in the new 8-block window
+        e.set_read_ahead(ReadAhead::DISABLED).unwrap();
+        assert_eq!(e.cached_windows(), 0);
+        assert_eq!(read(&e, B, B).await, blk(5, 1).to_vec());
+        assert_eq!(gets(), 3);
+        assert!(e.set_read_ahead(ra(3 * B)).is_err());
+    }
+
+    #[tokio::test]
+    async fn limits_change_live() {
+        let e = engine_with(mem()).await;
+        e.set_uploads(7);
+        e.set_reads(3);
+        assert_eq!((e.uploads_limit(), e.reads_limit()), (7, 3));
+        e.set_get_part(64 * B);
+        assert_eq!(e.get_part(), Some(64 * B));
     }
 
     #[tokio::test]
@@ -3211,9 +3258,13 @@ mod tests {
 
     #[tokio::test]
     async fn uploads_share_one_limit() {
-        let e = Arc::new(engine_with(mem()).await.with_uploads(2));
+        let e = Arc::new(engine_with(mem()).await);
+        e.set_uploads(2);
         e.write(0, blk(1, 8), false).unwrap();
-        let taken = e.upload_slots.acquire_many(2).await.unwrap();
+        let taken = (
+            e.upload_limiter().acquire().await,
+            e.upload_limiter().acquire().await,
+        );
         let flush = tokio::spawn({
             let e = e.clone();
             async move { e.flush_all(Reason::Explicit).await }
@@ -3227,7 +3278,8 @@ mod tests {
     #[tokio::test]
     async fn large_read_goes_out_in_parts() {
         let store = mem();
-        let e = engine_with(store.clone()).await.with_get_part(16 * B);
+        let e = engine_with(store.clone()).await;
+        e.set_get_part(16 * B);
         for i in 0..5 {
             e.write(0, blk(i, 8), true).unwrap();
         }

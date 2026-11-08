@@ -136,7 +136,7 @@ impl ReadCache {
     }
 
     #[cfg(test)]
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.lru.lock().unwrap().entries.len()
     }
 }
