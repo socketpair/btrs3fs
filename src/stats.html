@@ -152,6 +152,16 @@
   .btn:hover:not(:disabled) { border-color: var(--flow); }
   .btn:disabled { color: var(--muted); cursor: default; }
 
+  /* S3 link: one row per value, auto next to manual. */
+  .lt td.auto, .lt td.eff { white-space: nowrap; }
+  .lt td.man, .lt th:nth-child(3) { white-space: nowrap; text-align: left; }
+  .lt td.man input[type=text] { width: 7.5em; font: inherit; padding: 2px 6px; border: 1px solid var(--rule);
+                                border-radius: 4px; background: var(--surface); color: var(--ink); margin-left: 6px; }
+  .lt td.man input[type=text]:disabled { color: var(--muted); background: transparent; }
+  .lt td.name small { display: block; color: var(--muted); font-size: 12px; white-space: normal; }
+  .lt tr.manual td.eff { font-weight: 600; }
+  #l-yaml { margin: 8px 0 0; padding: 10px 12px; background: var(--bg); border-radius: 4px; overflow-x: auto; font-size: 12.5px; }
+  .regs { display: grid; gap: 4px; }
   table.grid { width: 100%; border-collapse: collapse; }
   table.grid th, table.grid td { padding: 5px 8px; border-bottom: 1px solid var(--rule); text-align: right; white-space: nowrap; }
   table.grid th { color: var(--muted); font-weight: 500; font-size: 13px; }
@@ -169,7 +179,8 @@
   .sum { color: var(--muted); font-size: 12px; margin-top: 6px; }
 
   @media (max-width: 860px) {
-    .app { grid-template-columns: 1fr; }
+    .app { grid-template-columns: minmax(0, 1fr); }
+    main { padding: 14px 16px 32px; }
     aside { border-right: 0; border-bottom: 1px solid var(--rule); padding: 12px 12px 0; }
     aside .ident { border-bottom: 0; margin-bottom: 4px; padding-bottom: 6px; }
     nav { flex-direction: row; overflow-x: auto; }
@@ -193,6 +204,7 @@
     <button role="tab" aria-selected="true" data-tab="overview">Overview</button>
     <button role="tab" aria-selected="false" data-tab="zones">Zones</button>
     <button role="tab" aria-selected="false" data-tab="btrfs">btrfs</button>
+    <button role="tab" aria-selected="false" data-tab="link">S3 link</button>
     <button role="tab" aria-selected="false" data-tab="details">Details</button>
   </nav>
 </aside>
@@ -248,6 +260,32 @@
     <p class="note">Removing empty block groups is <code>btrfs balance start -dusage=0 -musage=0</code> (data, metadata and system): their zones are reset and
       their S3 objects deleted. Committing is <code>syncfs()</code>: btrfs writes its transaction, so every written file
       is stored in S3.</p>
+  </div>
+</section>
+
+<section id="tab-link" hidden>
+  <p class="note" style="margin-top:0">Each value is <b>auto</b> — the daemon estimates it from its own S3 traffic and
+    adapts as the link changes — or <b>manual</b>. Tick “manual” to set one; Enter applies it. The auto column stays
+    visible either way. Settings made here last until the daemon restarts; to keep them, save the file below and pass
+    it as <code>mount --link-config</code>.</p>
+  <h2>Link to S3</h2>
+  <div class="panel scroll"><table class="grid lt" id="l-link"></table></div>
+  <h2>Derived settings</h2>
+  <div class="panel scroll"><table class="grid lt" id="l-derived"></table></div>
+  <h2>Connections</h2>
+  <div class="panel regs" id="l-regs"></div>
+  <h2>Measurement</h2>
+  <div class="panel">
+    <div class="actions" style="margin-top:0"><button class="btn" id="l-measure">Measure now</button></div>
+    <div id="l-mstate" class="note" style="margin-top:8px"></div>
+    <p class="note">Waits for the S3 requests in flight, holds new ones back, then measures for at most 20 s and
+      lets them go: reads of the disk's own objects (zones stored in one object), writes of temporary objects that are
+      deleted afterwards (no writes on a read-only disk). Writes wait in RAM meanwhile, reads wait.</p>
+  </div>
+  <h2>Settings file</h2>
+  <div class="panel">
+    <div class="actions" style="margin-top:0"><button class="btn" id="l-copy">Copy</button></div>
+    <pre id="l-yaml"></pre>
   </div>
 </section>
 
@@ -319,13 +357,14 @@ function showTab(t) {
   // The tab is in the address, so reloading or sharing the link keeps it.
   if (location.hash !== "#" + t) history.replaceState(null, "", t === "overview" ? location.pathname : "#" + t);
   for (const b of document.querySelectorAll("nav button")) b.setAttribute("aria-selected", String(b.dataset.tab === t));
-  for (const s of ["overview", "zones", "btrfs", "details"]) $("tab-" + s).hidden = s !== t;
+  for (const s of ["overview", "zones", "btrfs", "link", "details"]) $("tab-" + s).hidden = s !== t;
   if (t === "zones") tickZones();
   if (t === "btrfs") tickBtrfs();
+  if (t === "link") tickLink();
   if (last) draw(last);
 }
 for (const b of document.querySelectorAll("nav button")) b.onclick = () => showTab(b.dataset.tab);
-if (["zones", "btrfs", "details"].includes(location.hash.slice(1))) showTab(location.hash.slice(1));
+if (["zones", "btrfs", "link", "details"].includes(location.hash.slice(1))) showTab(location.hash.slice(1));
 
 /* ---------- overview ---------- */
 /* An arrow between stages; `left` points from right to left (reads come back from S3). */
@@ -359,7 +398,7 @@ function renderOverview(s) {
     stage("RAM buffers", `${bytes(s.dirty_bytes)} <small>of ${bytes(hard)}</small>`,
           `${num(s.dirty_zones)} zones · ${drain} · uploads start above ${bytes(soft)}`, gauge, waiting) +
     link(`${num(r.upReq)} uploads/s`, "to S3", r.up > 0) +
-    stage("S3", `${num(s.uploads_in_flight)} <small>of ${num(s.uploads_limit)} uploading</small>`,
+    stage("S3", `${num(s.uploads_in_flight)} <small>of ${num(s.uploads_limit)} uploading${mode("uploads")}</small>`,
           `${bytes(s.upload_size.sum)} stored since start` +
           (s.upload_errors ? ` · <span class="bad">${num(s.upload_errors)} failed</span>` : "") +
           (s.retries ? ` · ${num(s.retries)} retries` : ""));
@@ -372,7 +411,8 @@ function renderOverview(s) {
     link(`${num(r.krReq)} req/s`, "to the kernel", r.kr > 0, true) +
     stage("Read cache and RAM", rate(r.cache + r.ram), `${hitRate} · ${rate(r.ram)} of not yet stored data`) +
     link(`${num(r.gets)} GET/s`, "from S3", r.rd > 0, true) +
-    stage("S3", rate(r.rd), `median GET time ${s.get_latency_ms.p50 ? "≤ " + ms(s.get_latency_ms.p50) : "–"}`);
+    stage("S3", rate(r.rd), `up to ${num(s.reads_limit)} GETs at once${mode("reads")} · ` +
+          `median GET time ${s.get_latency_ms.p50 ? "≤ " + ms(s.get_latency_ms.p50) : "–"}`);
 
   $("charts").innerHTML =
     chart("Upload to S3", series.up, rate) +
@@ -669,7 +709,8 @@ function renderDetails(s) {
   const d = delta, e = s.last_errors || {};
   const err = (name, x) => [name, x ? `${span(x.secs_ago)} ago: ${esc(x.text)}` : "none", x && x.secs_ago < 600];
   $("d-errors").innerHTML = kv([err("Upload to S3", e.upload), err("Read from S3", e.read),
-    err("I/O error returned to the filesystem", e.io), err("Concatenation", e.compact)]);
+    err("I/O error returned to the filesystem", e.io), err("Concatenation", e.compact),
+    err("Link measurement", e.measure)]);
   $("h-kernel").innerHTML = hist("READ size", s.req_read_size) + hist("ZONE_APPEND size (data)", s.req_append_size) +
     hist("WRITE size (metadata, superblock)", s.req_write_size);
   $("h-up").innerHTML = hist("Upload size", s.upload_size) + hist("Upload time", s.upload_latency_ms) +
@@ -677,10 +718,10 @@ function renderDetails(s) {
   $("h-rd").innerHTML = hist("GET size", s.get_size) + hist("GET time", s.get_latency_ms);
   $("d-get-part").innerHTML = s.get_part
     ? `Reads are cut into GETs of at most <b>${bytes(s.get_part)}</b> run in parallel: S3 would return larger pieces, ` +
-      `but one GET streams only at the per-stream rate. The size is latency × read stream of the link given at mount; ` +
+      `but one GET streams only at the per-stream rate. The size is latency × read stream (S3 link section); ` +
       `read-ahead fetches windows of the same size. Up to <b>${num(s.reads_limit)}</b> GETs run at once ` +
-      `(total read rate / rate of one such GET).`
-    : `Reads are not cut into parts: no link characteristics were given. Up to ${num(s.reads_limit)} GETs run at once.`;
+      `(S3 link section).`
+    : `Reads are not cut into parts: the device runs without link tuning. Up to ${num(s.reads_limit)} GETs run at once.`;
   const seg = s.append === "SEGMENTS";
   $("h-cat-wrap").hidden = !seg;
   if (seg) $("h-cat").innerHTML = hist("Concatenation time", s.compact_time_ms) + hist("Segments per concatenation", s.segments_per_compaction);
@@ -774,6 +815,130 @@ for (const b of document.querySelectorAll("[data-fsact]")) b.onclick = async () 
   tickBtrfs();
 };
 
+/* ---------- S3 link ---------- */
+let lastLink = null;
+/* " · auto" or " · manual" after a connection count; nothing without link tuning. */
+function mode(key) {
+  const r = lastLink && lastLink[key];
+  return r ? ` · ${r.active ? "auto" : "manual"}` : "";
+}
+const LINK_NAMES = {
+  latency: ["Latency", "first byte of a small GET"],
+  read_stream: ["Read, one stream", "one GET after its first byte"],
+  read_total: ["Read, all together", "every GET at once"],
+  write_stream: ["Write, one stream", "one upload after its first byte"],
+  write_total: ["Write, all together", "every upload at once"],
+  read_unit: ["Read window and GET part", "latency × read stream; read-ahead window and size of parallel GETs"],
+  fs_readahead: ["btrfs readahead", "4 × latency × total read; bytes in flight for a sequential reader"],
+  uploads: ["Parallel uploads", "auto: grown from 1 while it pays"],
+  reads: ["Parallel GETs", "auto: grown from 1 while it pays"],
+  read_cache: ["Read cache", "RAM for read-ahead windows; manual only (0 = none)"],
+};
+function linkValue(v, raw) {
+  if (raw === null || raw === undefined) return "–";
+  return { ms: x => ms(Math.round(x * 10) / 10), "bytes/s": rate, bytes, count: num }[v.unit](raw);
+}
+/* Rows are built once and then updated in place, so typing in a field is never interrupted. */
+function linkRows(table, values) {
+  if (!table.dataset.built) {
+    table.innerHTML = `<tr><th>value</th><th>auto</th><th>manual</th><th>applied</th></tr>` + values.map(v => {
+      const [name, hint] = LINK_NAMES[v.key] || [v.key, ""];
+      return `<tr data-row="${v.key}"><td class="name">${name}<small>${esc(hint)}</small></td><td class="auto"></td>` +
+        `<td class="man"><label><input type="checkbox" data-key="${v.key}"> manual</label>` +
+        `<input type="text" data-key="${v.key}" aria-label="${name}" spellcheck="false" autocomplete="off"></td><td class="eff"></td></tr>`;
+    }).join("");
+    table.dataset.built = "1";
+    for (const box of table.querySelectorAll("input[type=checkbox]")) box.onchange = () => {
+      const field = table.querySelector(`input[type=text][data-key="${box.dataset.key}"]`);
+      if (box.checked) {
+        const v = lastLink.values.find(x => x.key === box.dataset.key);
+        field.disabled = false;
+        field.value = v.manual || v.effective || "";
+        field.focus(); field.select();
+      } else {
+        setLink(box.dataset.key, "auto");
+      }
+    };
+    for (const field of table.querySelectorAll("input[type=text]")) {
+      const apply = () => { if (!field.disabled && field.dataset.dirty) setLink(field.dataset.key, field.value.trim()); };
+      field.oninput = () => { field.dataset.dirty = "1"; };
+      field.onkeydown = e => { if (e.key === "Enter") apply(); if (e.key === "Escape") { delete field.dataset.dirty; field.blur(); } };
+      field.onblur = apply;
+    }
+  }
+  for (const v of values) {
+    const row = table.querySelector(`tr[data-row="${v.key}"]`);
+    const manual = v.manual !== null;
+    row.className = manual ? "manual" : "";
+    row.querySelector(".auto").textContent = v.key === "read_cache" ? "–" : linkValue(v, v.auto_raw);
+    row.querySelector(".eff").textContent = linkValue(v, v.effective_raw);
+    const box = row.querySelector("input[type=checkbox]"), field = row.querySelector("input[type=text]");
+    if (document.activeElement === field || field.dataset.dirty) continue;
+    box.checked = manual;
+    field.disabled = !manual;
+    field.value = manual ? v.manual : "";
+  }
+}
+async function setLink(key, value) {
+  const field = document.querySelector(`#tab-link input[type=text][data-key="${key}"]`);
+  if (field) delete field.dataset.dirty;
+  try {
+    await post(`link?${encodeURIComponent(key)}=${encodeURIComponent(value)}`);
+    toast(value === "auto" ? `${(LINK_NAMES[key] || [key])[0]}: auto.` : `${(LINK_NAMES[key] || [key])[0]}: set to ${value}.`);
+  } catch (e) { toast(`${(LINK_NAMES[key] || [key])[0]}: ${e.message}`, true); }
+  if (field) field.blur();
+  tickLink();
+}
+function renderLink(l) {
+  linkRows($("l-link"), l.values.filter(v => v.group === "link"));
+  linkRows($("l-derived"), l.values.filter(v => v.group !== "link"));
+  const reg = (name, r) => `<div><b>${name}:</b> ${num(r.limit)} at once, ${r.active ? esc(r.phase) : "set by hand (regulator paused)"}` +
+    (r.change ? ` · last change ${span(r.change_secs_ago)} ago: ${esc(r.change)}` : "") + `</div>`;
+  $("l-regs").innerHTML = reg("Uploads", l.uploads) + reg("GETs", l.reads) +
+    `<p class="note" style="margin:6px 0 0">Auto doubles the number while all slots are busy and the throughput grows by 10 % or more, ` +
+    `then tries one more every 30 s under load; a drop by a third or retries halve it.</p>`;
+  const m = l.measure;
+  const skipped = m.skipped && m.skipped.length ? ` Not measured: ${esc(m.skipped.join(", "))}.` : "";
+  $("l-mstate").innerHTML = {
+    idle: "No measurement since the start.",
+    waiting: `Waiting for ${num(m.waiting_ops)} S3 operations in flight to finish (${span(m.secs)}); new ones wait.`,
+    measuring: `Measuring… ${span(m.secs)} of at most 20 s.`,
+    done: `Measured in ${(m.elapsed_secs || 0).toFixed(1)} s, ${span(m.secs)} ago; the auto values above start from it.${skipped}`,
+    failed: `<span style="color:var(--bad)">Failed ${span(m.secs)} ago: ${esc(m.error)}</span>`,
+  }[m.state] || "";
+  $("l-measure").disabled = false;
+  $("l-yaml").textContent = l.yaml;
+}
+async function tickLink() {
+  try {
+    const r = await fetch("link.json", { cache: "no-store" });
+    if (r.status === 404) { lastLink = null; return; }
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    lastLink = await r.json();
+    if (tab === "link") renderLink(lastLink);
+  } catch (e) { if (tab === "link") $("l-mstate").textContent = `Cannot read link.json: ${e.message}`; }
+}
+$("l-measure").onclick = async () => {
+  try {
+    await post("measure");
+    toast("Measurement started: S3 requests wait until it ends (at most 20 s plus requests in flight).");
+  } catch (e) { toast(`Measure now failed: ${e.message}`, true); }
+  tickLink();
+};
+$("l-copy").onclick = async () => {
+  const text = $("l-yaml").textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("Copied: save it as a file and pass it as mount --link-config.");
+  } catch (e) {
+    // Without clipboard access (plain http from another host): select it for Ctrl+C.
+    const range = document.createRange();
+    range.selectNodeContents($("l-yaml"));
+    getSelection().removeAllRanges(); getSelection().addRange(range);
+    toast("Selected: press Ctrl+C to copy.");
+  }
+};
+
 /* ---------- loop ---------- */
 function push(name, v) { const s = series[name]; s.push(v); if (s.length > HISTORY) s.shift(); }
 
@@ -813,6 +978,7 @@ async function tick() {
     draw(s);
     $("live").className = "on"; $("live").textContent = "live";
     if (tab === "btrfs") tickBtrfs();
+    tickLink();  // the Overview shows auto or manual connections too
     if (tab === "zones" && ++ticks % 3 === 0) tickZones();  // the map changes slowly; every 3 s is enough
   } catch (e) {
     $("live").className = "off"; $("live").textContent = "no connection to the device server";
