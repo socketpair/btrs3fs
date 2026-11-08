@@ -854,6 +854,8 @@ function linkRows(table, values) {
         const v = lastLink.values.find(x => x.key === box.dataset.key);
         field.disabled = false;
         field.value = v.manual || v.effective || "";
+        // Ticking alone pins the value shown: Enter or leaving the field applies it.
+        field.dataset.dirty = "1";
         field.focus(); field.select();
       } else {
         setLink(box.dataset.key, "auto");
@@ -862,7 +864,10 @@ function linkRows(table, values) {
     for (const field of table.querySelectorAll("input[type=text]")) {
       const apply = () => { if (!field.disabled && field.dataset.dirty) setLink(field.dataset.key, field.value.trim()); };
       field.oninput = () => { field.dataset.dirty = "1"; };
-      field.onkeydown = e => { if (e.key === "Enter") apply(); if (e.key === "Escape") { delete field.dataset.dirty; field.blur(); } };
+      field.onkeydown = e => {
+        if (e.key === "Enter") { field.dataset.dirty = "1"; apply(); }
+        if (e.key === "Escape") { delete field.dataset.dirty; field.blur(); }
+      };
       field.onblur = apply;
     }
   }
@@ -881,12 +886,17 @@ function linkRows(table, values) {
 }
 async function setLink(key, value) {
   const field = document.querySelector(`#tab-link input[type=text][data-key="${key}"]`);
+  const name = (LINK_NAMES[key] || [key])[0];
   if (field) delete field.dataset.dirty;
   try {
     await post(`link?${encodeURIComponent(key)}=${encodeURIComponent(value)}`);
-    toast(value === "auto" ? `${(LINK_NAMES[key] || [key])[0]}: auto.` : `${(LINK_NAMES[key] || [key])[0]}: set to ${value}.`);
-  } catch (e) { toast(`${(LINK_NAMES[key] || [key])[0]}: ${e.message}`, true); }
-  if (field) field.blur();
+    toast(value === "auto" ? `${name}: auto.` : `${name}: set to ${value}.`);
+    if (field) field.blur();
+  } catch (e) {
+    toast(`${name}: ${e.message}`, true);
+    // Keep what was typed, to fix it; Escape gives up.
+    if (field && value !== "auto") { field.dataset.dirty = "1"; field.focus(); field.select(); }
+  }
   tickLink();
 }
 function renderLink(l) {
@@ -906,7 +916,7 @@ function renderLink(l) {
     done: `Measured in ${(m.elapsed_secs || 0).toFixed(1)} s, ${span(m.secs)} ago; the auto values above start from it.${skipped}`,
     failed: `<span style="color:var(--bad)">Failed ${span(m.secs)} ago: ${esc(m.error)}</span>`,
   }[m.state] || "";
-  $("l-measure").disabled = false;
+  $("l-measure").disabled = m.state === "waiting" || m.state === "measuring";
   $("l-yaml").textContent = l.yaml;
 }
 async function tickLink() {
