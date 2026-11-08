@@ -1,7 +1,5 @@
 /creds.txt
-/creds.json
-/creds[0-9]*.json
-/creds.yaml
-/creds[0-9]*.yaml
+/creds*.json
+/creds*.yaml
 /target
 /.superpowers
