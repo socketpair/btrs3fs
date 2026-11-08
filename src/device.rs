@@ -309,12 +309,12 @@ fn keep_fs_tuned(name: &str, readahead: Option<Arc<AtomicU64>>, reclaim: bool) {
     }
 }
 
-/// Turns on periodic reclaim for data and metadata (SPEC.md §11): btrfs
+/// Turns on periodic reclaim for data, metadata and system (SPEC.md §11): btrfs
 /// looks for block groups to reclaim periodically, among those not written
 /// to since its previous look, not only when space is freed. Dynamic reclaim
 /// stays off (user's decision): it waits until fewer than 10 zones are left.
 fn enable_reclaim(fs: &std::path::Path) {
-    for kind in ["data", "metadata"] {
+    for kind in ["data", "metadata", "system"] {
         let path = fs.join("allocation").join(kind).join("periodic_reclaim");
         match write_sysfs(&path, "1") {
             Ok(()) => info!("{}: enabled", path.display()),
