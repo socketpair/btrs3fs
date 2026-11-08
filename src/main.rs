@@ -1,4 +1,5 @@
 mod autotune;
+mod bench;
 mod btrfs;
 mod btrfs_zone;
 mod config;
@@ -85,13 +86,36 @@ enum Command {
     Detach(DetachArgs),
     /// Delete all objects of a disk.
     Destroy(DestroyArgs),
-    /// Measure the link to S3 from this host and print the --s3-* flags for mount/run.
+    /// Measure the link to S3 from this host and print a --link-config file for mount/run.
     Measure(DiskArgs),
+    /// Benchmark reads of objects grown by small appends (PATCH, segments) at the S3 level.
+    S3bench(BenchArgs),
+}
+
+#[derive(Args)]
+struct BenchArgs {
+    #[command(flatten)]
+    disk: DiskArgs,
+    /// Object sizes in appends, comma-separated.
+    #[arg(long, value_delimiter = ',', default_values_t = [256u64, 1024])]
+    appends: Vec<u64>,
+    /// Bytes per append (one write + fsync of btrfs).
+    #[arg(long, value_parser = parse_size, default_value = "4K")]
+    piece: u64,
+    /// Reads of each object.
+    #[arg(long, default_value_t = 3)]
+    repeat: usize,
+    /// GETs at once for reads in parts and of segments.
+    #[arg(long, default_value_t = 8)]
+    parallel: usize,
+    /// Part size of reads in parts (the daemon's read window).
+    #[arg(long, value_parser = parse_size, default_value = "128K")]
+    part: u64,
 }
 
 #[derive(Args)]
 struct DiskArgs {
-    /// Credentials file (JSON, see SPEC.md §3.2).
+    /// Credentials file (YAML or JSON, see SPEC.md §3.2).
     #[arg(long)]
     creds: PathBuf,
     /// Object key prefix of the disk inside the bucket.
@@ -251,6 +275,7 @@ fn main() {
         Command::Detach(a) => detach(a.dev_id),
         Command::Destroy(a) => cmd_destroy(a),
         Command::Measure(a) => cmd_measure(a),
+        Command::S3bench(a) => cmd_s3bench(a),
     };
     let code = match res {
         Ok(code) => code,
@@ -1113,6 +1138,28 @@ fn cmd_measure(a: DiskArgs) -> anyhow::Result<i32> {
     rt.block_on(measure::cleanup(&s3, &dir))?;
     let measured = measured?;
     print!("{}", measure::report(&measured));
+    Ok(0)
+}
+
+fn cmd_s3bench(a: BenchArgs) -> anyhow::Result<i32> {
+    ensure!(
+        a.piece > 0 && a.part > 0 && a.parallel > 0 && a.repeat > 0 && !a.appends.contains(&0),
+        "sizes, counts and parallelism must be positive"
+    );
+    let creds = config::Creds::load(&a.disk.creds)?;
+    let s3 = S3Store::new(&creds, &a.disk.transport, RetryPolicy::default())?;
+    let layout = Layout::new(&a.disk.prefix)?;
+    let opts = bench::Options {
+        pieces: a.appends,
+        piece: a.piece,
+        repeat: a.repeat,
+        parallel: a.parallel,
+        part: a.part,
+    };
+    print!(
+        "{}",
+        runtime()?.block_on(bench::run(&s3, layout.prefix(), &opts))?
+    );
     Ok(0)
 }
 
