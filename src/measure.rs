@@ -5,7 +5,7 @@
 use crate::config::DiskConfig;
 use crate::s3::S3Store;
 use crate::store::{Body, StoreResult};
-use crate::tuning::Link;
+use crate::tuning::{Auto, Chars, Manual};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
@@ -39,7 +39,7 @@ const SEEDS: usize = 8;
 const WRITE_KEYS: usize = 128;
 
 pub struct Measured {
-    pub link: Link,
+    pub link: Chars,
     pub latency_p90: Duration,
     pub elapsed: Duration,
     pub dir: String,
@@ -70,7 +70,7 @@ pub async fn measure(s3: &S3Store, prefix: &str) -> anyhow::Result<Measured> {
     })
 }
 
-async fn run(s3: &S3Store, dir: &str) -> anyhow::Result<(Link, Duration)> {
+async fn run(s3: &S3Store, dir: &str) -> anyhow::Result<(Chars, Duration)> {
     let zone = Bytes::from(vec![0x5a; STREAM_SIZE as usize]);
     let small = zone.slice(..SMALL_SIZE as usize);
     let seed = |i: usize| format!("{dir}/seed-{i}");
@@ -152,12 +152,12 @@ async fn run(s3: &S3Store, dir: &str) -> anyhow::Result<(Link, Duration)> {
     })
     .await?;
 
-    let link = Link {
-        latency,
-        read_stream,
-        read_total,
-        write_stream,
-        write_total,
+    let link = Chars {
+        latency: Some(latency),
+        read_stream: Some(read_stream),
+        read_total: Some(read_total),
+        write_stream: Some(write_stream),
+        write_total: Some(write_total),
     };
     Ok((link, latency_p90))
 }
@@ -215,9 +215,35 @@ pub fn rate_flag(bytes: u64) -> String {
 
 /// Report for the admin: what was measured and the flags to pass.
 pub fn report(m: &Measured) -> String {
-    let l = &m.link;
-    let ms = l.latency.as_millis().max(1);
+    let c = &m.link;
+    let measured = |r: Option<u64>| r.expect("measure sets every characteristic");
+    let ms = c.latency.map_or(1, |l| l.as_millis().max(1));
     let zone = DiskConfig::DEFAULT_ZONE_SIZE;
+    let derived = crate::tuning::resolve(
+        &Manual {
+            chars: *c,
+            ..Manual::default()
+        },
+        &Auto {
+            chars: Chars::default(),
+            uploads: 1,
+            reads: 1,
+        },
+        zone,
+    )
+    .derived;
+    struct L {
+        read_stream: u64,
+        read_total: u64,
+        write_stream: u64,
+        write_total: u64,
+    }
+    let l = L {
+        read_stream: measured(c.read_stream),
+        read_total: measured(c.read_total),
+        write_stream: measured(c.write_stream),
+        write_total: measured(c.write_total),
+    };
     format!(
         "S3 link from this host ({:.0} s; temporary objects under {}/ deleted):\n\
          \x20 latency (first byte of a small GET): {ms} ms, p90 {} ms\n\
@@ -234,7 +260,7 @@ pub fn report(m: &Measured) -> String {
         rate_flag(l.write_stream),
         rate_flag(l.write_total),
         zone / MIB,
-        l.tuning(zone),
+        derived,
         rate_flag(l.read_stream),
         rate_flag(l.read_total),
         rate_flag(l.write_stream),

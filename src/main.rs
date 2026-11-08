@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use store::{Backend, Body, Layout, MemStore, Store};
 use tokio::runtime::Runtime;
-use tuning::Link;
+use tuning::{Auto, Chars, Manual};
 use zones::Engine;
 
 /// btrfs mount options always used by `mount`: user decision (SPEC.md §9.2);
@@ -148,7 +148,7 @@ struct MountArgs {
 
 /// The link to S3 as `btrs3fs measure` reports it (SPEC.md §6.1): the daemon
 /// derives its read and upload settings from it. Per run, not in disk.json;
-/// values not given are those measured in Yandex Cloud next to the bucket.
+/// values not given are auto.
 #[derive(Args, Clone, Copy)]
 struct LinkArgs {
     /// Time to the first byte of a small GET, e.g. 36ms.
@@ -172,33 +172,18 @@ struct LinkArgs {
 }
 
 impl LinkArgs {
-    /// The link given on the command line, Yandex Cloud values for the rest;
-    /// says in the log what was not given.
-    fn link(&self) -> Link {
-        let d = Link::YANDEX_CLOUD;
-        let missing: Vec<&str> = [
-            ("--s3-latency", self.s3_latency.is_none()),
-            ("--s3-read-stream", self.s3_read_stream.is_none()),
-            ("--s3-read-total", self.s3_read_total.is_none()),
-            ("--s3-write-stream", self.s3_write_stream.is_none()),
-            ("--s3-write-total", self.s3_write_total.is_none()),
-        ]
-        .into_iter()
-        .filter_map(|(flag, none)| none.then_some(flag))
-        .collect();
-        if !missing.is_empty() {
-            warn!(
-                "S3 link not given ({}): assuming values measured in Yandex Cloud; \
-                 measure yours with `btrs3fs measure`",
-                missing.join(", ")
-            );
-        }
-        Link {
-            latency: self.s3_latency.unwrap_or(d.latency),
-            read_stream: self.s3_read_stream.unwrap_or(d.read_stream),
-            read_total: self.s3_read_total.unwrap_or(d.read_total),
-            write_stream: self.s3_write_stream.unwrap_or(d.write_stream),
-            write_total: self.s3_write_total.unwrap_or(d.write_total),
+    /// The link values given on the command line; the rest is auto.
+    fn manual(&self) -> Manual {
+        Manual {
+            chars: Chars {
+                latency: self.s3_latency,
+                read_stream: self.s3_read_stream,
+                read_total: self.s3_read_total,
+                write_stream: self.s3_write_stream,
+                write_total: self.s3_write_total,
+            },
+            read_cache: Some(self.read_cache),
+            ..Manual::default()
         }
     }
 }
@@ -370,11 +355,16 @@ fn serve_disk(
         Backend::Mem(_) => None,
     };
     let tuning = match link {
-        Some(l) => {
-            l.validate()?;
-            let t = l.tuning(cfg.zone_size);
-            info!("S3 link: {l}; derived: {t}");
-            Some(t)
+        Some(m) => {
+            tuning::validate(&m, cfg.zone_size)?;
+            let start = Auto {
+                chars: Chars::default(),
+                uploads: 1,
+                reads: 1,
+            };
+            let e = tuning::resolve(&m, &start, cfg.zone_size);
+            info!("S3 link: {}; derived: {}", e.chars, e.derived);
+            Some(e.derived)
         }
         None => None,
     };
@@ -394,7 +384,7 @@ fn serve_disk(
     };
     let engine = rt.block_on(Engine::open(&cfg, layout, Arc::new(store)))?;
     let read_ahead = tuning.map_or(ReadAhead::DISABLED, |t| ReadAhead {
-        window: t.unit,
+        window: t.read_unit,
         cache: read_cache,
     });
     let mut engine = engine.with_read_ahead(read_ahead)?;
@@ -402,7 +392,7 @@ fn serve_disk(
         engine = engine
             .with_uploads(t.uploads)
             .with_reads(t.reads)
-            .with_get_part(t.unit);
+            .with_get_part(t.read_unit);
     }
     let engine = Arc::new(engine);
     // A read-only disk has nothing to upload, concatenate or mark.
@@ -526,7 +516,7 @@ struct ServeOptions {
     stats: Option<StatsArgs>,
     /// `None` — no tuning (temporary device of `create`): no read-ahead,
     /// default uploads, whole-object GETs, btrfs readahead untouched.
-    link: Option<Link>,
+    link: Option<Manual>,
     read_cache: u64,
     /// Serve the disk read-only (SPEC.md §9.2).
     read_only: bool,
@@ -545,7 +535,7 @@ impl ServeOptions {
             dev_id,
             queues,
             stats: Some(stats),
-            link: Some(link.link()),
+            link: Some(link.manual()),
             read_cache: link.read_cache,
             read_only,
         }

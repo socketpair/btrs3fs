@@ -1,7 +1,7 @@
-//! Settings derived from the link to S3 (SPEC.md §6.1). The admin measures the
-//! link with `btrs3fs measure` and passes it to `mount`/`run`; the read window,
-//! the part size of large GETs, the btrfs readahead window and the numbers of
-//! parallel uploads and GETs all follow from it.
+//! Settings derived from the link to S3 (SPEC.md §6.1): the read window and
+//! part size of large GETs, the btrfs readahead window and the numbers of
+//! parallel uploads and GETs follow from the link characteristics. Each of
+//! the nine values is manual or auto; `resolve` picks what applies.
 
 use std::fmt;
 use std::time::Duration;
@@ -30,93 +30,63 @@ const READAHEAD_MAX: u64 = 256 * MIB;
 const UPLOADS_MIN: usize = 4;
 const UPLOADS_MAX: usize = 64;
 /// Upper bound of parallel GETs, as measured for uploads; it also keeps
-/// absurd link flags from asking for thousands of connections.
+/// absurd link values from asking for thousands of connections.
 const READS_MAX: usize = 64;
+/// Bound of any connection count, manual or regulated.
+pub const CONNECTIONS_MAX: usize = 64;
 
-/// Characteristics of the link to S3; rates are bytes per second.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Link {
+/// Characteristics of the link to S3; rates are bytes per second. `None`:
+/// not known (no estimate yet, nothing hardcoded; SPEC.md §6.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Chars {
     /// Time to the first byte of a small GET.
-    pub latency: Duration,
+    pub latency: Option<Duration>,
     /// One GET after its first byte.
-    pub read_stream: u64,
+    pub read_stream: Option<u64>,
     /// All GETs together.
-    pub read_total: u64,
+    pub read_total: Option<u64>,
     /// One PUT after its first byte.
-    pub write_stream: u64,
+    pub write_stream: Option<u64>,
     /// All PUTs together.
-    pub write_total: u64,
+    pub write_total: Option<u64>,
 }
 
-impl Link {
-    /// Medians of three `btrs3fs measure` runs on a VM in Yandex Cloud next
-    /// to the bucket (SPEC.md §12); used when the admin gives none.
-    pub const YANDEX_CLOUD: Link = Link {
-        latency: Duration::from_millis(32),
-        read_stream: 57 * MIB,
-        read_total: 564 * MIB,
-        write_stream: 36 * MIB,
-        write_total: 992 * MIB,
-    };
-
-    pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.latency.is_zero()
-                && self.read_stream > 0
-                && self.read_total > 0
-                && self.write_stream > 0
-                && self.write_total > 0,
-            "S3 link characteristics must all be positive"
-        );
-        Ok(())
-    }
-
-    /// What the daemon tunes for this link (SPEC.md §6.1).
-    pub fn tuning(&self, zone_size: u64) -> Tuning {
-        let latency = self.latency.as_secs_f64();
-        // Fetching one unit more costs as much as one more request.
-        let unit = pow2_round(latency * self.read_stream as f64)
-            .clamp(UNIT_MIN, UNIT_MAX)
-            .min(zone_size);
-        let fs_readahead = pow2_round(READAHEAD_FACTOR * latency * self.read_total as f64)
-            .clamp(READAHEAD_MIN, READAHEAD_MAX);
-        // Rate of one upload of a whole zone, its first byte included.
-        let one_upload = zone_size as f64 / (latency + zone_size as f64 / self.write_stream as f64);
-        let uploads = ((self.write_total as f64 / one_upload).ceil() as usize)
-            .clamp(UPLOADS_MIN, UPLOADS_MAX);
-        // The same for GETs of one unit (user decision).
-        let one_get = unit as f64 / (latency + unit as f64 / self.read_stream as f64);
-        let reads = ((self.read_total as f64 / one_get).ceil() as usize).clamp(1, READS_MAX);
-        Tuning {
-            unit,
-            fs_readahead,
-            uploads,
-            reads,
+impl Chars {
+    /// `self` where set, else `other`.
+    pub fn or(self, other: Chars) -> Chars {
+        Chars {
+            latency: self.latency.or(other.latency),
+            read_stream: self.read_stream.or(other.read_stream),
+            read_total: self.read_total.or(other.read_total),
+            write_stream: self.write_stream.or(other.write_stream),
+            write_total: self.write_total.or(other.write_total),
         }
     }
 }
 
-impl fmt::Display for Link {
+impl fmt::Display for Chars {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let rate = |r: Option<u64>| r.map_or("?".to_string(), |r| format!("{}", r / MIB));
         write!(
             f,
             "latency {} ms, read {} MiB/s per stream / {} MiB/s total, write {} / {} MiB/s",
-            self.latency.as_millis(),
-            self.read_stream / MIB,
-            self.read_total / MIB,
-            self.write_stream / MIB,
-            self.write_total / MIB
+            self.latency
+                .map_or("?".to_string(), |l| l.as_millis().to_string()),
+            rate(self.read_stream),
+            rate(self.read_total),
+            rate(self.write_stream),
+            rate(self.write_total)
         )
     }
 }
 
-/// Settings derived from a `Link`.
+/// Settings derived from the characteristics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Tuning {
+pub struct Derived {
     /// Read-ahead window of the daemon and the part size large reads are
     /// split into for parallel GETs: one GET of this size costs about two
     /// latencies.
-    pub unit: u64,
+    pub read_unit: u64,
     /// btrfs readahead window (`bdi/read_ahead_kb`): bytes in flight for a
     /// sequential reader.
     pub fs_readahead: u64,
@@ -126,20 +96,153 @@ pub struct Tuning {
     pub reads: usize,
 }
 
-impl fmt::Display for Tuning {
+impl fmt::Display for Derived {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "read window and GET part {} KiB (latency × read stream), \
-             btrfs readahead {} MiB ({READAHEAD_FACTOR} × latency × total read), \
-             {} parallel uploads (total write / one zone upload), \
-             {} parallel GETs (total read / one GET of the window)",
-            self.unit / KIB,
+            "read window and GET part {} KiB, btrfs readahead {} MiB, \
+             {} parallel uploads, {} parallel GETs",
+            self.read_unit / KIB,
             self.fs_readahead / MIB,
             self.uploads,
             self.reads
         )
     }
+}
+
+/// Values set by hand (`--link-config`, the statistics page); `None`: auto.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Manual {
+    pub chars: Chars,
+    pub read_unit: Option<u64>,
+    pub fs_readahead: Option<u64>,
+    pub uploads: Option<usize>,
+    pub reads: Option<usize>,
+    /// RAM for read-ahead windows; `None`: `config::DEFAULT_READ_CACHE`.
+    pub read_cache: Option<u64>,
+}
+
+/// What the daemon found itself: estimates and the regulated connections.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Auto {
+    pub chars: Chars,
+    pub uploads: usize,
+    pub reads: usize,
+}
+
+/// What applies: manual where set, auto elsewhere.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Effective {
+    pub chars: Chars,
+    pub derived: Derived,
+    /// What auto would give for each derived value (shown next to manual ones).
+    pub auto_derived: Derived,
+}
+
+/// Manual values where set, auto elsewhere (SPEC.md §6.1). Derived values
+/// in auto follow the effective characteristics; connections in auto come
+/// from the regulator unless every input of their formula is manual (the
+/// regulator's own estimate of the total depends on the connections).
+pub fn resolve(manual: &Manual, auto: &Auto, zone_size: u64) -> Effective {
+    let c = manual.chars.or(auto.chars);
+    let m = &manual.chars;
+    let read_unit = match (c.latency, c.read_stream) {
+        (Some(l), Some(r)) => unit_for(l, r, zone_size),
+        _ => UNIT_MIN.min(zone_size),
+    };
+    let unit = manual.read_unit.unwrap_or(read_unit);
+    let fs_readahead = match (c.latency, c.read_total) {
+        (Some(l), Some(r)) => readahead_for(l, r),
+        _ => READAHEAD_MIN,
+    };
+    let uploads = match (m.latency, m.write_stream, m.write_total) {
+        (Some(l), Some(s), Some(t)) => uploads_for(l, s, t, zone_size),
+        _ => auto.uploads,
+    };
+    let reads = match (m.latency, m.read_stream, m.read_total) {
+        (Some(l), Some(s), Some(t)) => reads_for(l, s, t, unit),
+        _ => auto.reads,
+    };
+    // The auto column shows what the daemon found itself: the regulator.
+    let auto_derived = Derived {
+        read_unit,
+        fs_readahead,
+        uploads: auto.uploads,
+        reads: auto.reads,
+    };
+    Effective {
+        chars: c,
+        derived: Derived {
+            read_unit: unit,
+            fs_readahead: manual.fs_readahead.unwrap_or(fs_readahead),
+            uploads: manual.uploads.unwrap_or(uploads),
+            reads: manual.reads.unwrap_or(reads),
+        },
+        auto_derived,
+    }
+}
+
+/// Checks manual values against the bounds of SPEC.md §6.1.
+pub fn validate(m: &Manual, zone_size: u64) -> anyhow::Result<()> {
+    let c = &m.chars;
+    anyhow::ensure!(
+        c.latency.is_none_or(|l| !l.is_zero()),
+        "latency must be positive"
+    );
+    for (name, v) in [
+        ("read_stream", c.read_stream),
+        ("read_total", c.read_total),
+        ("write_stream", c.write_stream),
+        ("write_total", c.write_total),
+    ] {
+        anyhow::ensure!(v.is_none_or(|v| v > 0), "{name} must be positive");
+    }
+    if let Some(u) = m.read_unit {
+        anyhow::ensure!(
+            u.is_power_of_two() && (UNIT_MIN..=UNIT_MAX).contains(&u) && u <= zone_size,
+            "read_unit {u} must be a power of two from {UNIT_MIN} to {} bytes",
+            UNIT_MAX.min(zone_size)
+        );
+    }
+    if let Some(r) = m.fs_readahead {
+        anyhow::ensure!(
+            (READAHEAD_MIN..=READAHEAD_MAX).contains(&r),
+            "fs_readahead {r} must be from {READAHEAD_MIN} to {READAHEAD_MAX} bytes"
+        );
+    }
+    for (name, v) in [("uploads", m.uploads), ("reads", m.reads)] {
+        if let Some(n) = v {
+            anyhow::ensure!(
+                (1..=CONNECTIONS_MAX).contains(&n),
+                "{name} {n} must be from 1 to {CONNECTIONS_MAX}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Fetching one unit more costs as much as one more request.
+fn unit_for(latency: Duration, read_stream: u64, zone_size: u64) -> u64 {
+    pow2_round(latency.as_secs_f64() * read_stream as f64)
+        .clamp(UNIT_MIN, UNIT_MAX)
+        .min(zone_size)
+}
+
+fn readahead_for(latency: Duration, read_total: u64) -> u64 {
+    pow2_round(READAHEAD_FACTOR * latency.as_secs_f64() * read_total as f64)
+        .clamp(READAHEAD_MIN, READAHEAD_MAX)
+}
+
+/// Total write / rate of one upload of a whole zone, its first byte included.
+fn uploads_for(latency: Duration, stream: u64, total: u64, zone_size: u64) -> usize {
+    let one = zone_size as f64 / (latency.as_secs_f64() + zone_size as f64 / stream as f64);
+    ((total as f64 / one).ceil() as usize).clamp(UPLOADS_MIN, UPLOADS_MAX)
+}
+
+/// The same for GETs of one unit (user decision).
+fn reads_for(latency: Duration, stream: u64, total: u64, unit: u64) -> usize {
+    let one = unit as f64 / (latency.as_secs_f64() + unit as f64 / stream as f64);
+    ((total as f64 / one).ceil() as usize).clamp(1, READS_MAX)
 }
 
 /// Nearest power of two (at least 1).
@@ -175,50 +278,171 @@ mod tests {
 
     const ZONE: u64 = 16 * MIB;
 
-    #[test]
-    fn cloud_and_internet() {
-        // Matches the best settings measured in the cloud (SPEC.md §12).
-        let t = Link::YANDEX_CLOUD.tuning(ZONE);
-        assert_eq!((t.unit, t.fs_readahead), (2 * MIB, 64 * MIB));
-        assert!((16..=64).contains(&t.uploads), "{t:?}");
-        // Alone 2 MiB take 32 ms + 35 ms, ~30 MiB/s: 564 MiB/s want 19 GETs.
-        assert_eq!(t.reads, 19);
+    /// Measured in the cloud (SPEC.md §12): the best settings there.
+    fn cloud() -> Chars {
+        Chars {
+            latency: Some(Duration::from_millis(32)),
+            read_stream: Some(57 * MIB),
+            read_total: Some(564 * MIB),
+            write_stream: Some(36 * MIB),
+            write_total: Some(992 * MIB),
+        }
+    }
 
-        // The laptop over the internet.
-        let laptop = Link {
-            latency: Duration::from_millis(50),
-            read_stream: 2 * MIB,
-            read_total: 20 * MIB,
-            write_stream: 3 * MIB,
-            write_total: 36 * MIB,
-        };
-        let t = laptop.tuning(ZONE);
-        assert_eq!((t.unit, t.fs_readahead), (128 * KIB, 4 * MIB));
-        assert!((4..=16).contains(&t.uploads), "{t:?}");
-        assert!((5..=20).contains(&t.reads), "{t:?}");
+    fn manual(chars: Chars) -> Manual {
+        Manual {
+            chars,
+            ..Manual::default()
+        }
+    }
+
+    fn regulated(n: usize) -> Auto {
+        Auto {
+            chars: Chars::default(),
+            uploads: n,
+            reads: n,
+        }
     }
 
     #[test]
-    fn bounds() {
-        let slow = Link {
-            latency: Duration::from_secs(2),
-            read_stream: 100 * MIB,
-            read_total: 10_000 * MIB,
-            write_stream: 1,
-            write_total: 1,
+    fn resolve_all_auto_without_data() {
+        let e = resolve(&Manual::default(), &regulated(1), ZONE);
+        assert_eq!(
+            e.derived,
+            Derived {
+                read_unit: 128 * KIB,
+                fs_readahead: 4 * MIB,
+                uploads: 1,
+                reads: 1
+            }
+        );
+        assert_eq!(e.chars, Chars::default());
+    }
+
+    #[test]
+    fn resolve_auto_derived_follow_effective_chars() {
+        let m = manual(Chars {
+            latency: Some(Duration::from_millis(32)),
+            ..Chars::default()
+        });
+        let auto = Auto {
+            chars: Chars {
+                read_stream: Some(57 * MIB),
+                ..Chars::default()
+            },
+            ..regulated(1)
         };
-        let t = slow.tuning(4 * MIB);
-        assert_eq!(t.unit, 4 * MIB); // never above the zone
-        assert_eq!(t.fs_readahead, READAHEAD_MAX);
-        assert_eq!(t.uploads, UPLOADS_MIN);
-        let absurd = Link {
-            latency: Duration::from_secs(1000),
-            read_total: u64::MAX,
+        let e = resolve(&m, &auto, ZONE);
+        assert_eq!(e.derived.read_unit, 2 * MIB);
+        assert_eq!(e.chars.latency, Some(Duration::from_millis(32)));
+        assert_eq!(e.chars.read_stream, Some(57 * MIB));
+        // Total read unknown: the readahead window stays at its minimum.
+        assert_eq!(e.derived.fs_readahead, 4 * MIB);
+    }
+
+    #[test]
+    fn manual_chars_use_formula_for_connections() {
+        let e = resolve(&manual(cloud()), &regulated(3), ZONE);
+        assert_eq!(
+            (e.derived.read_unit, e.derived.fs_readahead),
+            (2 * MIB, 64 * MIB)
+        );
+        assert!((21..=36).contains(&e.derived.uploads), "{e:?}");
+        // Alone 2 MiB take 32 ms + 35 ms, ~30 MiB/s: 564 MiB/s want 19 GETs.
+        assert_eq!(e.derived.reads, 19);
+        // What auto would give: the regulator's.
+        assert_eq!((e.auto_derived.uploads, e.auto_derived.reads), (3, 3));
+
+        // The laptop over the internet.
+        let laptop = Chars {
+            latency: Some(Duration::from_millis(50)),
+            read_stream: Some(2 * MIB),
+            read_total: Some(20 * MIB),
+            write_stream: Some(3 * MIB),
+            write_total: Some(36 * MIB),
+        };
+        let d = resolve(&manual(laptop), &regulated(1), ZONE).derived;
+        assert_eq!((d.read_unit, d.fs_readahead), (128 * KIB, 4 * MIB));
+        assert!((4..=16).contains(&d.uploads), "{d:?}");
+        assert!((5..=20).contains(&d.reads), "{d:?}");
+    }
+
+    #[test]
+    fn manual_derived_wins() {
+        let m = Manual {
+            uploads: Some(8),
+            ..manual(cloud())
+        };
+        let e = resolve(&m, &regulated(5), ZONE);
+        assert_eq!(e.derived.uploads, 8);
+        assert_eq!(e.auto_derived.uploads, 5);
+    }
+
+    #[test]
+    fn formula_bounds() {
+        let slow = Chars {
+            latency: Some(Duration::from_secs(2)),
+            read_stream: Some(100 * MIB),
+            read_total: Some(10_000 * MIB),
+            write_stream: Some(1),
+            write_total: Some(1),
+        };
+        let d = resolve(&manual(slow), &regulated(1), 4 * MIB).derived;
+        assert_eq!(d.read_unit, 4 * MIB); // never above the zone
+        assert_eq!(d.fs_readahead, READAHEAD_MAX);
+        assert_eq!(d.uploads, UPLOADS_MIN);
+        let absurd = Chars {
+            latency: Some(Duration::from_secs(1000)),
+            read_total: Some(u64::MAX),
             ..slow
         };
-        assert_eq!(absurd.tuning(4096).reads, READS_MAX);
+        assert_eq!(
+            resolve(&manual(absurd), &regulated(1), 4096).derived.reads,
+            READS_MAX
+        );
         assert_eq!(pow2_round(3.0 * MIB as f64), 4 * MIB);
         assert_eq!(pow2_round(1.4 * MIB as f64), MIB);
+    }
+
+    #[test]
+    fn validate_bounds() {
+        let ok = |m: Manual| validate(&m, ZONE).is_ok();
+        assert!(ok(Manual::default()));
+        assert!(ok(manual(cloud())));
+        assert!(ok(Manual {
+            read_unit: Some(MIB),
+            uploads: Some(64),
+            ..Manual::default()
+        }));
+        assert!(!ok(Manual {
+            read_unit: Some(3 * MIB),
+            ..Manual::default()
+        }));
+        assert!(!ok(Manual {
+            read_unit: Some(8 * MIB),
+            ..Manual::default()
+        }));
+        assert!(!ok(Manual {
+            uploads: Some(0),
+            ..Manual::default()
+        }));
+        assert!(!ok(Manual {
+            uploads: Some(65),
+            ..Manual::default()
+        }));
+        assert!(!ok(Manual {
+            reads: Some(65),
+            ..Manual::default()
+        }));
+        assert!(!ok(Manual {
+            fs_readahead: Some(MIB),
+            ..Manual::default()
+        }));
+        let zero_rate = Chars {
+            read_stream: Some(0),
+            ..Chars::default()
+        };
+        assert!(!ok(manual(zero_rate)));
     }
 
     #[test]
