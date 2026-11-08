@@ -22,6 +22,10 @@ const TICK: Duration = Duration::from_millis(100);
 const TICKS_PER_STEP: u32 = 10;
 /// A step is saturated when all slots were busy at this share of its ticks.
 const SATURATED_SHARE: f64 = 0.8;
+/// Steps an estimated new read window or btrfs readahead must hold before it
+/// applies: near a power-of-two boundary the estimate would flip it (and
+/// empty the read cache) every second.
+const SETTLE_STEPS: u32 = 5;
 /// How long a measurement waits for the S3 operations in flight: new ones
 /// queue behind it meanwhile, so it gives up rather than stall the disk.
 const PAUSE_WAIT: Duration = Duration::from_secs(10);
@@ -97,6 +101,9 @@ struct State {
     effective: Option<Effective>,
     ticks: Ticks,
     last: Option<(f64, Totals)>,
+    /// A new (read window, btrfs readahead) from the estimates and how many
+    /// steps in a row it has held.
+    pending: Option<((u64, u64), u32)>,
     measure: MeasureState,
 }
 
@@ -183,6 +190,7 @@ impl Autotune {
                 effective: None,
                 ticks: Ticks::default(),
                 last: None,
+                pending: None,
                 measure: MeasureState {
                     state: "idle",
                     ..MeasureState::default()
@@ -283,7 +291,29 @@ impl Autotune {
 
     /// Resolves the values and applies what changed.
     fn apply(&self, st: &mut State, why: &str) {
-        let e = tuning::resolve(&st.manual, &Self::auto(st), self.zone_size);
+        let mut e = tuning::resolve(&st.manual, &Self::auto(st), self.zone_size);
+        // Estimates move the windows only once they hold; a hand or a
+        // measurement moves them at once.
+        if let (true, Some((old, _))) = (why == "estimate", st.applied) {
+            let new = (e.derived.read_unit, e.derived.fs_readahead);
+            if new == (old.read_unit, old.fs_readahead) {
+                st.pending = None;
+            } else {
+                let held = match st.pending {
+                    Some((p, n)) if p == new => n + 1,
+                    _ => 1,
+                };
+                st.pending = Some((new, held));
+                if held < SETTLE_STEPS {
+                    e.derived.read_unit = old.read_unit;
+                    e.derived.fs_readahead = old.fs_readahead;
+                } else {
+                    st.pending = None;
+                }
+            }
+        } else {
+            st.pending = None;
+        }
         st.effective = Some(e);
         let d = e.derived;
         let cache = st
@@ -718,6 +748,34 @@ mod tests {
             t.step(i as f64, totals);
         }
         assert_eq!(t.engine.reads_limit(), 1);
+    }
+
+    /// An estimate near a power-of-two boundary must not flip the window
+    /// (and empty the read cache) every second.
+    #[tokio::test]
+    async fn windows_change_only_when_the_estimate_holds() {
+        let t = tuner(Manual::default()).await;
+        let set_stream = |r: u64| {
+            let mut st = t.st.lock().unwrap();
+            st.chars.latency = Some(Duration::from_millis(40));
+            st.chars.read_stream = Some(r);
+        };
+        let mut now = 0.0;
+        let mut step = || {
+            now += 1.0;
+            t.step(now, Totals::default());
+        };
+        step();
+        for i in 0..10 {
+            set_stream(if i % 2 == 0 { 50 << 20 } else { 4 << 20 });
+            step();
+            assert_eq!(t.engine.get_part(), Some(128 << 10), "step {i}");
+        }
+        set_stream(50 << 20);
+        for _ in 0..SETTLE_STEPS {
+            step();
+        }
+        assert_eq!(t.engine.get_part(), Some(2 << 20));
     }
 
     #[tokio::test]
