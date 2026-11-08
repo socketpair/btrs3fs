@@ -471,7 +471,6 @@ fn serve_disk(
                     uploads_limit: stats_engine.uploads_limit() as u64,
                     get_part: stats_engine.get_part(),
                     reads_limit: stats_engine.reads_limit() as u64,
-                    read_only: snap_fs.read_only(),
                     disk_read_only: read_only,
                 })
             };

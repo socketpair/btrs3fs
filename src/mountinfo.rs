@@ -6,8 +6,6 @@ use std::path::PathBuf;
 pub struct Mount {
     pub point: PathBuf,
     pub source: String,
-    /// Mounted read-only (the per-mount `ro` option).
-    pub read_only: bool,
 }
 
 /// Every mount, in mount order: of several on one point, the last is on top.
@@ -21,12 +19,11 @@ fn parse(text: &str) -> Vec<Mount> {
         .filter_map(|line| {
             let (left, right) = line.split_once(" - ")?;
             let left: Vec<&str> = left.split(' ').collect();
-            let (point, options) = (left.get(4)?, left.get(5)?);
+            let point = left.get(4)?;
             let source = right.split(' ').nth(1)?;
             Some(Mount {
                 point: PathBuf::from(unescape(point)),
                 source: unescape(source),
-                read_only: options.split(',').any(|o| o == "ro"),
             })
         })
         .collect()
@@ -74,7 +71,6 @@ mod tests {
         assert_eq!(m.len(), 2);
         assert_eq!(m[0].point, PathBuf::from("/mnt/my disk"));
         assert_eq!(m[0].source, "/dev/ublkb0");
-        assert!(!m[0].read_only);
-        assert!(m[1].read_only);
+        assert_eq!(m[1].point, PathBuf::from("/ro"));
     }
 }

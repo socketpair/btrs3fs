@@ -145,12 +145,7 @@ impl Btrfs {
 
     /// Where the filesystem on the device is mounted (the top-most mount).
     pub fn mountpoint(&self) -> Option<PathBuf> {
-        mount_of(&format!("/dev/{}", self.device)).map(|(point, _)| point)
-    }
-
-    /// Whether the filesystem is mounted read-only; `None` when not mounted.
-    pub fn read_only(&self) -> Option<bool> {
-        mount_of(&format!("/dev/{}", self.device)).map(|(_, ro)| ro)
+        mount_of(&format!("/dev/{}", self.device))
     }
 
     pub fn info(&self) -> Info {
@@ -228,13 +223,13 @@ impl Btrfs {
     }
 }
 
-/// Mount point and read-only flag of the top-most mount of `source`.
-fn mount_of(source: &str) -> Option<(PathBuf, bool)> {
+/// Mount point of the top-most mount of `source`.
+fn mount_of(source: &str) -> Option<PathBuf> {
     crate::mountinfo::mounts()
         .ok()?
         .into_iter()
         .rfind(|m| m.source == source)
-        .map(|m| (m.point, m.read_only))
+        .map(|m| m.point)
 }
 
 /// The sysfs directories (`/sys/fs/btrfs/<fsid>`) of the mounted btrfs

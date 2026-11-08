@@ -614,8 +614,6 @@ pub struct DiskState {
     pub uploads_limit: u64,
     pub get_part: Option<u64>,
     pub reads_limit: u64,
-    /// The filesystem on the device is mounted read-only (`None`: not mounted).
-    pub read_only: Option<bool>,
     /// The disk is served read-only (SPEC.md §9.2).
     pub disk_read_only: bool,
 }
@@ -625,15 +623,6 @@ impl Stats {
     fn alerts(&self, d: &DiskState, e: &LastErrors) -> Vec<Alert> {
         let mut out = Vec::new();
         let mut push = |level, text: String| out.push(Alert { level, text });
-        // On a disk served read-only the filesystem is read-only by design.
-        if d.read_only == Some(true) && !d.disk_read_only {
-            push(
-                "bad",
-                "The filesystem is mounted read-only: btrfs stopped writing after an error. \
-                 Unmount it and mount it again."
-                    .into(),
-            );
-        }
         if let Some(io) = e.io.as_ref().filter(|x| x.secs_ago < ALERT_IO_SECS) {
             push(
                 "bad",
@@ -974,7 +963,7 @@ mod tests {
 
     #[test]
     fn alerts_point_out_problems() {
-        let disk = |read_only| DiskState {
+        let disk = || DiskState {
             disk: "t/".into(),
             device: "/dev/ublkb9".into(),
             append: Default::default(),
@@ -992,7 +981,6 @@ mod tests {
             uploads_limit: 4,
             get_part: Some(2 << 20),
             reads_limit: 19,
-            read_only,
             disk_read_only: false,
         };
         let err = |secs_ago, text: &str| {
@@ -1002,13 +990,11 @@ mod tests {
             })
         };
         let quiet = LastErrors::default();
-        assert!(STATS.alerts(&disk(Some(false)), &quiet).is_empty());
-        let ro = STATS.alerts(&disk(Some(true)), &quiet);
-        assert_eq!(ro[0].level, "bad");
-        // Served read-only: a read-only filesystem is expected, no alert.
+        assert!(STATS.alerts(&disk(), &quiet).is_empty());
+        // How the filesystem is mounted is no alert (user decision).
         let served_ro = DiskState {
             disk_read_only: true,
-            ..disk(Some(true))
+            ..disk()
         };
         assert!(STATS.alerts(&served_ro, &quiet).is_empty());
         let errors = LastErrors {
@@ -1018,7 +1004,7 @@ mod tests {
             compact: None,
             measure: None,
         };
-        let a = STATS.alerts(&disk(None), &errors);
+        let a = STATS.alerts(&disk(), &errors);
         let texts: Vec<&str> = a.iter().map(|x| x.text.as_str()).collect();
         assert_eq!(a.len(), 2, "{texts:?}");
         assert!(texts[0].contains("I/O error 30 s ago: EIO"));
