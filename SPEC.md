@@ -804,6 +804,22 @@ crates.io её ещё нет. Поэтому зависимость — git с �
 - С ноутбука: задержка 38 мс, чтение ~33 МиБ/с, запись ~24 МиБ/с (упор в канал). `PUT` 16 КиБ —
   p50 77 мс (дозапись multipart была 261 мс), Яндекс: `PUT` 89 мс, `PATCH` 155 мс.
 
+**UpCloud** (`*.upcloudobjects.com`, 2026-11-08): PATCH нет, `?append` не работает, склейка
+частей по 4 КиБ на сервере работает → `SEGMENTS`, `copy_min_part: 0`. `DeleteObjects` принимает
+только `Content-MD5` (без него: `400 InvalidRequest: Missing required header … Content-MD5`).
+Ключ без политики доступа к бакету видит только `HeadBucket`.
+
+**VK Cloud** (`hb.ru-msk.vkcloud-storage.ru`, пустой регион принимается, 2026-11-08): PATCH нет,
+`?append` нет, склейка частей меньше 5 МиБ — `EntityTooSmall`; «копия 5 МиБ + последняя часть
+4 КиБ» работает → `SEGMENTS`, `copy_min_part: 5M`. Проверено на диске 100 ГиБ: 300 файлов по
+4–64 КиБ с `fsync` каждого и файл 200 МиБ; FULL-зоны склеились сами, остальные — кнопкой (7 склеек,
+68 МиБ мелких кусков прочитано и залито заново), после перемонтирования все sha256 совпали;
+удаление и balance — 17 зон сброшено, их объекты удалены.
+
+**MinIO AIStor** (2026-11-08): на PATCH и на `PUT` с `x-amz-write-offset-bytes` (AppendObject
+режима S3 Express, на этом бакете не включён) — `400 BadRequest: An unsupported API call`;
+склейка мелких частей — `EntityTooSmall` (как VK: подойдёт `copy_min_part: 5M`, не проверено).
+
 ---
 
 ## 12. Замеры

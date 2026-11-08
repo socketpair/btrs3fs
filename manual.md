@@ -175,6 +175,7 @@ applied: read window and GET part 1024 KiB, btrfs readahead 16 MiB, 4 parallel u
 | `--retry-backoff-factor` | `retry_backoff_factor` | 2.0 | Рост паузы, не меньше 1; пауза не длиннее `--retry-timeout-seconds`. |
 | `--queues` | `nr_queues` | 4 | Очереди (потоки) устройства. |
 | — | `append` | определяет `create` | Как растут объекты зон: `PATCH` (Yandex), `PUT_APPEND` (Ceph RGW Append Object) или `SEGMENTS` (каждая выгрузка — новый объект `<зона>-<смещение>`, фоновая склейка на сервере). |
+| — | `copy_min_part` | определяет `create` | `SEGMENTS`: куски меньше этого склейка читает и заливает заново, а не копирует на сервере. `0` — сервер склеивает части любого размера (Selectel, UpCloud); `5M` — только от 5 МиБ (VK Cloud, MinIO, AWS). |
 | `--queue-depth` | `queue_depth` | 128 | Глубина очереди. |
 
 ## 7. Сохранность данных
