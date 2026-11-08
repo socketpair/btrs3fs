@@ -1015,8 +1015,19 @@ fn cmd_create(a: CreateArgs) -> anyhow::Result<i32> {
             );
             s3.delete_many(&leftovers).await?;
         }
-        cfg.append = s3.detect_append(&layout.dir()).await?;
-        info!("appending to zone objects with {:?}", cfg.append);
+        (cfg.append, cfg.copy_min_part) = s3.detect_append(&layout.dir()).await?;
+        info!(
+            "appending to zone objects with {:?}{}",
+            cfg.append,
+            if cfg.copy_min_part > 0 {
+                format!(
+                    "; concatenation reads pieces under {} MiB",
+                    cfg.copy_min_part >> 20
+                )
+            } else {
+                String::new()
+            }
+        );
         let yaml = Bytes::from(cfg.to_yaml());
         s3.put(&layout.config_key(), Body::new(vec![yaml])).await?;
         Ok(())

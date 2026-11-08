@@ -335,8 +335,10 @@ impl S3Store {
     /// answer 200 with the right `x-rgw-next-append-position` twice (a service
     /// that ignores `?append` overwrites the object and sends no such header —
     /// Selectel does); else segments, if the bucket concatenates small parts on
-    /// the server. Without any of these btrs3fs cannot use the bucket.
-    pub async fn detect_append(&self, dir: &str) -> StoreResult<AppendMode> {
+    /// the server, or parts of the standard 5 MiB minimum (then the second
+    /// value, `copy_min_part`, is that minimum). Without any of these btrs3fs
+    /// cannot use the bucket.
+    pub async fn detect_append(&self, dir: &str) -> StoreResult<(AppendMode, u64)> {
         let dir = dir.trim_end_matches('/');
         let block = Bytes::from(vec![0u8; crate::config::BLOCK_SIZE as usize]);
         let len = block.len() as u64;
@@ -347,7 +349,7 @@ impl S3Store {
         let patched = self.patch_request(&key, len, one()).await;
         self.delete(&key).await?;
         match patched {
-            Ok(()) => return Ok(AppendMode::Patch),
+            Ok(()) => return Ok((AppendMode::Patch, 0)),
             Err(StoreError::Unsupported(_)) => {}
             Err(e) => return Err(e),
         }
@@ -362,7 +364,7 @@ impl S3Store {
         .await;
         self.delete(&key).await?;
         match appended {
-            Ok(true) => return Ok(AppendMode::PutAppend),
+            Ok(true) => return Ok((AppendMode::PutAppend, 0)),
             Ok(false) => {}
             Err(e) => debug!("no Append Object: {e}"),
         }
@@ -384,16 +386,41 @@ impl S3Store {
                 )
                 .await?;
             self.finish_concat(pending).await?;
-            Ok::<_, StoreError>(self.get(&c).await? == [first, second].concat())
+            Ok::<_, StoreError>(self.get(&c).await? == [first, second.clone()].concat())
         }
         .await;
-        self.delete_many(&[a, b, c]).await?;
+        self.delete_many(&[a, b.clone(), c.clone()]).await?;
+        let small = match concatenated {
+            Ok(true) => return Ok((AppendMode::Segments, 0)),
+            Ok(false) => return Err(anyhow!("server-side concatenation gave wrong data").into()),
+            Err(e) => e,
+        };
+        debug!("no concatenation of small parts: {small}");
+
+        // Parts of the standard minimum but the last: the concatenation then
+        // reads smaller pieces and uploads them (`copy_min_part`, SPEC.md §5).
+        let big = Bytes::from(vec![0x33u8; MIN_PART as usize]);
+        let d = format!("{dir}/append-probe-d");
+        self.put(&d, Body::new(vec![big.clone()])).await?;
+        self.put(&b, Body::new(vec![second.clone()])).await?;
+        let concatenated = async {
+            let parts = [
+                ConcatPart::copy(&d, 0, MIN_PART),
+                ConcatPart::copy(&b, 0, len),
+            ];
+            let pending = self.begin_concat(&c, &parts).await?;
+            self.finish_concat(pending).await?;
+            Ok::<_, StoreError>(self.get(&c).await? == [big, second].concat())
+        }
+        .await;
+        self.delete_many(&[d, b, c]).await?;
         match concatenated {
-            Ok(true) => Ok(AppendMode::Segments),
+            Ok(true) => Ok((AppendMode::Segments, MIN_PART)),
             Ok(false) => Err(anyhow!("server-side concatenation gave wrong data").into()),
             Err(e) => Err(anyhow!(
-                "this S3 can neither append (PATCH, Append Object) nor concatenate small \
-                 parts on the server ({e}); btrs3fs cannot use it"
+                "this S3 can neither append (PATCH, Append Object) nor concatenate parts on \
+                 the server (small parts: {small}; {} MiB parts: {e}); btrs3fs cannot use it",
+                MIN_PART >> 20
             )
             .into()),
         }
@@ -1021,6 +1048,8 @@ pub struct PendingConcat {
 /// Parts of one concatenation copied at once: the copies run on the server,
 /// so this only bounds requests in flight. Judgement call, as S3_PARALLELISM.
 const COPY_PARALLELISM: usize = 16;
+/// Smallest multipart part but the last in standard S3 (`EntityTooSmall`).
+const MIN_PART: u64 = 5 << 20;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -1525,7 +1554,7 @@ mod bucket_tests {
     async fn detect_append_mode() {
         let s3 = store();
         let prefix = unique_prefix("detect");
-        let mode = s3.detect_append(&prefix).await.unwrap();
+        let (mode, _) = s3.detect_append(&prefix).await.unwrap();
         eprintln!("append mode of this bucket: {mode:?}");
         if let Ok(want) = std::env::var("BTRS3FS_EXPECT_APPEND") {
             assert_eq!(format!("{mode:?}"), want);
