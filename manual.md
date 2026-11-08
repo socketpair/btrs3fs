@@ -44,26 +44,25 @@ echo ublk_drv | sudo tee /etc/modules-load.d/btrs3fs-ublk.conf   # загруз�
 
 ## 3. Файл реквизитов
 
-JSON, путь — флаг `--creds`; реквизиты нигде не печатаются. Права `0600`, владелец root.
+YAML (можно с комментариями; JSON с теми же ключами тоже подходит), путь — флаг `--creds`;
+реквизиты нигде не печатаются. Права `0600`, владелец root. Пример — `examples/creds.yaml`:
 
-```json
-{
-  "endpoint": "https://storage.yandexcloud.net",
-  "region": "ru-central1",
-  "bucket": "my-bucket",
-  "access_key": "...",
-  "secret_key": "..."
-}
+```yaml
+endpoint: https://storage.yandexcloud.net
+region: ru-central1
+bucket: my-bucket
+access_key: ...
+secret_key: ...
 ```
 
 `endpoint` — только `https://хост[:порт]`, без пути. S3 без TLS (`http://`, например свой MinIO
-в доверенной сети) — только с `"allow_http": true`: без шифрования любой на пути видит данные и
+в доверенной сети) — только с `allow_http: true`: без шифрования любой на пути видит данные и
 может подменить образ ФС. Если файл читают другие пользователи, демон предупреждает в журнале.
 
 ## 4. Быстрый старт
 
 ```bash
-C=/etc/btrs3fs/creds.json
+C=/etc/btrs3fs/creds.yaml
 sudo btrs3fs create --creds $C --prefix disks/data --size 10G      # один раз: диск + mkfs
 sudo mkdir -p /mnt/data
 sudo btrs3fs mount --creds $C --prefix disks/data /mnt/data        # корень ФС — root: chown
@@ -75,24 +74,24 @@ btrs3fs destroy --creds $C --prefix disks/data --yes               # удали�
 
 | Команда | Назначение |
 |---|---|
-| `create --creds F --prefix P --size S [параметры §6]` | Записать `P/disk.json` и отформатировать в btrfs (все профили `single`). Отказ, если под префиксом есть объекты; при ошибке созданное удаляется. |
+| `create --creds F --prefix P --size S [параметры §6]` | Записать `P/disk.yaml` и отформатировать в btrfs (все профили `single`). Отказ, если под префиксом есть объекты; при ошибке созданное удаляется. |
 | `mount --creds F --prefix P <точка> [-o опции] [--dev-id N] [-r]` | Запустить устройство в фоне и смонтировать с `nosuid,nodev,noatime,lazytime,commit=300` (+ `-o`). Возвращается после монтирования. `-r` — только чтение (ниже). |
 | `umount <точка>` | Размонтировать и остановить устройство. |
 | `run --creds F --prefix P [--dev-id 0]` | Устройство без монтирования, на переднем плане (systemd, §9). |
 | `run --memory --size S` | Устройство в RAM без S3 — для экспериментов. |
 | `detach [--dev-id 0]` | Остановить несмонтированное устройство или убрать устройство с умершим демоном. |
 | `detach --force [--dev-id N]` | SIGKILL демону даже при смонтированной ФС — как выдернуть питание; дальше `umount <точка>`. |
-| `destroy --creds F --prefix P --yes` | Удалить все объекты диска (только его: диск под префиксом `P/…` не трогается). Нужен `P/disk.json`. Сначала размонтируйте: команда этого не проверяет. |
+| `destroy --creds F --prefix P --yes` | Удалить все объекты диска (только его: диск под префиксом `P/…` не трогается). Нужен `P/disk.yaml`. Сначала размонтируйте: команда этого не проверяет. |
 | `measure --creds F --prefix P` | Измерить связь с S3 с этой машины и напечатать YAML для `--link-config` (§5.1). Читает объекты диска `P` (если он есть), пишет временные под `P/measure-…/` и удаляет их. Полминуты-минута, root не нужен. |
 
 `--dev-id`: устройство — `/dev/ublkb<N>`; у `mount` номер по умолчанию выбирает ядро, у `run` и
 `detach` — 0.
 
-Флаги `mount` и `run` (задаются при каждом запуске, в `disk.json` не хранятся):
+Флаги `mount` и `run` (задаются при каждом запуске, в `disk.yaml` не хранятся):
 
 | Флаг | По умолчанию | Смысл |
 |---|---|---|
-| `--queues N` | из `disk.json` | Число очередей (потоков) устройства. |
+| `--queues N` | из `disk.yaml` | Число очередей (потоков) устройства. |
 | `--link-config FILE` | всё авто | YAML с ручными настройками связи с S3 (§5.1). |
 | `--stats-port P` / `--no-stats` | `9470 + N` | Страница статистики (§14). |
 | `-r`, `--read-only` | выкл. | Только чтение (ниже). |
@@ -161,10 +160,10 @@ applied: read window and GET part 1024 KiB, btrfs readahead 16 MiB, 4 parallel u
 
 ## 6. Параметры диска
 
-Задаются при `create`, хранятся в `<prefix>/disk.json` и потом не меняются (кроме очередей —
+Задаются при `create`, хранятся в `<prefix>/disk.yaml` и потом не меняются (кроме очередей —
 `--queues`).
 
-| Флаг `create` | Поле `disk.json` | По умолчанию | Смысл |
+| Флаг `create` | Поле `disk.yaml` | По умолчанию | Смысл |
 |---|---|---|---|
 | `--size` | `disk_size` | — | Размер диска, кратен зоне. |
 | `--zone-size` | `zone_size` | `16M` | Размер зоны = наибольший объект. Степень двойки до 32M; btrfs требует ≥ 4M. Больше 16M не ставьте: Яндекс резко замедляет дозапись в объекты больше ~20 МБ. |
@@ -225,7 +224,7 @@ sudo systemctl enable --now btrs3fs@main
 ## 10. Что лежит в бакете
 
 ```
-<prefix>/disk.json            параметры диска (§6)
+<prefix>/disk.yaml            параметры диска (§6)
 <prefix>/0000000000000000     зона 0
 <prefix>/0000000001000000     зона 1 (смещение 16 МиБ, hex)
 <prefix>/0000000002000000-00000000   режим SEGMENTS: зона 2 с начала
@@ -249,7 +248,7 @@ sudo systemctl enable --now btrs3fs@main
 |---|---|
 | `disk … not found, create it first` | Неверный `--prefix` или диск не создан. |
 | `prefix … already holds N objects` при `create` | Там уже диск: другой префикс или `destroy`. |
-| `… disk.json exists: a disk cannot lie inside another disk's prefix` при `create` | Префикс внутри другого диска: выберите префикс рядом, а не внутри. |
+| `… disk.yaml exists: a disk cannot lie inside another disk's prefix` при `create` | Префикс внутри другого диска: выберите префикс рядом, а не внутри. |
 | `… is already mounted` | Точка занята: `umount` или другая точка. |
 | `umount`: ФС занята | Закрыть файлы, выйти из каталога (`fuser -vm /mnt/data`). |
 | ФС «пропала», в журнале ядра ошибки ввода-вывода или `emergency shutdown` | Демон умер. `sudo btrs3fs umount <точка>`, затем `mount`. |

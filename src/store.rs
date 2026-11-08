@@ -1,5 +1,5 @@
 //! Object storage abstraction: zone objects (one per zone, or segments
-//! `<zone>-<offset>` on SEGMENTS disks) plus `disk.json`.
+//! `<zone>-<offset>` on SEGMENTS disks) plus `disk.yaml`.
 //!
 //! `MemStore` mirrors the semantics observed on Yandex Object Storage
 //! (see SPEC.md §11): PATCH of a missing object fails with "not found",
@@ -495,8 +495,19 @@ impl Layout {
         key.starts_with(&self.measure_prefix())
     }
 
-    pub fn config_key(&self) -> String {
+    /// `disk.json` of disks created before `disk.yaml`; moved to `disk.yaml`
+    /// when such a disk is served writable.
+    pub fn legacy_config_key(&self) -> String {
         format!("{}/disk.json", self.prefix)
+    }
+
+    pub fn is_config_key(&self, key: &str) -> bool {
+        key == self.config_key() || key == self.legacy_config_key()
+    }
+
+    /// The disk's config, `<prefix>/disk.yaml` (SPEC.md §3.2).
+    pub fn config_key(&self) -> String {
+        format!("{}/disk.yaml", self.prefix)
     }
 
     /// Zone object name: byte offset of the zone in hex with leading zeros
@@ -588,6 +599,15 @@ const META_SUFFIX: &str = ".meta";
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    #[test]
+    fn config_keys() {
+        let l = Layout::new("a/b").unwrap();
+        assert_eq!(l.config_key(), "a/b/disk.yaml");
+        assert_eq!(l.legacy_config_key(), "a/b/disk.json");
+        assert!(l.is_config_key("a/b/disk.json") && l.is_config_key("a/b/disk.yaml"));
+        assert!(!l.is_config_key("a/disk.yaml"));
+    }
     use std::time::Duration;
 
     async fn pending<F: std::future::Future>(f: F) -> bool {

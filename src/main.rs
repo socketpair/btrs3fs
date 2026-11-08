@@ -73,7 +73,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a new disk: write <prefix>/disk.json and format it with zoned btrfs (needs root).
+    /// Create a new disk: write <prefix>/disk.yaml and format it with zoned btrfs (needs root).
     Create(CreateArgs),
     /// Start the device in the background and mount its btrfs (needs root).
     Mount(MountArgs),
@@ -141,7 +141,7 @@ struct MountArgs {
     /// ublk device id; -1 lets the kernel choose.
     #[arg(long, default_value_t = -1, allow_hyphen_values = true)]
     dev_id: i32,
-    /// Override nr_queues from disk.json.
+    /// Override nr_queues from disk.yaml.
     #[arg(long)]
     queues: Option<u16>,
     #[command(flatten)]
@@ -150,7 +150,7 @@ struct MountArgs {
     link: LinkArgs,
 }
 
-/// Link settings (SPEC.md §6.1): per run, not in disk.json.
+/// Link settings (SPEC.md §6.1): per run, not in disk.yaml.
 #[derive(Args, Clone)]
 struct LinkArgs {
     /// YAML file with manual link values (see examples/link.yaml); a key that
@@ -203,7 +203,7 @@ struct RunArgs {
     /// ublk device id: the device is /dev/ublkb<dev-id>.
     #[arg(long, default_value_t = 0)]
     dev_id: i32,
-    /// Override nr_queues from disk.json.
+    /// Override nr_queues from disk.yaml.
     #[arg(long)]
     queues: Option<u16>,
     /// Serve the disk read-only (mount it with -o ro,rescue=nologreplay):
@@ -280,29 +280,46 @@ fn ensure_root(what: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn load_config(s3: &S3Store, layout: &Layout) -> anyhow::Result<Option<DiskConfig>> {
-    let key = layout.config_key();
-    match s3.get(&key).await {
-        Ok(data) => Ok(Some(
-            DiskConfig::from_json(&data).with_context(|| format!("invalid {key}"))?,
-        )),
-        Err(store::StoreError::NotFound(_)) => Ok(None),
-        Err(e) => Err(e.into()),
+/// The disk's `disk.yaml`; for a disk created before it, its `disk.json`,
+/// moved to `disk.yaml` when `migrate` (served writable; SPEC.md §3.2).
+async fn load_config(
+    s3: &S3Store,
+    layout: &Layout,
+    migrate: bool,
+) -> anyhow::Result<Option<DiskConfig>> {
+    for key in [layout.config_key(), layout.legacy_config_key()] {
+        let data = match s3.get(&key).await {
+            Ok(data) => data,
+            Err(store::StoreError::NotFound(_)) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let cfg = DiskConfig::parse(&data).with_context(|| format!("invalid {key}"))?;
+        if migrate && key == layout.legacy_config_key() {
+            // The new one first: an interruption leaves both, never neither.
+            let yaml = Bytes::from(cfg.to_yaml());
+            s3.put(&layout.config_key(), Body::new(vec![yaml])).await?;
+            s3.delete(&key).await?;
+            info!("{key} moved to {}", layout.config_key());
+        }
+        return Ok(Some(cfg));
     }
+    Ok(None)
 }
 
-/// Loads `disk.json` and returns an S3 store using the disk's retry policy.
+/// Loads the disk config and returns an S3 store using the disk's retry
+/// policy; a writable disk gets its old `disk.json` moved to `disk.yaml`.
 fn open_s3_disk(
     rt: &Runtime,
     creds: &Path,
     prefix: &str,
     transport: &Transport,
+    read_only: bool,
 ) -> anyhow::Result<(DiskConfig, Layout, Store)> {
     let creds = config::Creds::load(creds)?;
     let layout = Layout::new(prefix)?;
     let s3 = S3Store::new(&creds, transport, RetryPolicy::default())?;
     let cfg = rt
-        .block_on(load_config(&s3, &layout))?
+        .block_on(load_config(&s3, &layout, !read_only))?
         .with_context(|| format!("disk {} not found, create it first", layout.config_key()))?;
     let s3 = s3
         .with_retry(RetryPolicy::from_config(&cfg))
@@ -516,7 +533,7 @@ fn link_settings(t: &autotune::Autotune, query: &str) -> String {
 struct ServeOptions {
     /// ublk device id; -1 lets the kernel choose.
     dev_id: i32,
-    /// Overrides `nr_queues` from disk.json.
+    /// Overrides `nr_queues` from disk.yaml.
     queues: Option<u16>,
     /// `None` — no statistics page (temporary device of `create`).
     stats: Option<StatsArgs>,
@@ -599,6 +616,7 @@ fn cmd_run(a: RunArgs) -> anyhow::Result<i32> {
             a.creds.as_ref().unwrap(),
             a.prefix.as_ref().unwrap(),
             &a.transport,
+            a.read_only,
         )?
     };
     let on_ready: device::OnReady = Box::new(|_| {
@@ -722,7 +740,8 @@ fn mount_daemon(
     let status = Arc::new(Mutex::new(Some(status)));
     let res = (|| -> anyhow::Result<()> {
         let rt = runtime()?;
-        let (cfg, layout, store) = open_s3_disk(&rt, creds, &a.disk.prefix, &a.disk.transport)?;
+        let (cfg, layout, store) =
+            open_s3_disk(&rt, creds, &a.disk.prefix, &a.disk.transport, a.read_only)?;
         let ready_status = status.clone();
         let on_ready: device::OnReady = Box::new(move |bdev| {
             if let Some(mut f) = ready_status.lock().unwrap().take() {
@@ -947,11 +966,12 @@ fn cmd_create(a: CreateArgs) -> anyhow::Result<i32> {
     rt.block_on(async {
         // Deleting by prefix would reach into a disk nested under another.
         for parent in layout.ancestors() {
-            let key = Layout::new(parent)?.config_key();
-            match s3.get(&key).await {
-                Ok(_) => bail!("{key} exists: a disk cannot lie inside another disk's prefix"),
-                Err(store::StoreError::NotFound(_)) => {}
-                Err(e) => return Err(e.into()),
+            let parent = Layout::new(parent)?;
+            if load_config(&s3, &parent, false).await?.is_some() {
+                bail!(
+                    "{} is a disk: a disk cannot lie inside another disk's prefix",
+                    parent.dir()
+                );
             }
         }
         let listed = s3.list(&layout.dir()).await?;
@@ -972,8 +992,8 @@ fn cmd_create(a: CreateArgs) -> anyhow::Result<i32> {
         }
         cfg.append = s3.detect_append(&layout.dir()).await?;
         info!("appending to zone objects with {:?}", cfg.append);
-        let json = Bytes::from(cfg.to_json());
-        s3.put(&layout.config_key(), Body::new(vec![json])).await?;
+        let yaml = Bytes::from(cfg.to_yaml());
+        s3.put(&layout.config_key(), Body::new(vec![yaml])).await?;
         Ok(())
     })?;
     let s3 = s3.with_append(cfg.append);
@@ -1066,7 +1086,8 @@ fn cmd_measure(a: DiskArgs) -> anyhow::Result<i32> {
     let layout = Layout::new(&a.prefix)?;
     let rt = runtime()?;
     // Reads only the disk's own objects; without a disk, writes only.
-    let cfg = rt.block_on(load_config(&s3, &layout))?;
+    // Only reads the disk: its config stays as it is.
+    let cfg = rt.block_on(load_config(&s3, &layout, false))?;
     let reads = match &cfg {
         Some(cfg) => {
             let listed = rt.block_on(s3.list(&layout.dir()))?;
@@ -1103,14 +1124,12 @@ fn cmd_destroy(a: DestroyArgs) -> anyhow::Result<i32> {
     let layout = Layout::new(&a.disk.prefix)?;
     let s3 = S3Store::new(&creds, &a.disk.transport, RetryPolicy::default())?;
     let rt = runtime()?;
-    match rt.block_on(s3.get(&layout.config_key())) {
-        Ok(_) => {}
-        Err(store::StoreError::NotFound(_)) => bail!(
+    if rt.block_on(load_config(&s3, &layout, false))?.is_none() {
+        bail!(
             "no disk at {}: {} not found",
             layout.dir(),
             layout.config_key()
-        ),
-        Err(e) => return Err(e.into()),
+        );
     }
     let deleted = destroy_prefix(&rt, &s3, &layout)?;
     info!("destroyed {}: {deleted} zone objects deleted", layout.dir());
@@ -1121,7 +1140,6 @@ fn cmd_destroy(a: DestroyArgs) -> anyhow::Result<i32> {
 /// disks nested under its prefix stay.
 fn destroy_prefix(rt: &Runtime, s3: &S3Store, layout: &Layout) -> anyhow::Result<usize> {
     rt.block_on(async {
-        let config_key = layout.config_key();
         let keys: Vec<String> = s3
             .list(&layout.dir())
             .await?
@@ -1132,7 +1150,8 @@ fn destroy_prefix(rt: &Runtime, s3: &S3Store, layout: &Layout) -> anyhow::Result
         s3.abort_stale_concats(layout).await?;
         s3.delete_many(&keys).await?;
         // The config goes last so an interrupted destroy can be repeated.
-        s3.delete(&config_key).await?;
+        s3.delete(&layout.legacy_config_key()).await?;
+        s3.delete(&layout.config_key()).await?;
         anyhow::Ok(keys.len())
     })
 }

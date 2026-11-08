@@ -1,0 +1,10 @@
+# btrs3fs S3 credentials: `--creds creds.yaml` (JSON with the same keys works too).
+# Keep the real file out of git and readable by its owner only: chmod 600.
+endpoint: https://storage.yandexcloud.net   # scheme and host only
+region: ru-central1
+bucket: my-bucket
+access_key: ACCESS_KEY_ID
+secret_key: SECRET_ACCESS_KEY
+# Plain http:// endpoints must be allowed explicitly: without TLS anyone on the
+# path reads the data and can alter the disk image.
+# allow_http: false

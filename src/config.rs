@@ -1,4 +1,4 @@
-//! Disk configuration (`<prefix>/disk.json`) and S3 credentials (`creds.json`).
+//! Disk configuration (`<prefix>/disk.yaml`) and S3 credentials (`--creds`, YAML or JSON).
 
 use anyhow::{Context, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -34,7 +34,7 @@ pub const MAX_ZONE_SIZE: u64 = 1 << libublk::sys::UBLK_IO_BUF_BITS;
 /// Deepest queue the ublk driver accepts (`UBLK_MAX_QUEUE_DEPTH`, `linux/ublk_cmd.h`).
 const UBLK_MAX_QUEUE_DEPTH: u16 = libublk::sys::UBLK_MAX_QUEUE_DEPTH as u16;
 
-/// Version of the disk.json format; bump on incompatible changes.
+/// Version of the disk.yaml format; bump on incompatible changes.
 pub const CONFIG_VERSION: u32 = 1;
 
 /// Zone size of new disks. Measured (SPEC.md §11): Yandex PATCH to an object
@@ -202,16 +202,19 @@ impl DiskConfig {
         self.disk_size / self.zone_size
     }
 
-    pub fn from_json(data: &[u8]) -> anyhow::Result<Self> {
-        let cfg: Self = serde_json::from_slice(data).context("cannot parse disk config")?;
+    /// `disk.yaml`, or the `disk.json` of older disks: YAML reads JSON too.
+    pub fn parse(data: &[u8]) -> anyhow::Result<Self> {
+        let cfg: Self = serde_norway::from_slice(data).context("cannot parse disk config")?;
         cfg.validate()?;
         Ok(cfg)
     }
 
-    pub fn to_json(&self) -> Vec<u8> {
-        let mut out = serde_json::to_vec_pretty(self).expect("disk config is serializable");
-        out.push(b'\n');
-        out
+    /// `disk.yaml` (SPEC.md §3.2).
+    pub fn to_yaml(&self) -> String {
+        let body = serde_norway::to_string(self).expect("disk config is serializable");
+        format!(
+            "# btrs3fs disk (SPEC.md §3.2): written by `btrs3fs create`, fixed afterwards.\n{body}"
+        )
     }
 }
 
@@ -234,7 +237,8 @@ impl Creds {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let data = std::fs::read(path)
             .with_context(|| format!("cannot read credentials file {}", path.display()))?;
-        let creds: Self = serde_json::from_slice(&data)
+        // YAML, or JSON, which YAML reads too.
+        let creds: Self = serde_norway::from_slice(&data)
             .with_context(|| format!("cannot parse credentials file {}", path.display()))?;
         creds.check_endpoint()?;
         if let Ok(meta) = std::fs::metadata(path) {
@@ -404,35 +408,80 @@ mod tests {
     #[test]
     fn old_config_with_zone_limits() {
         let mut json: serde_json::Value =
-            serde_json::from_slice(&DiskConfig::new(1 << 30, 16 << 20).to_json()).unwrap();
+            serde_json::to_value(DiskConfig::new(1 << 30, 16 << 20)).unwrap();
         assert!(json.get("max_open_zones").is_none()); // not written any more
         assert!(json.get("max_active_zones").is_none());
         json["max_open_zones"] = 1024.into();
         json["max_active_zones"] = 1024.into();
-        DiskConfig::from_json(json.to_string().as_bytes()).unwrap(); // still accepted
+        DiskConfig::parse(json.to_string().as_bytes()).unwrap(); // still accepted
     }
 
     #[test]
     fn append_mode() {
         let mut cfg = DiskConfig::new(1 << 30, 16 << 20);
         cfg.append = AppendMode::Segments;
-        let mut json: serde_json::Value = serde_json::from_slice(&cfg.to_json()).unwrap();
+        let mut json: serde_json::Value = serde_json::to_value(&cfg).unwrap();
         assert_eq!(json["append"], "SEGMENTS");
         json["append"] = "patch".into(); // written so before the names were fixed
-        let old = DiskConfig::from_json(json.to_string().as_bytes()).unwrap();
+        let old = DiskConfig::parse(json.to_string().as_bytes()).unwrap();
         assert_eq!(old.append, AppendMode::Patch);
         json["append"] = "MULTIPART".into(); // removed mode
-        assert!(DiskConfig::from_json(json.to_string().as_bytes()).is_err());
+        assert!(DiskConfig::parse(json.to_string().as_bytes()).is_err());
         json.as_object_mut().unwrap().remove("append"); // disks created before the field
-        let old = DiskConfig::from_json(json.to_string().as_bytes()).unwrap();
+        let old = DiskConfig::parse(json.to_string().as_bytes()).unwrap();
         assert_eq!(old.append, AppendMode::Patch);
     }
 
     #[test]
-    fn json_roundtrip() {
-        let cfg = DiskConfig::new(1 << 30, 32 << 20);
-        assert_eq!(DiskConfig::from_json(&cfg.to_json()).unwrap(), cfg);
-        assert!(DiskConfig::from_json(br#"{"version":1}"#).is_err());
+    fn yaml_roundtrip() {
+        let mut cfg = DiskConfig::new(1 << 30, 32 << 20);
+        cfg.append = AppendMode::Segments;
+        let yaml = cfg.to_yaml();
+        assert!(yaml.starts_with("# "), "{yaml}");
+        assert!(yaml.contains("append: SEGMENTS"), "{yaml}");
+        assert_eq!(DiskConfig::parse(yaml.as_bytes()).unwrap(), cfg);
+        assert!(DiskConfig::parse(br#"{"version":1}"#).is_err());
+    }
+
+    /// Disks created before disk.yaml have a disk.json: YAML reads JSON.
+    #[test]
+    fn legacy_json_parses() {
+        let cfg = DiskConfig::new(1 << 30, 16 << 20);
+        let json = serde_json::to_vec_pretty(&cfg).unwrap();
+        assert_eq!(DiskConfig::parse(&json).unwrap(), cfg);
+    }
+
+    #[test]
+    fn creds_read_yaml_and_json() {
+        let dir = std::env::temp_dir().join(format!("btrs3fs-creds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let yaml = dir.join("creds.yaml");
+        std::fs::write(
+            &yaml,
+            "# test\nendpoint: https://s3.example\nregion: r\nbucket: b\naccess_key: a\nsecret_key: s\n",
+        )
+        .unwrap();
+        let json = dir.join("creds.json");
+        std::fs::write(
+            &json,
+            r#"{"endpoint":"https://s3.example","region":"r","bucket":"b","access_key":"a","secret_key":"s"}"#,
+        )
+        .unwrap();
+        for path in [&yaml, &json] {
+            let c = Creds::load(path).unwrap();
+            assert_eq!((c.bucket.as_str(), c.region.as_str()), ("b", "r"));
+        }
+        std::fs::write(
+            &yaml,
+            "endpoint: https://s3.example\nbucket: b\nsecret: x\n",
+        )
+        .unwrap();
+        assert!(Creds::load(&yaml).is_err()); // unknown key, missing ones
+        // The example in the repository is valid apart from its placeholders.
+        let example: Creds =
+            serde_norway::from_str(include_str!("../examples/creds.yaml")).unwrap();
+        assert!(example.secret_key.contains("SECRET"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

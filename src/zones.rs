@@ -418,7 +418,6 @@ impl Engine {
         let mut found: Vec<Vec<(u64, u64)>> = vec![Vec::new(); nr_zones];
         let mut finished = vec![false; nr_zones];
         let mut meta = vec![false; nr_zones];
-        let config_key = layout.config_key();
         let zone_index = |offset: u64, key: &str| -> anyhow::Result<usize> {
             anyhow::ensure!(
                 offset.is_multiple_of(cfg.zone_size) && offset < cfg.disk_size,
@@ -446,7 +445,7 @@ impl Engine {
                 layout.parse_zone_key(&obj.key).map(|zone| (zone, 0))
             };
             let Some((zone, start)) = parsed else {
-                if obj.key != config_key {
+                if !layout.is_config_key(&obj.key) {
                     warn!("ignoring unexpected object {}", obj.key);
                 }
                 continue;
@@ -2501,7 +2500,7 @@ mod tests {
         assert_eq!(keys(&store, "t/").await, before);
         // The store itself refuses changes, whoever asks.
         assert!(matches!(
-            store.delete("t/disk.json").await,
+            store.delete("t/disk.yaml").await,
             Err(StoreError::ReadOnly)
         ));
     }
@@ -2726,7 +2725,7 @@ mod tests {
         let store = mem();
         let e = segments_engine(store.clone()).await;
         let nested = [
-            "t/x/disk.json",
+            "t/x/disk.yaml",
             "t/x/0000000000000000-00000000",
             "t/0000000000100000x/0000000000000000",
         ];

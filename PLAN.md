@@ -8,7 +8,7 @@
 ```
 src/
   main.rs       CLI (clap): create / mount / umount / run / detach / destroy; fork демона
-  config.rs     disk.json (DiskConfig, проверки), creds.json; все константы с обоснованием
+  config.rs     disk.yaml (DiskConfig, проверки), creds.json; все константы с обоснованием
   store.rs      Store: S3 или MemStore (тесты, run --memory); раскладка ключей
   s3.rs         S3Store: reqwest (HTTP/1.1) + aws-sigv4 + quick-xml, повторы, DeleteObjects, теги
   zones.rs      движок зон: состояния, буферы, выгрузка, FINISH/RESET, фоновая выгрузка,

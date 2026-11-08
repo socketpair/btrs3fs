@@ -45,7 +45,7 @@ pub struct RetryPolicy {
 }
 
 impl Default for RetryPolicy {
-    /// For requests before disk.json is read, or without a disk at all.
+    /// For requests before disk.yaml is read, or without a disk at all.
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(DEFAULT_RETRY_TIMEOUT_SECS),
@@ -147,7 +147,7 @@ impl S3Store {
         })
     }
 
-    /// Same client and connection pool with another way to append (from disk.json).
+    /// Same client and connection pool with another way to append (from disk.yaml).
     pub fn with_append(&self, append: AppendMode) -> Self {
         Self {
             append,
@@ -1097,7 +1097,7 @@ mod tests {
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>b</Name><Prefix>p/</Prefix>
 <KeyCount>2</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>true</IsTruncated>
 <Contents><Key>p/0000000000000000</Key><LastModified>2026-10-23T12:00:00.000Z</LastModified><ETag>&#34;x&#34;</ETag><Size>8192</Size><StorageClass>STANDARD</StorageClass></Contents>
-<Contents><Key>p/disk.json</Key><Size>300</Size></Contents>
+<Contents><Key>p/disk.yaml</Key><Size>300</Size></Contents>
 <NextContinuationToken>tok/1</NextContinuationToken></ListBucketResult>"#;
         let r: ListResult = quick_xml::de::from_str(xml).unwrap();
         assert_eq!(r.contents.len(), 2);
@@ -1326,6 +1326,45 @@ mod bucket_tests {
             .collect();
         assert_eq!(left, vec![keys[1].clone()]);
         cleanup(&s3, &format!("{prefix}/")).await;
+    }
+
+    /// A disk created before disk.yaml: read-only serving reads its
+    /// disk.json as is, writable serving moves it to disk.yaml.
+    #[tokio::test]
+    #[ignore]
+    async fn legacy_config_is_migrated() {
+        let s3 = store();
+        let layout = Layout::new(&unique_prefix("legacy")).unwrap();
+        let cfg = crate::config::DiskConfig::new(1 << 30, 16 << 20);
+        let json = serde_json::to_vec_pretty(&cfg).unwrap();
+        s3.put(&layout.legacy_config_key(), body(&json))
+            .await
+            .unwrap();
+        let keys = || async {
+            let mut k: Vec<String> = s3
+                .list(&layout.dir())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|o| o.key)
+                .collect();
+            k.sort();
+            k
+        };
+        let got = crate::load_config(&s3, &layout, false).await.unwrap();
+        assert_eq!(got, Some(cfg.clone()));
+        assert_eq!(keys().await, [layout.legacy_config_key()]);
+        let got = crate::load_config(&s3, &layout, true).await.unwrap();
+        assert_eq!(got, Some(cfg.clone()));
+        assert_eq!(keys().await, [layout.config_key()]);
+        let yaml = s3.get(&layout.config_key()).await.unwrap();
+        assert!(yaml.starts_with(b"# "));
+        assert_eq!(
+            crate::load_config(&s3, &layout, true).await.unwrap(),
+            Some(cfg)
+        );
+        s3.delete(&layout.config_key()).await.unwrap();
+        assert_eq!(crate::load_config(&s3, &layout, true).await.unwrap(), None);
     }
 
     #[tokio::test]

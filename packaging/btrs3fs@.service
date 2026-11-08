@@ -20,7 +20,7 @@ ExecStart=/usr/local/bin/btrs3fs run --creds ${CREDS} --prefix ${PREFIX} --dev-i
 # SIGTERM stops the device. Data no FLUSH confirmed is NOT uploaded, like a
 # disk cache on power loss (SPEC.md §5): unmount first (the fstab line above
 # orders it). Uploads already running finish, each may retry for
-# retry_timeout_seconds (disk.json), so allow time for that.
+# retry_timeout_seconds (disk.yaml), so allow time for that.
 KillMode=mixed
 TimeoutStopSec=15min
 Restart=no

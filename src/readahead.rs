@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 
-/// Read-ahead settings of a running device (command line, not disk.json).
+/// Read-ahead settings of a running device (command line, not disk.yaml).
 #[derive(Clone, Copy, Debug)]
 pub struct ReadAhead {
     /// Window size in bytes; 0 disables read-ahead.
