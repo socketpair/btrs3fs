@@ -206,7 +206,6 @@
   <nav role="tablist" aria-orientation="vertical">
     <button role="tab" aria-selected="true" data-tab="overview">Overview</button>
     <button role="tab" aria-selected="false" data-tab="zones">Zones</button>
-    <button role="tab" aria-selected="false" data-tab="btrfs">btrfs</button>
     <button role="tab" aria-selected="false" data-tab="link">S3 link</button>
     <button role="tab" aria-selected="false" data-tab="details">Details</button>
   </nav>
@@ -240,31 +239,22 @@
     <div class="actions">
       <button class="btn" data-act="flush">Upload buffered data</button>
       <button class="btn" data-act="compact" id="btn-compact">Concatenate fragmented zones</button>
+      <button class="btn" data-fsact="syncfs">Commit the filesystem</button>
+      <button class="btn" data-fsact="balance">Remove empty block groups</button>
     </div>
+    <div id="b-action" class="note" style="margin-top:8px"></div>
     <p class="note">One cell per zone in disk order, left to right; partly written zones fill from the bottom.
-      Hover a cell for a summary, click it for what the zone holds — below the map; the switch above dims all zones but data or metadata ones. “Upload buffered data” stores everything held in RAM now but does not commit
-      btrfs — use “Commit the filesystem” on the btrfs tab for that. “Concatenate fragmented zones” merges the S3
-      objects of every zone that has more than one.</p>
+      Hover a cell for a summary, click it for what the zone holds — below the map; the switch above dims all zones but data or metadata ones.
+      “Upload buffered data” stores everything held in RAM now but does not commit btrfs. “Concatenate fragmented zones”
+      merges the S3 objects of every zone that has more than one. “Commit the filesystem” is <code>syncfs()</code>: btrfs
+      writes its transaction, so every written file is stored in S3. “Remove empty block groups” is
+      <code>btrfs balance start -dusage=0 -musage=0</code> (data, metadata and system): their zones are reset and their S3
+      objects deleted.</p>
   </div>
+  <div class="panel" id="b-op" style="margin-top:12px"></div>
   <div class="panel" id="zinfo" hidden></div>
 </section>
 
-<section id="tab-btrfs" hidden>
-  <div class="facts" id="b-facts"></div>
-  <h2>Space by block group type</h2>
-  <div class="panel scroll"><table class="grid" id="b-spaces"></table></div>
-  <h2>Operations</h2>
-  <div class="panel">
-    <div class="actions" style="margin-top:0">
-      <button class="btn" data-fsact="balance">Remove empty block groups</button>
-      <button class="btn" data-fsact="syncfs">Commit the filesystem</button>
-    </div>
-    <div id="b-action" class="note" style="margin-top:8px"></div>
-    <p class="note">Removing empty block groups is <code>btrfs balance start -dusage=0 -musage=0</code> (data, metadata and system): their zones are reset and
-      their S3 objects deleted. Committing is <code>syncfs()</code>: btrfs writes its transaction, so every written file
-      is stored in S3.</p>
-  </div>
-</section>
 
 <section id="tab-link" hidden>
   <p class="note" style="margin-top:0">Each value is <b>auto</b> — the daemon estimates it from its own S3 traffic and
@@ -360,14 +350,13 @@ function showTab(t) {
   // The tab is in the address, so reloading or sharing the link keeps it.
   if (location.hash !== "#" + t) history.replaceState(null, "", t === "overview" ? location.pathname : "#" + t);
   for (const b of document.querySelectorAll("nav button")) b.setAttribute("aria-selected", String(b.dataset.tab === t));
-  for (const s of ["overview", "zones", "btrfs", "link", "details"]) $("tab-" + s).hidden = s !== t;
-  if (t === "zones") tickZones();
-  if (t === "btrfs") tickBtrfs();
+  for (const s of ["overview", "zones", "link", "details"]) $("tab-" + s).hidden = s !== t;
+  if (t === "zones") { tickZones(); tickBtrfs(); }
   if (t === "link") tickLink();
   if (last) draw(last);
 }
 for (const b of document.querySelectorAll("nav button")) b.onclick = () => showTab(b.dataset.tab);
-if (["zones", "btrfs", "link", "details"].includes(location.hash.slice(1))) showTab(location.hash.slice(1));
+if (["zones", "link", "details"].includes(location.hash.slice(1))) showTab(location.hash.slice(1));
 
 /* ---------- overview ---------- */
 /* An arrow between stages; `left` points from right to left (reads come back from S3). */
@@ -763,13 +752,13 @@ function renderDetails(s) {
       ["dropped (zone changed meanwhile)", num(s.compact_aborted)], ["failed", num(s.compact_errors), s.compact_errors > 0]])) : "");
 }
 
-/* ---------- btrfs ---------- */
+/* ---------- btrfs operations (zones tab) ---------- */
 async function tickBtrfs() {
   try {
     const r = await fetch("btrfs.json", { cache: "no-store" });
     if (!r.ok) throw new Error("HTTP " + r.status);
     renderBtrfs(await r.json());
-  } catch (e) { $("b-facts").innerHTML = panel("Filesystem", `<p class="note">Cannot read btrfs.json: ${esc(e.message)}</p>`); }
+  } catch (e) { $("b-op").innerHTML = `<p class="note">Cannot read btrfs.json: ${esc(e.message)}</p>`; }
 }
 function renderBtrfs(b) {
   const busy = !!b.running;
@@ -778,29 +767,15 @@ function renderBtrfs(b) {
   $("b-action").innerHTML = busy ? `${esc(b.running)} is running for ${span(b.running_secs)}.`
     : l ? `Last: ${esc(l.name)} ${l.ok ? "finished" : '<span style="color:var(--bad)">failed</span>'} in ${num(l.secs)} s — ${esc(l.message)}` : "";
   if (!b.mounted) {
-    $("b-facts").innerHTML = panel("Filesystem", `<p class="note">No btrfs on ${esc(b.device)} is mounted. Mount the disk to see it here.</p>`);
-    $("b-spaces").innerHTML = "";
+    $("b-op").innerHTML = panelTitle("btrfs operation") + `<p class="note">No btrfs on ${esc(b.device)} is mounted.</p>`;
     return;
   }
-  const c = b.commits || {}, errs = Object.values(b.errors || {}).reduce((a, x) => a + x, 0);
-  $("b-facts").innerHTML =
-    panel("Filesystem", kv([["mounted on", esc(b.mountpoint)], ["writes", diskRO ? "read-only: the disk is served read-only" : b.read_only ? "read-only — remount it" : "allowed", b.read_only && !diskRO],
-      ["label", esc(b.label || "none")], ["generation", num(b.generation)], ["fsid", `<span class="note">${esc(b.fsid)}</span>`]])) +
-    panel("Transaction commits", kv([["commits", num(c.commits)], ["last", `${num(c.last_commit_ms)} ms`], ["longest", `${num(c.max_commit_ms)} ms`],
-      ["average", c.commits ? `${num(c.total_commit_ms / c.commits)} ms` : "–"], ["running now", c.cur_commit_ms ? `${num(c.cur_commit_ms)} ms` : "no"]])) +
-    panel("Device errors", kv(Object.entries(b.errors || {}).map(([k, v]) => [esc(k.replace("_errs", "")), num(v), v > 0])
-      .concat([["total", num(errs), errs > 0]]))) +
-    panel("Running operation", kv([["exclusive operation", esc(b.exclusive_operation || "none")],
-      ["balance", b.balance.running ? `${num(b.balance.completed)} of ${num(b.balance.expected)} block groups` : "not running"],
-      ["global reserve", `${bytes(b.global_rsv_reserved)} of ${bytes(b.global_rsv_size)}`],
-      ["reclaim starts at", b.bg_reclaim_threshold === null ? "–" : `${num(b.bg_reclaim_threshold)}% allocated`]]));
-  $("b-spaces").innerHTML = `<tr><th></th><th>allocated</th><th>used</th><th>garbage in zones</th><th>pinned</th><th>reserved</th>` +
-    `<th>may use</th><th>reclaimed</th><th>reclaim below</th></tr>` +
-    b.spaces.map(x => `<tr><td>${esc(x.kind)}</td><td>${bytes(x.total_bytes)}</td><td>${bytes(x.bytes_used)}</td>` +
-      `<td>${bytes(x.bytes_zone_unusable)}</td><td>${bytes(x.bytes_pinned)}</td><td>${bytes(x.bytes_reserved)}</td><td>${bytes(x.bytes_may_use)}</td>` +
-      `<td>${num(x.reclaim_count)} · ${bytes(x.reclaim_bytes)}${x.reclaim_errors ? ` · <span style="color:var(--bad)">${num(x.reclaim_errors)} failed</span>` : ""}</td>` +
-      `<td>${x.bg_reclaim_threshold === null ? "–" : num(x.bg_reclaim_threshold) + "% used"}${x.dynamic_reclaim ? " · dynamic" : ""}${x.periodic_reclaim ? " · periodic" : ""}</td></tr>`).join("");
+  $("b-op").innerHTML = panelTitle("btrfs operation") + kv([["exclusive operation", esc(b.exclusive_operation || "none")],
+    ["balance", b.balance.running ? `${num(b.balance.completed)} of ${num(b.balance.expected)} block groups` : "not running"],
+    ["global reserve", `${bytes(b.global_rsv_reserved)} of ${bytes(b.global_rsv_size)}`],
+    ["reclaim starts at", b.bg_reclaim_threshold === null ? "–" : `${num(b.bg_reclaim_threshold)}% allocated`]]);
 }
+const panelTitle = t => `<div class="title">${t}</div>`;
 
 /* ---------- actions ---------- */
 /* The answer of an action; a refusal ({"error": ...}) is thrown like a failure. */
@@ -983,9 +958,9 @@ function update(s, p, dt) {
 function draw(s) {
   $("disk").textContent = s.disk;
   // Where the disk lives: prefix in the bucket, the bucket, the S3 service.
-  $("where").textContent = s.bucket
+  $("where").textContent = (s.bucket
     ? `prefix ${s.prefix}/ in bucket ${s.bucket} at ${s.endpoint}`
-    : "in RAM, no S3";
+    : "in RAM, no S3") + (s.mountpoint ? `, mounted on ${s.mountpoint}` : ", not mounted");
   diskRO = !!s.disk_read_only;
   $("meta").textContent = `on ${s.device} · ${appendMode(s)}${diskRO ? " · read-only" : ""} · up ${span(s.uptime_secs)}`;
   document.title = `${s.alerts && s.alerts.length ? "⚠ " : ""}btrs3fs ${s.disk}`;
@@ -1005,7 +980,7 @@ async function tick() {
     prev = s; prevTime = now; last = s;
     draw(s);
     $("live").className = "on"; $("live").textContent = "live";
-    if (tab === "btrfs") tickBtrfs();
+    if (tab === "zones") tickBtrfs();
     tickLink();  // the Overview shows auto or manual connections too
     if (tab === "zones" && ++ticks % 3 === 0) tickZones();  // the map changes slowly; every 3 s is enough
   } catch (e) {

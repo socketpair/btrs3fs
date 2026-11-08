@@ -508,6 +508,8 @@ pub struct Snapshot {
     pub endpoint: Option<String>,
     pub bucket: Option<String>,
     pub prefix: String,
+    /// Where the btrfs of the disk is mounted; `None` when not mounted.
+    pub mountpoint: Option<String>,
     pub uptime_secs: u64,
     pub dirty_bytes: u64,
     /// Background uploads start above `dirty_limit`; writes wait at `dirty_hard_limit`.
@@ -601,6 +603,8 @@ pub struct DiskState {
     pub endpoint: Option<String>,
     pub bucket: Option<String>,
     pub prefix: String,
+    /// Where its btrfs is mounted; `None` when not mounted.
+    pub mountpoint: Option<String>,
     pub uptime_secs: u64,
     pub dirty_bytes: u64,
     pub dirty_limit: u64,
@@ -695,6 +699,7 @@ impl Stats {
             endpoint: d.endpoint,
             bucket: d.bucket,
             prefix: d.prefix,
+            mountpoint: d.mountpoint,
             uptime_secs: d.uptime_secs,
             dirty_bytes: d.dirty_bytes,
             dirty_limit: d.dirty_limit,
@@ -955,6 +960,7 @@ mod tests {
             endpoint: Some("https://s3.example".into()),
             bucket: Some("b".into()),
             prefix: "disks/a".into(),
+            mountpoint: Some("/mnt/a".into()),
             ..DiskState::default()
         };
         let json = serde_json::to_value(STATS.snapshot(d)).unwrap();
@@ -963,6 +969,7 @@ mod tests {
         assert_eq!(json["endpoint"], "https://s3.example");
         assert_eq!(json["bucket"], "b");
         assert_eq!(json["prefix"], "disks/a");
+        assert_eq!(json["mountpoint"], "/mnt/a");
     }
 
     #[test]
@@ -975,6 +982,7 @@ mod tests {
             endpoint: None,
             bucket: None,
             prefix: "t".into(),
+            mountpoint: None,
             uptime_secs: 1,
             dirty_bytes: 512 << 20,
             dirty_limit: 256 << 20,

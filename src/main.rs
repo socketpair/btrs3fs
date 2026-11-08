@@ -461,6 +461,7 @@ fn serve_disk(
                     endpoint: endpoint.clone(),
                     bucket: bucket.clone(),
                     prefix: prefix.clone(),
+                    mountpoint: snap_fs.mountpoint().map(|p| p.display().to_string()),
                     uptime_secs: started.elapsed().as_secs(),
                     dirty_bytes: stats_engine.dirty_bytes(),
                     dirty_limit: stats_engine.dirty_limit(),

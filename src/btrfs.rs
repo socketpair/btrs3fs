@@ -1,10 +1,10 @@
-//! The btrfs on the device, for the statistics page (SPEC.md §9.3): figures
-//! from sysfs and ioctls, and the actions `balance -dusage=0 -musage=0` and `syncfs()`.
+//! The btrfs on the device, for the statistics page (SPEC.md §9.3): the
+//! operation running in it (sysfs, balance progress ioctl) and the actions
+//! `balance -dusage=0 -musage=0` and `syncfs()`.
 //! No external programs are run.
 
 use log::{info, warn};
 use serde::Serialize;
-use std::collections::BTreeMap;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -68,27 +68,6 @@ impl IoctlBalanceArgs {
     }
 }
 
-/// Space of one kind of block groups (`allocation/<kind>/`), bytes.
-#[derive(Serialize, Default)]
-pub struct Space {
-    pub kind: String,
-    pub total_bytes: Option<u64>,
-    pub bytes_used: Option<u64>,
-    pub bytes_zone_unusable: Option<u64>,
-    pub bytes_pinned: Option<u64>,
-    pub bytes_reserved: Option<u64>,
-    pub bytes_may_use: Option<u64>,
-    pub bytes_readonly: Option<u64>,
-    pub disk_total: Option<u64>,
-    pub disk_used: Option<u64>,
-    pub bg_reclaim_threshold: Option<u64>,
-    pub dynamic_reclaim: Option<u64>,
-    pub periodic_reclaim: Option<u64>,
-    pub reclaim_count: Option<u64>,
-    pub reclaim_bytes: Option<u64>,
-    pub reclaim_errors: Option<u64>,
-}
-
 #[derive(Serialize, Default)]
 pub struct Balance {
     pub running: bool,
@@ -105,28 +84,17 @@ pub struct ActionResult {
     pub secs: f64,
 }
 
-/// `/btrfs.json`.
+/// `/btrfs.json`: the operation running in the filesystem and the actions
+/// of the statistics page (zones tab).
 #[derive(Serialize, Default)]
 pub struct Info {
     /// The filesystem on the device is mounted (found in sysfs and mountinfo).
     pub mounted: bool,
     pub device: String,
-    pub fsid: String,
-    pub label: String,
-    pub mountpoint: String,
-    pub read_only: bool,
-    pub generation: Option<u64>,
-    pub nodesize: Option<u64>,
-    pub sectorsize: Option<u64>,
     pub exclusive_operation: String,
     pub bg_reclaim_threshold: Option<u64>,
-    /// `commit_stats`: commits, last/max/total commit time in ms.
-    pub commits: BTreeMap<String, u64>,
     pub global_rsv_size: Option<u64>,
     pub global_rsv_reserved: Option<u64>,
-    pub spaces: Vec<Space>,
-    /// `devinfo/*/error_stats`, summed over devices.
-    pub errors: BTreeMap<String, u64>,
     pub balance: Balance,
     /// The action in progress and how long it runs, seconds.
     pub running: Option<String>,
@@ -146,11 +114,10 @@ struct ActionState {
     last: Option<ActionResult>,
 }
 
-/// The filesystem as found: sysfs directory and mount.
+/// The filesystem as found: sysfs directory and mount point.
 struct Found {
     sysfs: PathBuf,
     mountpoint: PathBuf,
-    read_only: bool,
 }
 
 impl Btrfs {
@@ -164,12 +131,8 @@ impl Btrfs {
 
     fn find(&self) -> Option<Found> {
         let sysfs = sysfs_dirs(&self.device).into_iter().next()?;
-        let (mountpoint, read_only) = mount_of(&format!("/dev/{}", self.device))?;
-        Some(Found {
-            sysfs,
-            mountpoint,
-            read_only,
-        })
+        let mountpoint = self.mountpoint()?;
+        Some(Found { sysfs, mountpoint })
     }
 
     /// What btrfs keeps in the zone at device bytes `[start, start + size)`.
@@ -178,6 +141,11 @@ impl Btrfs {
             Some(fs) => crate::btrfs_zone::zone_contents(&fs.mountpoint, start, size),
             None => Default::default(),
         }
+    }
+
+    /// Where the filesystem on the device is mounted (the top-most mount).
+    pub fn mountpoint(&self) -> Option<PathBuf> {
+        mount_of(&format!("/dev/{}", self.device)).map(|(point, _)| point)
     }
 
     /// Whether the filesystem is mounted read-only; `None` when not mounted.
@@ -203,55 +171,10 @@ impl Btrfs {
         };
         let s = &fs.sysfs;
         info.mounted = true;
-        info.fsid = s
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        info.label = read_text(&s.join("label")).unwrap_or_default();
-        info.mountpoint = fs.mountpoint.display().to_string();
-        info.read_only = fs.read_only;
-        info.generation = read_u64(&s.join("generation"));
-        info.nodesize = read_u64(&s.join("nodesize"));
-        info.sectorsize = read_u64(&s.join("sectorsize"));
         info.exclusive_operation = read_text(&s.join("exclusive_operation")).unwrap_or_default();
         info.bg_reclaim_threshold = read_u64(&s.join("bg_reclaim_threshold"));
-        info.commits = read_pairs(&s.join("commit_stats"));
         info.global_rsv_size = read_u64(&s.join("allocation/global_rsv_size"));
         info.global_rsv_reserved = read_u64(&s.join("allocation/global_rsv_reserved"));
-        for kind in ["data", "metadata", "system"] {
-            let d = s.join("allocation").join(kind);
-            if !d.is_dir() {
-                continue;
-            }
-            let v = |name: &str| read_u64(&d.join(name));
-            info.spaces.push(Space {
-                kind: kind.to_string(),
-                total_bytes: v("total_bytes"),
-                bytes_used: v("bytes_used"),
-                bytes_zone_unusable: v("bytes_zone_unusable"),
-                bytes_pinned: v("bytes_pinned"),
-                bytes_reserved: v("bytes_reserved"),
-                bytes_may_use: v("bytes_may_use"),
-                bytes_readonly: v("bytes_readonly"),
-                disk_total: v("disk_total"),
-                disk_used: v("disk_used"),
-                bg_reclaim_threshold: v("bg_reclaim_threshold"),
-                dynamic_reclaim: v("dynamic_reclaim"),
-                periodic_reclaim: v("periodic_reclaim"),
-                reclaim_count: v("reclaim_count"),
-                reclaim_bytes: v("reclaim_bytes"),
-                reclaim_errors: v("reclaim_errors"),
-            });
-        }
-        for dev in std::fs::read_dir(s.join("devinfo"))
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            for (k, v) in read_pairs(&dev.path().join("error_stats")) {
-                *info.errors.entry(k).or_default() += v;
-            }
-        }
         info.balance = balance_progress(&fs.mountpoint);
         info
     }
@@ -392,34 +315,9 @@ fn read_u64(path: &Path) -> Option<u64> {
     read_text(path)?.parse().ok()
 }
 
-/// `key value` lines (`commit_stats`, `error_stats`).
-fn read_pairs(path: &Path) -> BTreeMap<String, u64> {
-    read_text(path)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| {
-            let (k, v) = l.split_once(' ')?;
-            Some((k.to_string(), v.trim().parse().ok()?))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pairs() {
-        let dir = std::env::temp_dir().join(format!("btrs3fs-pairs-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let f = dir.join("commit_stats");
-        std::fs::write(&f, "commits 6\ncur_commit_ms 0\nlast_commit_ms 79\nbad\n").unwrap();
-        let p = read_pairs(&f);
-        assert_eq!(p.get("commits"), Some(&6));
-        assert_eq!(p.get("last_commit_ms"), Some(&79));
-        assert_eq!(p.len(), 3);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
 
     #[test]
     fn not_mounted() {
@@ -427,5 +325,34 @@ mod tests {
         let i = b.info();
         assert!(!i.mounted);
         assert_eq!(i.device, "/dev/ublkb-none");
+        assert_eq!(b.mountpoint(), None);
+    }
+
+    /// Only what the zones tab shows: the operation running and the actions.
+    #[test]
+    fn info_has_operations_only() {
+        let json = serde_json::to_value(Btrfs::new("ublkb-none").info()).unwrap();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "balance",
+                "bg_reclaim_threshold",
+                "device",
+                "exclusive_operation",
+                "global_rsv_reserved",
+                "global_rsv_size",
+                "last",
+                "mounted",
+                "running",
+                "running_secs"
+            ]
+        );
     }
 }
