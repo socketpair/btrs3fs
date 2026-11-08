@@ -96,11 +96,24 @@ fn size_text(bytes: u64) -> String {
     }
 }
 
+/// Whole seconds, else milliseconds to one decimal: a latency needs no more.
 fn duration_text(d: Duration) -> String {
     if d.subsec_nanos() == 0 {
         format!("{}s", d.as_secs())
     } else {
-        format!("{}ms", d.as_secs_f64() * 1e3)
+        let ms = (d.as_secs_f64() * 1e4).round() / 10.0;
+        format!("{ms}ms")
+    }
+}
+
+/// A rate as an estimate: whole MiB/s from 10 MiB/s, else whole KiB/s.
+fn rate_text(bytes: u64) -> String {
+    const KIB: u64 = 1 << 10;
+    const MIB: u64 = 1 << 20;
+    if bytes >= 10 * MIB {
+        format!("{}M", (bytes + MIB / 2) / MIB)
+    } else {
+        format!("{}K", ((bytes + KIB / 2) / KIB).max(1))
     }
 }
 
@@ -127,10 +140,10 @@ pub fn render(m: &Manual) -> String {
          # RAM for read-ahead windows (null = 64M, 0 = none).\n\
          read_cache: {}\n",
         or_null(c.latency, duration_text),
-        or_null(c.read_stream, size_text),
-        or_null(c.read_total, size_text),
-        or_null(c.write_stream, size_text),
-        or_null(c.write_total, size_text),
+        or_null(c.read_stream, rate_text),
+        or_null(c.read_total, rate_text),
+        or_null(c.write_stream, rate_text),
+        or_null(c.write_total, rate_text),
         or_null(m.read_unit, size_text),
         or_null(m.fs_readahead, size_text),
         or_null(m.uploads, |n| n.to_string()),
@@ -192,6 +205,24 @@ mod tests {
             ..Manual::default()
         };
         assert_eq!(parse(&render(&odd)).unwrap(), odd);
+    }
+
+    #[test]
+    fn measured_values_render_round() {
+        let m = Manual {
+            chars: crate::tuning::Chars {
+                latency: Some(Duration::from_nanos(108_142_468)),
+                read_stream: Some(7_429_454),
+                read_total: Some(34_867_198),
+                ..Default::default()
+            },
+            ..Manual::default()
+        };
+        let text = render(&m);
+        assert!(text.contains("latency: 108.1ms"), "{text}");
+        assert!(text.contains("read_stream: 7255K"), "{text}");
+        assert!(text.contains("read_total: 33M"), "{text}");
+        assert!(parse(&text).is_ok());
     }
 
     #[test]

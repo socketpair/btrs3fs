@@ -484,6 +484,17 @@ impl Layout {
         format!("{}/", self.prefix)
     }
 
+    /// Where measurements put temporary objects: `<prefix>/measure-<random>/`
+    /// (SPEC.md §6.1).
+    pub fn measure_prefix(&self) -> String {
+        format!("{}/measure-", self.prefix)
+    }
+
+    /// A temporary object of a measurement, left if one was cut off.
+    pub fn is_measure_key(&self, key: &str) -> bool {
+        key.starts_with(&self.measure_prefix())
+    }
+
     pub fn config_key(&self) -> String {
         format!("{}/disk.json", self.prefix)
     }

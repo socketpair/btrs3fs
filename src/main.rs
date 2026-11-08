@@ -1038,10 +1038,32 @@ fn format_disk(cfg: &DiskConfig, layout: &Layout, s3: &S3Store) -> anyhow::Resul
 fn cmd_measure(a: DiskArgs) -> anyhow::Result<i32> {
     let creds = config::Creds::load(&a.creds)?;
     let s3 = S3Store::new(&creds, &a.transport, RetryPolicy::default())?;
-    eprintln!("measuring the link to S3, about 20 s…");
     let layout = Layout::new(&a.prefix)?;
-    let measured = runtime()?.block_on(measure::measure(&s3, layout.prefix()))?;
-    println!("{}", measure::report(&measured));
+    let rt = runtime()?;
+    // Reads only the disk's own objects; without a disk, writes only.
+    let cfg = rt.block_on(load_config(&s3, &layout))?;
+    let reads = match &cfg {
+        Some(cfg) => {
+            let listed = rt.block_on(s3.list(&layout.dir()))?;
+            measure::candidates_from_listing(
+                &layout,
+                &listed,
+                cfg.append == config::AppendMode::Segments,
+            )
+        }
+        None => Vec::new(),
+    };
+    eprintln!(
+        "measuring the link to S3 (reading {} objects of the disk)…",
+        reads.len()
+    );
+    let plan = measure::Plan {
+        reads,
+        write_dir: Some(measure::temp_dir(&layout)),
+        budget: None,
+    };
+    let measured = rt.block_on(measure::run(&s3, plan))?;
+    print!("{}", measure::report(&measured));
     Ok(0)
 }
 
@@ -1077,7 +1099,7 @@ fn destroy_prefix(rt: &Runtime, s3: &S3Store, layout: &Layout) -> anyhow::Result
             .await?
             .into_iter()
             .map(|o| o.key)
-            .filter(|k| layout.zone_of(k).is_some())
+            .filter(|k| layout.zone_of(k).is_some() || layout.is_measure_key(k))
             .collect();
         s3.abort_stale_concats(layout).await?;
         s3.delete_many(&keys).await?;

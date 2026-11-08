@@ -426,7 +426,12 @@ impl Engine {
             );
             Ok((offset / cfg.zone_size) as usize)
         };
+        let mut measure_leftovers = Vec::new();
         for obj in store.list(&layout.dir()).await? {
+            if layout.is_measure_key(&obj.key) {
+                measure_leftovers.push(obj.key);
+                continue;
+            }
             if let Some(offset) = layout.parse_finished_key(&obj.key) {
                 finished[zone_index(offset, &obj.key)?] = true;
                 continue;
@@ -530,6 +535,19 @@ impl Engine {
                 upload: tokio::sync::Mutex::new(()),
                 requests: ZoneRequests::default(),
             });
+        }
+        // Temporary objects of a measurement cut off by a crash (SPEC.md §6.1).
+        if !measure_leftovers.is_empty() {
+            info!(
+                "{} objects of an interrupted link measurement{}",
+                measure_leftovers.len(),
+                if read_only {
+                    "; left in place"
+                } else {
+                    "; deleting them"
+                }
+            );
+            leftovers.extend(measure_leftovers);
         }
         if read_only {
             // Not part of any zone above; nothing can join them on a disk
@@ -1791,6 +1809,28 @@ impl Engine {
         }
     }
 
+    /// Objects a link measurement may read (SPEC.md §6.1): (key, size) of
+    /// every zone stored in exactly one object.
+    pub fn measure_candidates(&self) -> Vec<(String, u64)> {
+        self.zones
+            .iter()
+            .filter_map(|zone| {
+                let st = zone.state.lock().unwrap();
+                match st.objects[..] {
+                    [o] if o.start == 0 && o.to > 0 => Some((
+                        if self.segments {
+                            self.layout.segment_key(zone.start, 0)
+                        } else {
+                            self.layout.zone_key(zone.start)
+                        },
+                        o.to,
+                    )),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     /// Uploads allowed at once.
     pub fn uploads_limit(&self) -> usize {
         self.upload_slots.limit()
@@ -2092,6 +2132,59 @@ mod tests {
             e.write(wp, blk(first + i, 1), false).unwrap();
             e.flush_zone(zone as usize, Reason::Explicit).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn candidates_skip_fragmented() {
+        let store = mem();
+        let e = segments_engine(store.clone()).await;
+        segment_writes(&e, 0, 1, 1).await; // one object
+        segment_writes(&e, 1, 1, 2).await; // two segments: fragmented
+        let c = e.measure_candidates();
+        assert_eq!(c, vec![("t/0000000000000000-00000000".to_string(), B)]);
+        // The same from a listing, as `btrs3fs measure` sees the disk.
+        let listed = store.list("t/").await.unwrap();
+        let layout = Layout::new("t").unwrap();
+        assert_eq!(
+            crate::measure::candidates_from_listing(&layout, &listed, true),
+            c
+        );
+        // A plain disk: every zone is one object.
+        let store = mem();
+        let e = engine_with(store.clone()).await;
+        e.write(ZS, blk(1, 2), false).unwrap();
+        e.flush_all(Reason::Explicit).await.unwrap();
+        let c = e.measure_candidates();
+        assert_eq!(c, vec![("t/0000000000100000".to_string(), 2 * B)]);
+        let listed = store.list("t/").await.unwrap();
+        assert_eq!(
+            crate::measure::candidates_from_listing(&layout, &listed, false),
+            c
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_deletes_measure_leftovers() {
+        let store = mem();
+        store
+            .put("t/measure-1f/w-3", Body::new(vec![blk(1, 1)]))
+            .await
+            .unwrap();
+        let layout = Layout::new("t").unwrap();
+        assert!(layout.is_measure_key("t/measure-1f/w-3"));
+        assert!(!layout.is_measure_key("t/0000000000000000"));
+        assert!(!layout.is_measure_key("tt/measure-1f/w-3"));
+        engine_with(store.clone()).await;
+        assert!(keys(&store, "t/").await.is_empty());
+        // Read-only: left in place.
+        let store = mem();
+        store
+            .put("t/measure-1f/w-3", Body::new(vec![blk(1, 1)]))
+            .await
+            .unwrap();
+        let ro = Arc::new(Arc::into_inner(store).unwrap().read_only());
+        engine_with(ro.clone()).await;
+        assert_eq!(keys(&ro, "t/").await, ["t/measure-1f/w-3"]);
     }
 
     #[tokio::test]
