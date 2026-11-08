@@ -81,6 +81,23 @@ pub enum Backend {
 pub struct Store {
     backend: Backend,
     read_only: bool,
+    /// Every operation holds it shared; a link measurement holds it alone
+    /// (SPEC.md §6.1). Fair: operations started after the measurement asked
+    /// wait behind it.
+    gate: tokio::sync::RwLock<()>,
+    in_flight: std::sync::atomic::AtomicUsize,
+}
+
+/// An operation in flight: lets a measurement wait for it.
+pub struct Op<'a> {
+    _shared: tokio::sync::RwLockReadGuard<'a, ()>,
+    count: &'a std::sync::atomic::AtomicUsize,
+}
+
+impl Drop for Op<'_> {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Store {
@@ -88,6 +105,8 @@ impl Store {
         Self {
             backend,
             read_only: false,
+            gate: tokio::sync::RwLock::new(()),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -115,6 +134,35 @@ impl Store {
         &self.backend
     }
 
+    /// Enters an operation: waits while a measurement runs.
+    pub async fn op(&self) -> Op<'_> {
+        let shared = self.gate.read().await;
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        Op {
+            _shared: shared,
+            count: &self.in_flight,
+        }
+    }
+
+    /// Waits for every operation in flight; new ones wait until the guard
+    /// is dropped (also when its holder panics).
+    pub async fn pause(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.gate.write().await
+    }
+
+    /// Operations in flight now.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// The S3 store, for the measurement, which talks to it past the gate.
+    pub fn s3_store(&self) -> Option<&crate::s3::S3Store> {
+        match &self.backend {
+            Backend::S3(s) => Some(s),
+            Backend::Mem(_) => None,
+        }
+    }
+
     fn writable(&self) -> StoreResult<()> {
         if self.read_only {
             return Err(StoreError::ReadOnly);
@@ -125,6 +173,7 @@ impl Store {
     /// Whole object, `None` if it does not exist.
     #[cfg(test)]
     pub async fn get(&self, key: &str) -> StoreResult<Option<Bytes>> {
+        let _op = self.op().await;
         self.interleave().await;
         let res = match &self.backend {
             Backend::Mem(m) => m.get(key),
@@ -149,6 +198,7 @@ impl Store {
 
     /// Creates or replaces an object.
     pub async fn put(&self, key: &str, body: Body) -> StoreResult<()> {
+        let _op = self.op().await;
         self.writable()?;
         self.interleave().await;
         match &self.backend {
@@ -160,6 +210,7 @@ impl Store {
     /// Grows a zone object: `offset` 0 creates it, else `body` goes at
     /// `offset` = the object's size, the way the disk appends (SPEC.md §5).
     pub async fn append(&self, key: &str, offset: u64, body: Body) -> StoreResult<()> {
+        let _op = self.op().await;
         self.writable()?;
         self.interleave().await;
         match &self.backend {
@@ -171,6 +222,7 @@ impl Store {
 
     /// Exactly `len` bytes starting at `offset`.
     pub async fn get_range(&self, key: &str, offset: u64, len: u64) -> StoreResult<Bytes> {
+        let _op = self.op().await;
         self.interleave().await;
         match &self.backend {
             Backend::Mem(m) => m.get_range(key, offset, len),
@@ -180,6 +232,7 @@ impl Store {
 
     /// Deletes an object; deleting a missing object is not an error.
     pub async fn delete(&self, key: &str) -> StoreResult<()> {
+        let _op = self.op().await;
         self.writable()?;
         self.interleave().await;
         match &self.backend {
@@ -190,6 +243,7 @@ impl Store {
 
     /// Deletes many objects with few requests; missing objects are not an error.
     pub async fn delete_many(&self, keys: &[String]) -> StoreResult<()> {
+        let _op = self.op().await;
         self.writable()?;
         self.interleave().await;
         match &self.backend {
@@ -202,6 +256,7 @@ impl Store {
 
     /// All objects whose key starts with `prefix`.
     pub async fn list(&self, prefix: &str) -> StoreResult<Vec<ObjectInfo>> {
+        let _op = self.op().await;
         self.interleave().await;
         match &self.backend {
             Backend::Mem(m) => m.list(prefix),
@@ -216,6 +271,7 @@ impl Store {
         dst: &str,
         parts: &[ConcatPart],
     ) -> StoreResult<PendingConcat> {
+        let _op = self.op().await;
         self.writable()?;
         self.interleave().await;
         match &self.backend {
@@ -234,6 +290,7 @@ impl Store {
     }
 
     pub async fn finish_concat(&self, pending: PendingConcat) -> StoreResult<()> {
+        let _op = self.op().await;
         self.writable()?;
         self.interleave().await;
         match (&self.backend, pending) {
@@ -247,6 +304,7 @@ impl Store {
 
     /// Drops a concatenation that must not complete (best effort).
     pub async fn abort_concat(&self, pending: PendingConcat) {
+        let _op = self.op().await;
         if let (Backend::S3(s), PendingConcat::S3(p)) = (&self.backend, pending) {
             s.abort_concat(p).await;
         }
@@ -254,6 +312,7 @@ impl Store {
 
     /// Aborts concatenations of the disk a crash left unfinished; how many.
     pub async fn abort_stale_concats(&self, layout: &Layout) -> StoreResult<usize> {
+        let _op = self.op().await;
         self.writable()?;
         self.interleave().await;
         match &self.backend {
@@ -517,6 +576,62 @@ const META_SUFFIX: &str = ".meta";
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    async fn pending<F: std::future::Future>(f: F) -> bool {
+        tokio::time::timeout(Duration::from_millis(30), f)
+            .await
+            .is_err()
+    }
+
+    fn one() -> Body {
+        Body::new(vec![Bytes::from_static(b"x")])
+    }
+
+    #[tokio::test]
+    async fn pause_waits_for_in_flight() {
+        let store = Store::mem(MemStore::default());
+        let op = store.op().await; // an operation in flight
+        assert_eq!(store.in_flight(), 1);
+        assert!(pending(store.pause()).await);
+        drop(op);
+        let _paused = store.pause().await;
+        assert_eq!(store.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn ops_queue_behind_pause() {
+        let store = Arc::new(Store::mem(MemStore::default()));
+        let paused = store.pause().await;
+        let put = tokio::spawn({
+            let store = store.clone();
+            async move { store.put("k", one()).await }
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!put.is_finished(), "an operation ran during the pause");
+        drop(paused);
+        put.await.unwrap().unwrap();
+        assert_eq!(store.list("k").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pause_released_on_panic() {
+        let store = Arc::new(Store::mem(MemStore::default()));
+        let measuring = tokio::spawn({
+            let store = store.clone();
+            async move {
+                let _paused = store.pause().await;
+                panic!("measurement failed");
+            }
+        });
+        assert!(measuring.await.is_err());
+        tokio::time::timeout(Duration::from_secs(1), store.put("k", one()))
+            .await
+            .expect("the pause is gone")
+            .unwrap();
+    }
+
     use super::*;
 
     #[test]
