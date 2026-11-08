@@ -206,10 +206,12 @@ impl Btrfs {
         let spawned = std::thread::Builder::new()
             .name(format!("btrs3fs-{name}"))
             .spawn(move || {
-                info!(
-                    "statistics page: {name} on {} started",
-                    fs.mountpoint.display()
-                );
+                let by = if name == "autobalance" {
+                    "daemon"
+                } else {
+                    "statistics page"
+                };
+                info!("{by}: {name} on {} started", fs.mountpoint.display());
                 let started = Instant::now();
                 let res = run(&fs.mountpoint);
                 let secs = started.elapsed().as_secs_f64();
