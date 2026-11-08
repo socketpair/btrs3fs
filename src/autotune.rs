@@ -236,23 +236,29 @@ impl Autotune {
         let saturated = |busy: u32| ticks.n > 0 && busy as f64 >= SATURATED_SHARE * ticks.n as f64;
         let manual = st.manual;
         let e = st.effective.expect("applied at start");
+        // Retries are taken every step, so none piles up for later.
+        let (write_retries, read_retries) =
+            (OBS.take_retries(Dir::Write), OBS.take_retries(Dir::Read));
+        // While a measurement holds S3 the engine's requests wait with their
+        // slots taken: such seconds say nothing about the link.
+        let measuring = matches!(st.measure.state, "waiting" | "measuring");
         // A regulator steps only while it decides: its samples mean nothing
         // under a limit set otherwise.
-        if e.derived.uploads == st.uploads.limit() && manual.uploads.is_none() {
+        if !measuring && e.derived.uploads == st.uploads.limit() && manual.uploads.is_none() {
             st.uploads.step(Sample {
                 bytes_per_sec: t.written.saturating_sub(t0.written) as f64 / dt,
                 saturated: saturated(ticks.uploads_busy),
                 completions: t.uploads.saturating_sub(t0.uploads),
-                retries: OBS.take_retries(Dir::Write),
+                retries: write_retries,
                 now_secs: now,
             });
         }
-        if e.derived.reads == st.reads.limit() && manual.reads.is_none() {
+        if !measuring && e.derived.reads == st.reads.limit() && manual.reads.is_none() {
             st.reads.step(Sample {
                 bytes_per_sec: t.read.saturating_sub(t0.read) as f64 / dt,
                 saturated: saturated(ticks.reads_busy),
                 completions: t.gets.saturating_sub(t0.gets),
-                retries: OBS.take_retries(Dir::Read),
+                retries: read_retries,
                 now_secs: now,
             });
         }
@@ -514,7 +520,8 @@ impl Autotune {
             struct Unfinished(Arc<Autotune>);
             impl Drop for Unfinished {
                 fn drop(&mut self) {
-                    let mut st = self.0.st.lock().unwrap();
+                    // Also while unwinding from a panic under the lock.
+                    let mut st = self.0.st.lock().unwrap_or_else(|e| e.into_inner());
                     if matches!(st.measure.state, "waiting" | "measuring") {
                         st.measure.state = "failed";
                         st.measure.error = Some("the measurement task panicked".into());
@@ -565,6 +572,9 @@ impl Autotune {
     }
 
     fn finish(&self, result: anyhow::Result<measure::Measured>) {
+        // The measurement's own retries are not the engine's.
+        OBS.take_retries(Dir::Read);
+        OBS.take_retries(Dir::Write);
         let mut st = self.st.lock().unwrap();
         let at = Some(Instant::now());
         match result {
@@ -687,6 +697,27 @@ mod tests {
         }
         assert_eq!(t.engine.reads_limit(), 8);
         assert_eq!(t.engine.uploads_limit(), 1); // not saturated: unchanged
+    }
+
+    /// While a measurement holds S3, the engine's requests wait with their
+    /// slots taken: those seconds say nothing about the link.
+    #[tokio::test]
+    async fn regulators_rest_during_a_measurement() {
+        let t = tuner(Manual::default()).await;
+        t.st.lock().unwrap().measure.state = "measuring";
+        let mut totals = Totals::default();
+        t.step(0.0, totals);
+        for i in 1..10 {
+            let held = t.engine.get_limiter().acquire().await;
+            for _ in 0..10 {
+                t.tick();
+            }
+            drop(held);
+            totals.read += 1 << 20;
+            totals.gets += 4;
+            t.step(i as f64, totals);
+        }
+        assert_eq!(t.engine.reads_limit(), 1);
     }
 
     #[tokio::test]
