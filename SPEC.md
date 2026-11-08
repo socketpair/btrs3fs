@@ -440,9 +440,10 @@ struct Zone { state: Mutex<ZoneState>, upload: tokio::sync::Mutex<()> }
 
 - Подпись SigV4 с `UNSIGNED-PAYLOAD`.
 - `DeleteObjects` — режим `Quiet` (в ответе только сбои), отсутствующий ключ — не ошибка,
-  с `x-amz-checksum-crc32c` списка ключей: стандарт S3 требует контрольную сумму тела (Selectel
-  проверяет, Яндекс принимает), CRC32C — самая быстрая из допустимых (одна инструкция процессора
-  на 8 байт; крейт `crc32c`). Сбой части ключей с `InternalError`/`SlowDown`/
+  с `Content-MD5` списка ключей (решение пользователя — только он, во всех облаках): стандарт S3
+  требует контрольную сумму тела, а старый `Content-MD5` принимают все (UpCloud — только его;
+  Selectel и Яндекс — его или `x-amz-checksum-*`); тело — несколько КиБ, цена MD5 незаметна
+  (крейт `md-5`). Сбой части ключей с `InternalError`/`SlowDown`/
   `ServiceUnavailable` — повтор пакета, прочие коды — ошибка.
 - Транспорт: только HTTP/1.1, пул соединений (по соединению на запрос в работе,
   переиспользуются; простой — 90 с), `TCP_NODELAY`, connect 10 с, ожидание заголовков ответа
@@ -758,7 +759,8 @@ crates.io её ещё нет. Поэтому зависимость — git с �
   на новый объект, 3 раза: ровно один `200`, девять `412`, в объекте — данные победителя.
 - Теги приходят в `ListObjectsV2`; `x-amz-tagging` при PUT принимается, при PATCH — молча
   игнорируется (как и `x-amz-meta-*`).
-- `DeleteObjects` принимается и без контрольной суммы, и с `x-amz-checksum-crc32c`.
+- `DeleteObjects` принимается и без контрольной суммы, и с `x-amz-checksum-crc32c`, и с
+  `Content-MD5`.
 - HTTP/2 поддерживается, но при многих потоках в соединении отвечает `REFUSED_STREAM`.
 
 **Selectel** (`s3.ru-7.storage.selcloud.ru`, 2026-10-26)
@@ -771,7 +773,7 @@ crates.io её ещё нет. Поэтому зависимость — git с �
   верное). Яндекс те же склейки отвергает: `EntityTooSmall` (части ≥ 5 МиБ, как AWS).
 - LIST сразу после `PUT`/`DELETE` — 100 из 100 актуальны (Яндекс — тоже).
 - `DeleteObjects` без контрольной суммы — отказ (`Content-MD5 or Amz-Content-Checksum`);
-  `x-amz-checksum-crc32c` принимается.
+  принимается и `x-amz-checksum-crc32c`, и `Content-MD5`.
 - `POST`/`PUT` без тела требуют `Content-Length: 0` (иначе `411`).
 - Повтор запроса к ключу, пока прошлый (брошенный нами по таймауту) ещё числится у сервера, —
   `409 OperationAborted` «A conflicting conditional operation is currently in progress … Try

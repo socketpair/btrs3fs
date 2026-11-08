@@ -714,13 +714,13 @@ impl S3Store {
     async fn delete_batch(&self, keys: &[String]) -> StoreResult<()> {
         let url = format!("{}?delete", self.base);
         let xml = delete_xml(keys);
-        let checksum = crc32c_header(xml.as_bytes());
+        let md5 = content_md5(xml.as_bytes());
         let body = Body::new(vec![Bytes::from(xml)]);
         let what = format!("DELETE {} objects from {}", keys.len(), keys[0]);
         self.with_retries(&what, || async {
             let headers = [
                 ("content-type", "application/xml".to_string()),
-                ("x-amz-checksum-crc32c", checksum.clone()),
+                ("content-md5", md5.clone()),
             ];
             let resp = self
                 .send(reqwest::Method::POST, &url, &headers, Some(&body))
@@ -833,13 +833,14 @@ struct DeleteError {
     message: String,
 }
 
-/// `x-amz-checksum-crc32c` of a request body: base64 of the big-endian CRC32C.
-/// DeleteObjects must carry a checksum of its key list (standard S3; Selectel
-/// enforces it, Yandex does not); CRC32C is the fastest the standard allows
-/// — one CPU instruction per 8 bytes on x86 (SSE4.2) and ARM (SPEC.md §8).
-fn crc32c_header(body: &[u8]) -> String {
+/// `Content-MD5` of a request body: base64 of its MD5. DeleteObjects must
+/// carry a checksum of its key list; this oldest form is the one every S3
+/// accepts (UpCloud takes no other; SPEC.md §8), and for a key list of a few
+/// KiB its cost does not matter.
+fn content_md5(body: &[u8]) -> String {
     use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(crc32c::crc32c(body).to_be_bytes())
+    use md5::Digest;
+    base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(body))
 }
 
 /// DeleteObjects request body; quiet: the answer lists only failures.
@@ -1243,9 +1244,9 @@ mod tests {
     }
 
     #[test]
-    fn crc32c_checksum() {
-        // CRC32C of "123456789" is the standard check value 0xE3069283.
-        assert_eq!(crc32c_header(b"123456789"), "4waSgw==");
+    fn md5_header() {
+        // MD5 of "123456789" is 25f9e794323b453885f5181f1b624d0b.
+        assert_eq!(content_md5(b"123456789"), "JfnnlDI7RTiF9RgfG2JNCw==");
     }
 
     #[test]
