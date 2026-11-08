@@ -83,7 +83,7 @@ pub fn parse(text: &str) -> anyhow::Result<Manual> {
 }
 
 /// `24M`, `512K`, or bytes when not a whole number of KiB.
-fn size_text(bytes: u64) -> String {
+pub fn size_text(bytes: u64) -> String {
     const KIB: u64 = 1 << 10;
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
@@ -97,7 +97,7 @@ fn size_text(bytes: u64) -> String {
 }
 
 /// Whole seconds, else milliseconds to one decimal: a latency needs no more.
-fn duration_text(d: Duration) -> String {
+pub fn duration_text(d: Duration) -> String {
     if d.subsec_nanos() == 0 {
         format!("{}s", d.as_secs())
     } else {
@@ -107,7 +107,7 @@ fn duration_text(d: Duration) -> String {
 }
 
 /// A rate as an estimate: whole MiB/s from 10 MiB/s, else whole KiB/s.
-fn rate_text(bytes: u64) -> String {
+pub fn rate_text(bytes: u64) -> String {
     const KIB: u64 = 1 << 10;
     const MIB: u64 = 1 << 20;
     if bytes >= 10 * MIB {

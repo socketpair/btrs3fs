@@ -631,6 +631,19 @@ impl Engine {
         self.read_cache.lock().unwrap().clone()
     }
 
+    /// The read-ahead window; `None`: read-ahead off.
+    pub fn read_ahead_window(&self) -> Option<u64> {
+        self.read_cache().map(|c| c.window())
+    }
+
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
+    }
+
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
     #[cfg(test)]
     fn cached_windows(&self) -> usize {
         self.read_cache().map_or(0, |c| c.len())

@@ -21,7 +21,7 @@ use libublk::{UblkError, UblkFlags, UblkRuntime, ops, sys};
 use log::{debug, error, info, trace, warn};
 use std::future::Future;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -59,9 +59,10 @@ pub struct DeviceOptions {
     pub dev_id: i32,
     pub nr_queues: u16,
     pub queue_depth: u16,
-    /// btrfs readahead window to set once the filesystem on the device is
-    /// mounted (`bdi/read_ahead_kb`), bytes; `None` leaves btrfs's own.
-    pub fs_readahead: Option<u64>,
+    /// btrfs readahead window to keep on the filesystem mounted from the
+    /// device (`bdi/read_ahead_kb`), bytes, changing at run time (SPEC.md
+    /// §6.1); 0 or `None` leaves btrfs's own.
+    pub fs_readahead: Option<Arc<AtomicU64>>,
     /// `<bucket>/<prefix>`, the serial number lsblk shows (SPEC.md §2);
     /// `None` for a RAM disk.
     pub serial: Option<String>,
@@ -177,7 +178,7 @@ pub fn serve(
     };
 
     let zone_size = cfg.zone_size;
-    let fs_readahead = opts.fs_readahead;
+    let fs_readahead = opts.fs_readahead.clone();
     let serial = opts.serial.clone();
     let device_fn = move |ctrl: &UblkCtrl| {
         let bdev = ctrl.get_bdev_path();
@@ -280,28 +281,29 @@ const FS_TUNE_POLL: Duration = Duration::from_secs(1);
 /// by `mount` or by fstab alike: the readahead window
 /// (`/sys/fs/btrfs/<fsid>/bdi/read_ahead_kb`, SPEC.md §6.1), when given, and
 /// periodic reclaim when `reclaim` (not on a read-only disk; SPEC.md §11).
-/// Both belong to the mounted filesystem, not
-/// to the device, so they cannot be set before. Each mount is set once:
-/// values the admin changes afterwards stay.
-fn keep_fs_tuned(name: &str, readahead: Option<u64>, reclaim: bool) {
-    let mut done: std::collections::HashSet<std::path::PathBuf> = Default::default();
+/// Both belong to the mounted filesystem, not to the device, so they cannot
+/// be set before. The window is written on each new mount and whenever our
+/// value changes, so a value the admin sets stays until then; reclaim once
+/// per mount.
+fn keep_fs_tuned(name: &str, readahead: Option<Arc<AtomicU64>>, reclaim: bool) {
+    let mut done: std::collections::HashMap<std::path::PathBuf, u64> = Default::default();
     loop {
         let mounted = crate::btrfs::sysfs_dirs(name);
-        done.retain(|fs| mounted.contains(fs));
+        done.retain(|fs, _| mounted.contains(fs));
+        let target = readahead.as_ref().map_or(0, |t| t.load(Ordering::SeqCst));
         for fs in mounted {
-            if !done.insert(fs.clone()) {
-                continue;
+            let new = !done.contains_key(&fs);
+            if new && reclaim {
+                enable_reclaim(&fs);
             }
-            if let Some(bytes) = readahead {
+            if target > 0 && done.get(&fs) != Some(&target) {
                 let path = fs.join("bdi/read_ahead_kb");
-                match write_sysfs(&path, (bytes >> 10).to_string()) {
-                    Ok(()) => info!("{}: btrfs readahead set to {bytes} bytes", path.display()),
+                match write_sysfs(&path, (target >> 10).to_string()) {
+                    Ok(()) => info!("{}: btrfs readahead set to {target} bytes", path.display()),
                     Err(e) => warn!("cannot set btrfs readahead in {}: {e}", path.display()),
                 }
             }
-            if reclaim {
-                enable_reclaim(&fs);
-            }
+            done.insert(fs, target);
         }
         std::thread::sleep(FS_TUNE_POLL);
     }

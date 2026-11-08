@@ -128,6 +128,11 @@ impl Histogram {
         self.sum.fetch_add(value, Relaxed);
     }
 
+    /// The sum of all values recorded.
+    pub fn sum(&self) -> u64 {
+        self.sum.load(Relaxed)
+    }
+
     fn snapshot(&self) -> Hist {
         let counts: Vec<u64> = self.counts.iter().map(|c| c.load(Relaxed)).collect();
         let used = || {
@@ -218,6 +223,7 @@ pub struct LastErrors {
     /// Errors returned to the kernel: the filesystem saw them.
     pub io: Option<ErrorInfo>,
     pub compact: Option<ErrorInfo>,
+    pub measure: Option<ErrorInfo>,
 }
 
 /// Something the page should point out: `bad` needs action, `warn` may.
@@ -366,6 +372,7 @@ pub struct Stats {
     pub err_read: LastError,
     pub err_io: LastError,
     pub err_compact: LastError,
+    pub err_measure: LastError,
 }
 
 pub static STATS: Stats = Stats {
@@ -417,6 +424,7 @@ pub static STATS: Stats = Stats {
     err_read: LastError::new(),
     err_io: LastError::new(),
     err_compact: LastError::new(),
+    err_measure: LastError::new(),
 };
 
 impl Stats {
@@ -622,6 +630,7 @@ impl Stats {
             ("Upload to S3", &e.upload),
             ("Read from S3", &e.read),
             ("Concatenation", &e.compact),
+            ("Link measurement", &e.measure),
         ] {
             if let Some(x) = err.as_ref().filter(|x| x.secs_ago < ALERT_RECENT_SECS) {
                 push(
@@ -642,6 +651,7 @@ impl Stats {
             read: self.err_read.snapshot(),
             io: self.err_io.snapshot(),
             compact: self.err_compact.snapshot(),
+            measure: self.err_measure.snapshot(),
         };
         let alerts = self.alerts(&d, &last_errors);
         Snapshot {
@@ -909,6 +919,7 @@ mod tests {
             read: err(3600, "old"),
             io: err(30, "EIO"),
             compact: None,
+            measure: None,
         };
         let a = STATS.alerts(&disk(None), &errors);
         let texts: Vec<&str> = a.iter().map(|x| x.text.as_str()).collect();

@@ -1,3 +1,4 @@
+mod autotune;
 mod btrfs;
 mod btrfs_zone;
 mod config;
@@ -22,7 +23,6 @@ use bytes::Bytes;
 use clap::{Args, Parser, Subcommand};
 use config::{DiskConfig, parse_size};
 use log::{error, info, warn};
-use readahead::ReadAhead;
 use s3::{RetryPolicy, S3Store, Transport};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use store::{Backend, Body, Layout, MemStore, Store};
 use tokio::runtime::Runtime;
-use tuning::{Auto, Chars, Manual};
+use tuning::Manual;
 use zones::Engine;
 
 /// btrfs mount options always used by `mount`: user decision (SPEC.md §9.2);
@@ -150,44 +150,21 @@ struct MountArgs {
     link: LinkArgs,
 }
 
-/// The link to S3 as `btrs3fs measure` reports it (SPEC.md §6.1): the daemon
-/// derives its read and upload settings from it. Per run, not in disk.json;
-/// values not given are auto.
-#[derive(Args, Clone, Copy)]
+/// Link settings (SPEC.md §6.1): per run, not in disk.json.
+#[derive(Args, Clone)]
 struct LinkArgs {
-    /// Time to the first byte of a small GET, e.g. 36ms.
-    #[arg(long, value_parser = tuning::parse_duration)]
-    s3_latency: Option<Duration>,
-    /// Rate of one GET after its first byte, per second, e.g. 55M.
-    #[arg(long, value_parser = parse_size)]
-    s3_read_stream: Option<u64>,
-    /// Rate of all GETs together, per second.
-    #[arg(long, value_parser = parse_size)]
-    s3_read_total: Option<u64>,
-    /// Rate of one PUT after its first byte, per second.
-    #[arg(long, value_parser = parse_size)]
-    s3_write_stream: Option<u64>,
-    /// Rate of all PUTs together, per second.
-    #[arg(long, value_parser = parse_size)]
-    s3_write_total: Option<u64>,
-    /// RAM for read-ahead windows; 0 disables read-ahead [default: 64M].
-    #[arg(long, value_parser = parse_size, default_value_t = config::DEFAULT_READ_CACHE, hide_default_value = true)]
-    read_cache: u64,
+    /// YAML file with manual link values (see examples/link.yaml); a key that
+    /// is null or absent is auto: estimated from the daemon's own traffic.
+    #[arg(long, value_name = "FILE")]
+    link_config: Option<PathBuf>,
 }
 
 impl LinkArgs {
-    /// The link values given on the command line; the rest is auto.
-    fn manual(&self) -> Manual {
-        Manual {
-            chars: Chars {
-                latency: self.s3_latency,
-                read_stream: self.s3_read_stream,
-                read_total: self.s3_read_total,
-                write_stream: self.s3_write_stream,
-                write_total: self.s3_write_total,
-            },
-            read_cache: Some(self.read_cache),
-            ..Manual::default()
+    /// The manual values; all auto without a file.
+    fn manual(&self) -> anyhow::Result<Manual> {
+        match &self.link_config {
+            Some(path) => linkconf::load(path),
+            None => Ok(Manual::default()),
         }
     }
 }
@@ -347,7 +324,6 @@ fn serve_disk(
         queues,
         stats: stats_opt,
         link,
-        read_cache,
         read_only,
     } = serve;
     if let Some(q) = queues {
@@ -358,20 +334,9 @@ fn serve_disk(
         Backend::S3(s) => Some(format!("{}/{}", s.bucket(), layout.prefix())),
         Backend::Mem(_) => None,
     };
-    let tuning = match link {
-        Some(m) => {
-            tuning::validate(&m, cfg.zone_size)?;
-            let start = Auto {
-                chars: Chars::default(),
-                uploads: 1,
-                reads: 1,
-            };
-            let e = tuning::resolve(&m, &start, cfg.zone_size);
-            info!("S3 link: {}; derived: {}", e.chars, e.derived);
-            Some(e.derived)
-        }
-        None => None,
-    };
+    if let Some(m) = &link {
+        tuning::validate(m, cfg.zone_size)?;
+    }
     info!(
         "disk {}: {} bytes, {} zones of {} bytes",
         layout.dir(),
@@ -386,18 +351,25 @@ fn serve_disk(
     } else {
         store
     };
-    let engine = rt.block_on(Engine::open(&cfg, layout, Arc::new(store)))?;
-    let read_ahead = tuning.map_or(ReadAhead::DISABLED, |t| ReadAhead {
-        window: t.read_unit,
-        cache: read_cache,
-    });
-    engine.set_read_ahead(read_ahead)?;
-    if let Some(t) = tuning {
-        engine.set_uploads(t.uploads);
-        engine.set_reads(t.reads);
-        engine.set_get_part(t.read_unit);
-    }
-    let engine = Arc::new(engine);
+    let engine = Arc::new(rt.block_on(Engine::open(&cfg, layout, Arc::new(store)))?);
+    // Without link settings (the temporary device of `create`) nothing is
+    // tuned: no read-ahead, default uploads, whole-object GETs.
+    let fs_target = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let tune = match link {
+        Some(manual) => {
+            let t = autotune::Autotune::new(
+                engine.clone(),
+                manual,
+                cfg.zone_size,
+                fs_target.clone(),
+                read_only,
+                rt.handle().clone(),
+            )?;
+            rt.spawn(t.clone().run());
+            Some(t)
+        }
+        None => None,
+    };
     // A read-only disk has nothing to upload, concatenate or mark.
     if !read_only {
         rt.spawn(engine.clone().background_flusher());
@@ -407,7 +379,7 @@ fn serve_disk(
         dev_id,
         nr_queues: cfg.nr_queues,
         queue_depth: cfg.queue_depth,
-        fs_readahead: tuning.map(|t| t.fs_readahead),
+        fs_readahead: tune.as_ref().map(|_| fs_target.clone()),
         serial,
         read_only,
     };
@@ -520,7 +492,6 @@ struct ServeOptions {
     /// `None` — no tuning (temporary device of `create`): no read-ahead,
     /// default uploads, whole-object GETs, btrfs readahead untouched.
     link: Option<Manual>,
-    read_cache: u64,
     /// Serve the disk read-only (SPEC.md §9.2).
     read_only: bool,
 }
@@ -531,15 +502,14 @@ impl ServeOptions {
         dev_id: i32,
         queues: Option<u16>,
         stats: StatsArgs,
-        link: &LinkArgs,
+        manual: Manual,
         read_only: bool,
     ) -> Self {
         Self {
             dev_id,
             queues,
             stats: Some(stats),
-            link: Some(link.manual()),
-            read_cache: link.read_cache,
+            link: Some(manual),
             read_only,
         }
     }
@@ -604,7 +574,7 @@ fn cmd_run(a: RunArgs) -> anyhow::Result<i32> {
         device::sd_notify("READY=1");
         true
     });
-    let serve = ServeOptions::device(a.dev_id, a.queues, a.stats, &a.link, a.read_only);
+    let serve = ServeOptions::device(a.dev_id, a.queues, a.stats, a.link.manual()?, a.read_only);
     serve_until_stopped(&rt, cfg, layout, store, serve, on_ready)?;
     Ok(0)
 }
@@ -648,6 +618,8 @@ fn cmd_mount(a: MountArgs, keep_stderr: bool) -> anyhow::Result<i32> {
     let creds = std::fs::canonicalize(&a.disk.creds)
         .with_context(|| format!("credentials file {}", a.disk.creds.display()))?;
     let options = mount_options(a.options.as_deref(), a.read_only);
+    // Read before the fork: a bad file fails here, with its message.
+    let manual = a.link.manual()?;
 
     // Fork before any thread exists (tokio and ublk queues start in the child).
     let (mut status_rx, status_tx) = pipe()?;
@@ -658,7 +630,7 @@ fn cmd_mount(a: MountArgs, keep_stderr: bool) -> anyhow::Result<i32> {
     }
     if pid == 0 {
         drop(status_rx);
-        let code = mount_daemon(&a, &creds, status_tx, keep_stderr);
+        let code = mount_daemon(&a, &creds, manual, status_tx, keep_stderr);
         log::logger().flush();
         // SAFETY: terminate the child without running the parent's exit handlers.
         unsafe { libc::_exit(code) };
@@ -708,7 +680,13 @@ fn cmd_mount(a: MountArgs, keep_stderr: bool) -> anyhow::Result<i32> {
 
 /// Background device server of `mount`. Reports `READY <bdev> <stats port|->` or `ERROR <msg>`
 /// to the parent through `status`.
-fn mount_daemon(a: &MountArgs, creds: &Path, status: File, keep_stderr: bool) -> i32 {
+fn mount_daemon(
+    a: &MountArgs,
+    creds: &Path,
+    manual: Manual,
+    status: File,
+    keep_stderr: bool,
+) -> i32 {
     detach_from_terminal(keep_stderr);
     let status = Arc::new(Mutex::new(Some(status)));
     let res = (|| -> anyhow::Result<()> {
@@ -722,7 +700,7 @@ fn mount_daemon(a: &MountArgs, creds: &Path, status: File, keep_stderr: bool) ->
             }
             true
         });
-        let serve = ServeOptions::device(a.dev_id, a.queues, a.stats, &a.link, a.read_only);
+        let serve = ServeOptions::device(a.dev_id, a.queues, a.stats, manual, a.read_only);
         serve_until_stopped(&rt, cfg, layout, store, serve, on_ready)
     })();
     match res {
@@ -1017,7 +995,6 @@ fn format_disk(cfg: &DiskConfig, layout: &Layout, s3: &S3Store) -> anyhow::Resul
             stats: None,
             // mkfs reads next to nothing.
             link: None,
-            read_cache: 0,
             read_only: false,
         },
         on_ready,
