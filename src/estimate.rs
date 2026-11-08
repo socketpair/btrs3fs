@@ -12,8 +12,10 @@ use std::time::Duration;
 /// Samples kept per estimate: the last ones only, so a change of the link
 /// (VPN on or off) shows within a few dozen requests.
 const SAMPLES: usize = 64;
-/// Requests smaller than this say little about the rate of a stream.
-const STREAM_MIN: u64 = 256 << 10;
+/// Requests smaller than this say little about the rate of a stream. It is
+/// the smallest read window: the daemon's GETs are never larger than the
+/// window, so a higher floor would keep the window from ever growing.
+const STREAM_MIN: u64 = 128 << 10;
 /// Uploads up to this size are mostly latency (an estimate of it before any GET).
 const SMALL_PUT: u64 = 64 << 10;
 
@@ -193,6 +195,18 @@ mod tests {
             o.get(MS(30), 4 * KIB, MS(1));
         }
         assert_eq!(o.estimate(prev).read_stream, Some(7));
+    }
+
+    /// GETs of the smallest read window still feed the estimate: it must be
+    /// able to grow the window from its start value.
+    #[test]
+    fn read_stream_counts_unit_sized_gets() {
+        let o = Observations::new();
+        for _ in 0..8 {
+            o.get(MS(30), 128 * KIB, MS(10));
+        }
+        let r = o.estimate(Chars::default()).read_stream;
+        assert!(near(r, 128.0 * KIB as f64 / 0.010, 0.01), "{r:?}");
     }
 
     #[test]
