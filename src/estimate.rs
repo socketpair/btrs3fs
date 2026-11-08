@@ -240,7 +240,10 @@ mod tests {
         };
         o.seed(seeded);
         let e = o.estimate(Chars::default());
-        assert_eq!((e.latency, e.read_stream, e.write_stream), (Some(MS(50)), Some(3 * MIB), Some(2 * MIB)));
+        assert_eq!(
+            (e.latency, e.read_stream, e.write_stream),
+            (Some(MS(50)), Some(3 * MIB), Some(2 * MIB))
+        );
         // New samples count again.
         o.get(MS(10), 4 * KIB, MS(1));
         assert_eq!(o.estimate(Chars::default()).latency, Some(MS(10)));
