@@ -242,7 +242,9 @@ async fn one_size(
     Ok(())
 }
 
-/// Runs the benchmark; its objects are deleted whatever happens.
+/// Runs the benchmark, printing each size as it is done; its objects are
+/// deleted whatever happens (a run stopped by a signal leaves them under
+/// `<prefix>/s3bench-*/`).
 pub async fn run(s3: &S3Store, prefix: &str, o: &Options) -> anyhow::Result<String> {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -253,9 +255,15 @@ pub async fn run(s3: &S3Store, prefix: &str, o: &Options) -> anyhow::Result<Stri
         o.repeat
     );
     let mut result = Ok(());
+    print!("{out}");
     for &n in &o.pieces {
         eprintln!("{n} appends…");
-        if let Err(e) = one_size(s3, o, &dir, n, &mut out).await {
+        // Each size is printed when done: a stopped run keeps what it measured.
+        let mut part = String::new();
+        let done = one_size(s3, o, &dir, n, &mut part).await;
+        print!("{part}");
+        out.push_str(&part);
+        if let Err(e) = done {
             result = Err(e);
             break;
         }

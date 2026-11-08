@@ -1156,10 +1156,7 @@ fn cmd_s3bench(a: BenchArgs) -> anyhow::Result<i32> {
         parallel: a.parallel,
         part: a.part,
     };
-    print!(
-        "{}",
-        runtime()?.block_on(bench::run(&s3, layout.prefix(), &opts))?
-    );
+    runtime()?.block_on(bench::run(&s3, layout.prefix(), &opts))?;
     Ok(0)
 }
 
