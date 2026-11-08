@@ -92,6 +92,9 @@ pub enum CompactWhy {
 /// Concatenations running at once. They copy on the server, so this only
 /// bounds the S3 request rate. Judgement call.
 const COMPACT_PARALLELISM: usize = 4;
+/// GETs at once for the pieces a concatenation reads (`copy_min_part`), like
+/// the copies of its parts.
+const CONCAT_READ_PARALLELISM: usize = 16;
 
 /// Pause of the background flusher after a failed upload. The upload itself
 /// already retried for retry_timeout_seconds; this only avoids a busy loop
@@ -265,6 +268,60 @@ fn cover(mut found: Vec<(u64, u64)>) -> (Vec<Stored>, Vec<u64>) {
     (chosen, leftovers)
 }
 
+/// A range of an object: (key, offset, length).
+type Range = (String, u64, u64);
+
+/// A part of a concatenation to build: a server copy of one range, or the
+/// bytes of several ranges read and uploaded as one part.
+#[derive(Clone, Debug, PartialEq)]
+enum PlanPart {
+    Copy(Range),
+    Read(Vec<Range>),
+}
+
+/// The parts that join `pieces` in order when every part but the last must
+/// be at least `min` bytes (SPEC.md §5, `copy_min_part`): pieces of `min`
+/// and more are copied; smaller ones are read and uploaded together,
+/// topped up to `min` with the start of the next big piece when they fall
+/// short, whose rest is copied if still `min` or the last piece.
+fn plan_parts(pieces: Vec<Range>, min: u64) -> Vec<PlanPart> {
+    if min == 0 {
+        return pieces.into_iter().map(PlanPart::Copy).collect();
+    }
+    let n = pieces.len();
+    let mut out = Vec::new();
+    let mut acc: Vec<Range> = Vec::new();
+    let mut acc_len = 0;
+    for (i, (key, mut offset, mut len)) in pieces.into_iter().enumerate() {
+        if len < min {
+            acc.push((key, offset, len));
+            acc_len += len;
+            continue;
+        }
+        if !acc.is_empty() {
+            if acc_len < min {
+                // `need` < `min` <= `len`: the rest of this piece is not empty.
+                let need = min - acc_len;
+                acc.push((key.clone(), offset, need));
+                offset += need;
+                len -= need;
+            }
+            out.push(PlanPart::Read(std::mem::take(&mut acc)));
+            acc_len = 0;
+        }
+        if len >= min || i + 1 == n {
+            out.push(PlanPart::Copy((key, offset, len)));
+        } else {
+            acc.push((key, offset, len));
+            acc_len = len;
+        }
+    }
+    if !acc.is_empty() {
+        out.push(PlanPart::Read(acc));
+    }
+    out
+}
+
 /// Zones waiting for concatenation: urgent (FULL) ones first.
 struct CompactQueue {
     urgent: VecDeque<usize>,
@@ -400,6 +457,8 @@ pub struct Engine {
     meta_kick: Notify,
     /// Served read-only: changes are refused, the store only read (SPEC.md §9.2).
     read_only: bool,
+    /// Pieces smaller than this a concatenation reads and uploads (SPEC.md §5).
+    copy_min_part: u64,
 }
 
 impl Engine {
@@ -605,6 +664,7 @@ impl Engine {
             meta_pending: std::sync::atomic::AtomicBool::new(false),
             meta_kick: Notify::new(),
             read_only,
+            copy_min_part: cfg.copy_min_part,
         };
         // Zones restored with several segments: concatenate them.
         for (zi, zone) in engine.zones.iter().enumerate() {
@@ -1761,16 +1821,22 @@ impl Engine {
             }
             (st.generation, st.objects.clone())
         };
-        let sources: Vec<_> = parts
+        let pieces: Vec<Range> = parts
             .iter()
             .map(|o| {
                 let key = self.layout.segment_key(zone.start, o.start);
-                ConcatPart::copy(&key, o.from - o.start, o.to - o.from)
+                (key, o.from - o.start, o.to - o.from)
             })
             .collect();
         let base = self.layout.segment_key(zone.start, 0);
         let _in_flight = zone.requests.concats.enter();
-        let pending = match self.store.begin_concat(&base, &sources).await {
+        let begun = async {
+            let sources = self
+                .concat_sources(plan_parts(pieces, self.copy_min_part))
+                .await?;
+            self.store.begin_concat(&base, &sources).await
+        };
+        let pending = match begun.await {
             Ok(p) => p,
             // A RESET meanwhile deleted the parts (the upload is aborted):
             // no failure of the concatenation, nothing to concatenate.
@@ -1786,6 +1852,33 @@ impl Engine {
             parts,
             pending,
         }))
+    }
+
+    /// The parts of a concatenation: copies as they are, reads fetched (GET
+    /// of each range, `READ_PARALLELISM` at once) and joined into one part.
+    async fn concat_sources(&self, plan: Vec<PlanPart>) -> Result<Vec<ConcatPart>, StoreError> {
+        let mut out = Vec::with_capacity(plan.len());
+        for part in plan {
+            out.push(match part {
+                PlanPart::Copy((key, offset, len)) => ConcatPart::Copy { key, offset, len },
+                PlanPart::Read(ranges) => {
+                    let got: Vec<Bytes> = futures_util::stream::iter(ranges)
+                        .map(|(key, offset, len)| async move {
+                            self.store.get_range(&key, offset, len).await
+                        })
+                        .buffered(CONCAT_READ_PARALLELISM)
+                        .collect::<Vec<_>>()
+                        .await
+                        .into_iter()
+                        .collect::<Result<_, _>>()?;
+                    STATS
+                        .compact_read_bytes
+                        .add(got.iter().map(|b| b.len() as u64).sum());
+                    ConcatPart::Data(Bytes::from(got.concat()))
+                }
+            });
+        }
+        Ok(out)
     }
 
     /// Completes the concatenation under the zone's `upload` lock, unless the
@@ -2107,6 +2200,105 @@ mod tests {
             .unwrap()
     }
 
+    fn r(key: &str, offset: u64, len: u64) -> (String, u64, u64) {
+        (key.to_string(), offset, len)
+    }
+
+    #[test]
+    fn plan_copies_everything_without_a_minimum() {
+        let pieces = vec![r("a", 0, 10), r("b", 0, 1), r("c", 2, 1)];
+        let plan = plan_parts(pieces.clone(), 0);
+        assert_eq!(
+            plan,
+            pieces.into_iter().map(PlanPart::Copy).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn plan_copies_the_base_and_uploads_the_tail() {
+        let plan = plan_parts(vec![r("base", 0, 8), r("s1", 0, 1), r("s2", 0, 2)], 5);
+        assert_eq!(
+            plan,
+            [
+                PlanPart::Copy(r("base", 0, 8)),
+                PlanPart::Read(vec![r("s1", 0, 1), r("s2", 0, 2)])
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_reads_a_small_base_too() {
+        let plan = plan_parts(vec![r("base", 0, 3), r("s1", 0, 1)], 5);
+        assert_eq!(plan, [PlanPart::Read(vec![r("base", 0, 3), r("s1", 0, 1)])]);
+    }
+
+    /// Small pieces between two big ones take the start of the next big one
+    /// up to the minimum; its rest is copied if big enough or last.
+    #[test]
+    fn plan_pads_small_pieces_with_the_next_big_one() {
+        let plan = plan_parts(vec![r("a", 0, 6), r("s", 0, 2), r("b", 0, 10)], 5);
+        assert_eq!(
+            plan,
+            [
+                PlanPart::Copy(r("a", 0, 6)),
+                PlanPart::Read(vec![r("s", 0, 2), r("b", 0, 3)]),
+                PlanPart::Copy(r("b", 3, 7)),
+            ]
+        );
+        // The rest of b too small and not last: read with what follows.
+        let plan = plan_parts(vec![r("s", 0, 2), r("b", 0, 6), r("t", 0, 1)], 5);
+        assert_eq!(
+            plan,
+            [
+                PlanPart::Read(vec![r("s", 0, 2), r("b", 0, 3)]),
+                PlanPart::Read(vec![r("b", 3, 3), r("t", 0, 1)]),
+            ]
+        );
+    }
+
+    /// Every part but the last is at least the minimum, and the parts cover
+    /// the pieces in order, for any layout.
+    #[test]
+    fn plan_parts_obey_the_minimum() {
+        let mut seed = 7u64;
+        let mut rnd = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for _ in 0..3000 {
+            let min = rnd(8);
+            let pieces: Vec<_> = (0..1 + rnd(7))
+                .map(|i| r(&format!("k{i}"), rnd(3), 1 + rnd(12)))
+                .collect();
+            let plan = plan_parts(pieces.clone(), min);
+            let ranges: Vec<_> = plan
+                .iter()
+                .flat_map(|p| match p {
+                    PlanPart::Copy(x) => vec![x.clone()],
+                    PlanPart::Read(v) => v.clone(),
+                })
+                .collect();
+            // Same bytes in the same order, split anywhere.
+            let bytes = |v: &[(String, u64, u64)]| {
+                v.iter()
+                    .flat_map(|(k, o, l)| (*o..o + l).map(move |b| (k.clone(), b)))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(bytes(&ranges), bytes(&pieces), "{pieces:?} min {min}");
+            let len = |p: &PlanPart| match p {
+                PlanPart::Copy(x) => x.2,
+                PlanPart::Read(v) => v.iter().map(|x| x.2).sum(),
+            };
+            let n = plan.len() - 1;
+            assert!(
+                plan[..n].iter().all(|p| len(p) >= min),
+                "{pieces:?} min {min}: {plan:?}"
+            );
+        }
+    }
+
     /// The one-pass `cover` picks what the plain greedy search picks.
     #[test]
     fn cover_matches_greedy() {
@@ -2184,6 +2376,41 @@ mod tests {
             e.write(wp, blk(first + i, 1), false).unwrap();
             e.flush_zone(zone as usize, Reason::Explicit).await.unwrap();
         }
+    }
+
+    /// A server that copies no part below 4 blocks (as VK Cloud and MinIO
+    /// with 5 MiB): with `copy_min_part` the small segments are read and
+    /// uploaded, and the zone ends as one object with the same data.
+    #[tokio::test]
+    async fn concatenation_reads_pieces_below_the_minimum() {
+        let concat = |copy_min_part: u64| async move {
+            let store = mem();
+            mem_store(&store).set_min_part(4 * B);
+            let mut cfg = DiskConfig::new(8 * ZS, ZS);
+            cfg.dirty_limit_bytes = 64 * B;
+            cfg.append = AppendMode::Segments;
+            cfg.copy_min_part = copy_min_part;
+            let e = Engine::open(&cfg, Layout::new("t").unwrap(), store.clone())
+                .await
+                .unwrap();
+            // A base of 6 blocks, then 3 single-block segments.
+            e.write(0, blk(1, 6), false).unwrap();
+            e.flush_zone(0, Reason::Explicit).await.unwrap();
+            segment_writes(&e, 0, 2, 3).await;
+            let done = e.compact_zone(0).await;
+            (e, store, done)
+        };
+        let (e, store, done) = concat(4 * B).await;
+        done.unwrap();
+        assert_eq!(
+            keys(&store, "t/0000000000000000").await,
+            ["t/0000000000000000-00000000"]
+        );
+        let want = [blk(1, 6), blk(2, 1), blk(3, 1), blk(4, 1)].concat();
+        assert_eq!(read(&e, 0, 9 * B).await, want);
+        // Without it the server refuses the small parts.
+        let (_, _, done) = concat(0).await;
+        assert!(done.is_err());
     }
 
     #[tokio::test]
