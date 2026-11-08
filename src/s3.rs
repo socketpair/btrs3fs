@@ -88,12 +88,23 @@ pub struct S3Store {
     credentials: Credentials,
     retry: RetryPolicy,
     append: AppendMode,
+    /// The longest silence in the body of an answer (`STALL`).
+    stall: Duration,
 }
 
-/// TCP keepalive probes on idle connections: notices connections silently
-/// dropped by NAT or Wi-Fi (SPEC.md §8). Judgement call: well below the
-/// common 60+ s NAT idle timeouts.
-const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+/// A transfer with no byte moving this long is dead (user decision; SPEC.md
+/// §8): connections die silently, without RST or FIN (NAT, Wi-Fi, a route
+/// change). It is applied three ways, so the dead connection is dropped and
+/// the retry opens a new one:
+/// - `TCP_USER_TIMEOUT`: the kernel aborts a connection whose sent data (or
+///   keepalive probe) stays unacknowledged this long — a request written into
+///   a dead connection, an upload that stopped;
+/// - TCP keepalive after this much silence, probes every second: a dead
+///   connection is found while it idles in the pool or waits for an answer;
+/// - the body of an answer: no chunk for this long ends the attempt.
+const STALL: Duration = Duration::from_secs(5);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+const KEEPALIVE_PROBES: u32 = 3;
 
 /// Idle connections are kept for reuse this long; the reqwest default.
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -117,7 +128,10 @@ impl S3Store {
     pub fn new(creds: &Creds, transport: &Transport, retry: RetryPolicy) -> anyhow::Result<Self> {
         let mut builder = reqwest::Client::builder()
             .tcp_nodelay(true)
-            .tcp_keepalive(TCP_KEEPALIVE)
+            .tcp_user_timeout(STALL)
+            .tcp_keepalive(STALL)
+            .tcp_keepalive_interval(KEEPALIVE_INTERVAL)
+            .tcp_keepalive_retries(KEEPALIVE_PROBES)
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(READ_TIMEOUT)
@@ -144,7 +158,13 @@ impl S3Store {
             ),
             retry,
             append: AppendMode::Patch,
+            stall: STALL,
         })
+    }
+
+    #[cfg(test)]
+    fn with_stall(self, stall: Duration) -> Self {
+        Self { stall, ..self }
     }
 
     /// Same client and connection pool with another way to append (from disk.yaml).
@@ -650,7 +670,7 @@ impl S3Store {
                 .send(reqwest::Method::GET, &url, &headers, None)
                 .await?;
             let headers_at = Instant::now();
-            let data = read_body(check(resp, key).await?, len).await?;
+            let data = read_body(check(resp, key).await?, len, self.stall).await?;
             if data.len() as u64 != len {
                 return Err(Attempt::Retry(anyhow!(
                     "short read: got {} of {len} bytes",
@@ -837,14 +857,32 @@ fn delete_xml(keys: &[String]) -> String {
 
 /// Reads a ranged GET answer of at most the `limit` bytes asked for: a
 /// server ignoring the range would otherwise send a whole object.
-async fn read_body(mut resp: reqwest::Response, limit: u64) -> Result<Bytes, Attempt> {
+/// No chunk for `stall`: the attempt ends and its connection is dropped
+/// (an unfinished answer never goes back to the pool).
+async fn read_body(
+    mut resp: reqwest::Response,
+    limit: u64,
+    stall: Duration,
+) -> Result<Bytes, Attempt> {
     let too_big =
         |n: u64| Attempt::Fatal(anyhow!("answer of {n} bytes, at most {limit} expected").into());
     if let Some(n) = resp.content_length().filter(|&n| n > limit) {
         return Err(too_big(n));
     }
     let mut buf = BytesMut::with_capacity(resp.content_length().unwrap_or(0) as usize);
-    while let Some(chunk) = resp.chunk().await? {
+    loop {
+        let chunk = match tokio::time::timeout(stall, resp.chunk()).await {
+            Ok(chunk) => chunk?,
+            Err(_) => {
+                return Err(Attempt::Retry(anyhow!(
+                    "no data for {} s after {} of {} bytes: connection dropped",
+                    stall.as_secs_f64(),
+                    buf.len(),
+                    resp.content_length().unwrap_or(0)
+                )));
+            }
+        };
+        let Some(chunk) = chunk else { break };
         let n = buf.len() as u64 + chunk.len() as u64;
         if n > limit {
             return Err(too_big(n));
@@ -1068,10 +1106,67 @@ mod tests {
     async fn answers_are_bounded() {
         let answer = |n: usize| reqwest::Response::from(http::Response::new(vec![b'x'; n]));
         assert_eq!(
-            read_body(answer(10), 10).await.ok().map(|b| b.len()),
+            read_body(answer(10), 10, STALL).await.ok().map(|b| b.len()),
             Some(10)
         );
-        assert!(read_body(answer(11), 10).await.is_err());
+        assert!(read_body(answer(11), 10, STALL).await.is_err());
+    }
+
+    /// A server that goes silent in the middle of an answer (a connection
+    /// that died without RST or FIN): the transfer is cut once no byte came
+    /// for the stall time, its connection dropped, and the retry goes over a
+    /// new connection.
+    #[tokio::test]
+    async fn stalled_transfer_retries_on_a_new_connection() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicU64::new(0));
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let n = count.fetch_add(1, Ordering::SeqCst);
+                let mut req = [0u8; 4096];
+                let _ = sock.read(&mut req).await;
+                let head = "HTTP/1.1 206 Partial Content\r\nContent-Length: 8\r\n\r\n";
+                sock.write_all(head.as_bytes()).await.unwrap();
+                if n == 0 {
+                    sock.write_all(b"half").await.unwrap(); // then silence
+                    held.push(sock);
+                } else {
+                    sock.write_all(b"12345678").await.unwrap();
+                }
+            }
+        });
+        let creds: Creds = serde_json::from_str(&format!(
+            r#"{{"endpoint":"http://127.0.0.1:{port}","bucket":"b","access_key":"a","secret_key":"s","region":"r","allow_http":true}}"#
+        ))
+        .unwrap();
+        let retry = RetryPolicy {
+            timeout: Duration::from_secs(10),
+            initial_delay: Duration::from_millis(10),
+            backoff_factor: 2.0,
+        };
+        let s3 = S3Store::new(&creds, &Transport { proxy: None }, retry)
+            .unwrap()
+            .with_stall(Duration::from_millis(300));
+        let started = Instant::now();
+        let data = s3.get_range("k", 0, 8).await.unwrap();
+        assert_eq!(&data[..], b"12345678");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "the retry used a new connection"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
