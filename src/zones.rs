@@ -43,12 +43,10 @@ static ZEROS: [u8; 1 << 20] = [0; 1 << 20];
 /// When to concatenate a zone (SPEC.md §5). Judgement calls agreed with the
 /// user. Segments: more than `COMPACT_READ_FACTOR` × (zone / GET part) — a
 /// sequential read of the zone then pays at most ~1/4 extra GETs — within
-/// the bounds; metadata zones `COMPACT_META_FACTOR` times as many, since
-/// their reads are 16 KiB nodes that never span segments.
+/// the bounds; the same for every zone, data or metadata (user decision).
 const COMPACT_READ_FACTOR: u64 = 4;
 const COMPACT_SEGMENTS_MIN: usize = 8;
 const COMPACT_SEGMENTS_MAX: usize = 1024;
-const COMPACT_META_FACTOR: usize = 4;
 /// Count-triggered concatenation waits until at least 1/this of what is
 /// already concatenated was added: no copying a whole zone for a crumb.
 const COMPACT_GROWTH: u64 = 8;
@@ -1524,16 +1522,11 @@ impl Engine {
             .map(|((_, b), i, reason)| (i, b, reason))
     }
 
-    /// Segments above which a zone is concatenated (SPEC.md §5).
-    fn segment_limit(&self, kind: Kind) -> usize {
-        let data = (COMPACT_READ_FACTOR * self.zone_size / self.get_part.load(Ordering::SeqCst))
-            .clamp(COMPACT_SEGMENTS_MIN as u64, COMPACT_SEGMENTS_MAX as u64)
-            as usize;
-        if kind == Kind::Meta {
-            data * COMPACT_META_FACTOR
-        } else {
-            data
-        }
+    /// Segments above which a zone is concatenated (SPEC.md §5), whatever
+    /// it holds (user decision).
+    fn segment_limit(&self) -> usize {
+        (COMPACT_READ_FACTOR * self.zone_size / self.get_part.load(Ordering::SeqCst))
+            .clamp(COMPACT_SEGMENTS_MIN as u64, COMPACT_SEGMENTS_MAX as u64) as usize
     }
 
     /// Whether a SEGMENTS zone needs concatenation now, how soon (`true`:
@@ -1542,14 +1535,14 @@ impl Engine {
         if !self.segments || st.objects.len() < 2 {
             return None;
         }
-        let meta = st.kind == Kind::Meta;
-        if st.cond == Cond::Full && !meta {
+        // A FULL zone never changes again: one concatenation, at once.
+        if st.cond == Cond::Full {
             return Some((true, CompactWhy::Full));
         }
         // What the first object, the last concatenation, already covers.
         let base = st.objects[0].to;
         let grown = (st.flushed - base) * COMPACT_GROWTH >= base;
-        (st.objects.len() > self.segment_limit(st.kind) && grown)
+        (st.objects.len() > self.segment_limit() && grown)
             .then_some((false, CompactWhy::ManySegments))
     }
 
@@ -2315,7 +2308,7 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_rules_for_data_and_metadata() {
-        // Zone 1 MiB, no GET part: data limit 8 segments, metadata 32.
+        // Zone 1 MiB, no GET part: 8 segments, whatever the zone holds.
         let e = segments_engine(mem()).await;
         let none = &[false; 8];
         let meta_write = |zone: u64| {
@@ -2326,18 +2319,31 @@ mod tests {
         // Data: 9 segments of growing size pass both the limit and the growth guard.
         segment_writes(&e, 1, 1, 9).await;
         assert_eq!(e.next_compaction(none), Some(1));
-        // Metadata: 9 segments are fine, 33 are many.
-        for _ in 0..9 {
+        // Metadata: the same limit (user decision): 8 segments are fine, 9 are many.
+        for _ in 0..8 {
             meta_write(2);
             e.flush_zone(2, Reason::Explicit).await.unwrap();
         }
-        assert_eq!(e.next_compaction(none), None);
-        for _ in 0..24 {
-            meta_write(2);
-            e.flush_zone(2, Reason::Explicit).await.unwrap();
-        }
-        assert_eq!(e.next_compaction(none), Some(2));
+        assert_eq!(
+            e.next_compaction(&[true, true, false, false, false, false, false, false]),
+            None
+        );
+        meta_write(2);
+        e.flush_zone(2, Reason::Explicit).await.unwrap();
+        assert_eq!(
+            e.next_compaction(&[false, true, false, false, false, false, false, false]),
+            Some(2)
+        );
         assert_eq!(e.zones[2].state.lock().unwrap().kind, Kind::Meta);
+        // A FULL metadata zone goes urgently, like a data zone: it never changes again.
+        {
+            let mut st = e.zones[2].state.lock().unwrap();
+            st.cond = Cond::Full;
+            assert!(matches!(
+                e.compaction_due(&st),
+                Some((true, CompactWhy::Full))
+            ));
+        }
         e.note_meta(4 * ZS); // empty zone: learns from its writes
         assert_eq!(e.zones[4].state.lock().unwrap().kind, Kind::Unknown);
         segment_writes(&e, 3, 1, 1).await;
