@@ -15,7 +15,7 @@ use crate::config::{AppendMode, BLOCK_SIZE, DiskConfig};
 use crate::limiter::Limiter;
 use crate::readahead::{ReadAhead, ReadCache};
 use crate::stats::{InFlight, Reason, STATS, ZoneCounts};
-use crate::store::{Body, Layout, PendingConcat, Store, StoreError};
+use crate::store::{Body, ConcatPart, Layout, PendingConcat, Store, StoreError};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use log::{debug, info, warn};
@@ -1765,7 +1765,7 @@ impl Engine {
             .iter()
             .map(|o| {
                 let key = self.layout.segment_key(zone.start, o.start);
-                (key, o.from - o.start, o.to - o.from)
+                ConcatPart::copy(&key, o.from - o.start, o.to - o.from)
             })
             .collect();
         let base = self.layout.segment_key(zone.start, 0);

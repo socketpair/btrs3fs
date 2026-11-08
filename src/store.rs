@@ -67,8 +67,30 @@ pub enum PendingConcat {
     S3(crate::s3::PendingConcat),
 }
 
-/// A source range of a concatenation: (key, offset, length).
-pub type ConcatPart = (String, u64, u64);
+/// A part of a concatenation (SPEC.md §5): a range of an existing object,
+/// copied on the server, or bytes we upload.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConcatPart {
+    Copy { key: String, offset: u64, len: u64 },
+    Data(Bytes),
+}
+
+impl ConcatPart {
+    pub fn copy(key: &str, offset: u64, len: u64) -> Self {
+        ConcatPart::Copy {
+            key: key.to_string(),
+            offset,
+            len,
+        }
+    }
+
+    pub fn len(&self) -> u64 {
+        match self {
+            ConcatPart::Copy { len, .. } => *len,
+            ConcatPart::Data(b) => b.len() as u64,
+        }
+    }
+}
 
 pub enum Backend {
     Mem(MemStore),
@@ -276,9 +298,15 @@ impl Store {
         self.interleave().await;
         match &self.backend {
             Backend::Mem(m) => {
+                m.check_parts(parts)?;
                 let mut data = Vec::new();
-                for (key, offset, len) in parts {
-                    data.extend_from_slice(&m.get_range(key, *offset, *len)?);
+                for part in parts {
+                    match part {
+                        ConcatPart::Copy { key, offset, len } => {
+                            data.extend_from_slice(&m.get_range(key, *offset, *len)?)
+                        }
+                        ConcatPart::Data(b) => data.extend_from_slice(b),
+                    }
                 }
                 Ok(PendingConcat::Mem {
                     dst: dst.to_string(),
@@ -335,9 +363,30 @@ pub struct MemStore {
     /// Deletes of keys containing this fail (tests).
     fail_deletes_of: Mutex<Option<String>>,
     range_gets: AtomicU64,
+    /// Smallest part of a concatenation but the last, as S3 servers have
+    /// (tests); 0: any.
+    min_part: AtomicU64,
 }
 
 impl MemStore {
+    /// Refuses concatenations with a part but the last smaller than `n`,
+    /// like most S3 servers (`EntityTooSmall`).
+    #[cfg(test)]
+    pub fn set_min_part(&self, n: u64) {
+        self.min_part.store(n, Ordering::SeqCst);
+    }
+
+    fn check_parts(&self, parts: &[ConcatPart]) -> StoreResult<()> {
+        let min = self.min_part.load(Ordering::SeqCst);
+        let n = parts.len().saturating_sub(1);
+        if parts[..n].iter().any(|p| p.len() < min) {
+            return Err(
+                anyhow::anyhow!("EntityTooSmall: a part is smaller than {min} bytes").into(),
+            );
+        }
+        Ok(())
+    }
+
     /// Makes every subsequent operation fail (failure injection for tests).
     #[cfg(test)]
     pub fn set_fail(&self, fail: bool) {
@@ -599,6 +648,42 @@ const META_SUFFIX: &str = ".meta";
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn concatenation_of_copies_and_uploaded_bytes() {
+        let mem = MemStore::default();
+        mem.put("a", Body::new(vec![Bytes::from_static(b"AAAA")]))
+            .unwrap();
+        mem.put("b", Body::new(vec![Bytes::from_static(b"BBBB")]))
+            .unwrap();
+        let store = Store::mem(mem);
+        let parts = [
+            ConcatPart::copy("a", 1, 3),
+            ConcatPart::Data(Bytes::from_static(b"xy")),
+            ConcatPart::copy("b", 0, 2),
+        ];
+        let p = store.begin_concat("c", &parts).await.unwrap();
+        store.finish_concat(p).await.unwrap();
+        assert_eq!(&store.get("c").await.unwrap().unwrap()[..], b"AAAxyBB");
+        assert_eq!(parts.iter().map(ConcatPart::len).sum::<u64>(), 7);
+    }
+
+    /// Like VK Cloud and MinIO: every part but the last at least this big.
+    #[tokio::test]
+    async fn mem_store_enforces_a_minimum_part() {
+        let mem = MemStore::default();
+        mem.put("a", Body::new(vec![Bytes::from_static(b"AAAA")]))
+            .unwrap();
+        mem.set_min_part(3);
+        let store = Store::mem(mem);
+        let small_first = [ConcatPart::copy("a", 0, 2), ConcatPart::copy("a", 2, 2)];
+        assert!(store.begin_concat("c", &small_first).await.is_err());
+        let small_last = [
+            ConcatPart::copy("a", 0, 3),
+            ConcatPart::Data(Bytes::from_static(b"z")),
+        ];
+        assert!(store.begin_concat("c", &small_last).await.is_ok());
+    }
 
     #[test]
     fn config_keys() {

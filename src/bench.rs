@@ -218,7 +218,10 @@ async fn one_size(
         Summary::of(&reads_seg)
     );
     let merged = format!("{dir}/seg-{n}/merged");
-    let parts: Vec<ConcatPart> = keys.iter().map(|k| (k.clone(), 0, o.piece)).collect();
+    let parts: Vec<ConcatPart> = keys
+        .iter()
+        .map(|k| ConcatPart::copy(k, 0, o.piece))
+        .collect();
     let concat = async {
         let (pending, t_copy) = timed(s3.begin_concat(&merged, &parts)).await?;
         let ((), t_done) = timed(s3.finish_concat(pending)).await?;

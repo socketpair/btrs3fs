@@ -378,7 +378,10 @@ impl S3Store {
         self.put(&b, Body::new(vec![second.clone()])).await?;
         let concatenated = async {
             let pending = self
-                .begin_concat(&c, &[(a.clone(), 0, len), (b.clone(), 0, len)])
+                .begin_concat(
+                    &c,
+                    &[ConcatPart::copy(&a, 0, len), ConcatPart::copy(&b, 0, len)],
+                )
                 .await?;
             self.finish_concat(pending).await?;
             Ok::<_, StoreError>(self.get(&c).await? == [first, second].concat())
@@ -487,9 +490,9 @@ impl S3Store {
         .await
     }
 
-    /// Concatenation on the server (SPEC.md §5): a multipart upload to `dst`
-    /// whose parts are copies of `parts` (UploadPartCopy with a range), up to
-    /// `COPY_PARALLELISM` at once. The object appears on `finish_concat`.
+    /// Concatenation (SPEC.md §5): a multipart upload to `dst` whose parts are
+    /// copies of object ranges (UploadPartCopy) or our bytes (UploadPart), up
+    /// to `COPY_PARALLELISM` at once. The object appears on `finish_concat`.
     pub async fn begin_concat(
         &self,
         dst: &str,
@@ -501,19 +504,25 @@ impl S3Store {
         let copies: Vec<_> = parts
             .iter()
             .enumerate()
-            .map(|(i, (src, offset, len))| {
+            .map(|(i, part)| {
                 let part_url = format!("{url}?partNumber={}&uploadId={id}", i + 1);
-                let headers = [
-                    (
-                        "x-amz-copy-source",
-                        format!("/{}/{}", self.bucket, encode_path(src)),
-                    ),
-                    (
-                        "x-amz-copy-source-range",
-                        format!("bytes={offset}-{}", offset + len - 1),
-                    ),
-                ];
                 async move {
+                    let (src, offset, len) = match part {
+                        ConcatPart::Copy { key, offset, len } => (key, *offset, *len),
+                        ConcatPart::Data(bytes) => {
+                            return self.upload_part(&part_url, dst, i + 1, bytes).await;
+                        }
+                    };
+                    let headers = [
+                        (
+                            "x-amz-copy-source",
+                            format!("/{}/{}", self.bucket, encode_path(src)),
+                        ),
+                        (
+                            "x-amz-copy-source-range",
+                            format!("bytes={offset}-{}", offset + len - 1),
+                        ),
+                    ];
                     self.with_retries(&format!("COPY {src} into {dst}"), || async {
                         let resp = self
                             .send(reqwest::Method::PUT, &part_url, &headers, None)
@@ -537,7 +546,7 @@ impl S3Store {
             dst: dst.to_string(),
             upload_id,
             etags: Vec::new(),
-            size: parts.iter().map(|p| p.2).sum(),
+            size: parts.iter().map(ConcatPart::len).sum(),
         };
         match etags.into_iter().collect::<StoreResult<Vec<String>>>() {
             Ok(etags) => Ok(PendingConcat { etags, ..pending }),
@@ -546,6 +555,30 @@ impl S3Store {
                 Err(e)
             }
         }
+    }
+
+    /// UploadPart of our bytes as part `n` of a concatenation into `dst`; the
+    /// answer's `ETag` names the part.
+    async fn upload_part(
+        &self,
+        url: &str,
+        dst: &str,
+        n: usize,
+        bytes: &Bytes,
+    ) -> StoreResult<String> {
+        let body = Body::new(vec![bytes.clone()]);
+        self.with_retries(&format!("PUT part {n} of {dst}"), || async {
+            let resp = self
+                .send(reqwest::Method::PUT, url, &[], Some(&body))
+                .await?;
+            let resp = check(resp, dst).await?;
+            resp.headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+                .ok_or_else(|| Attempt::Fatal(anyhow!("{dst}: part {n} answered no ETag").into()))
+        })
+        .await
     }
 
     /// CompleteMultipartUpload: the concatenated object replaces `dst`. A
