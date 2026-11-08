@@ -9,6 +9,7 @@ use crate::config::{
     AppendMode, Creds, DEFAULT_RETRY_BACKOFF, DEFAULT_RETRY_INITIAL_DELAY_MS,
     DEFAULT_RETRY_TIMEOUT_SECS, DiskConfig,
 };
+use crate::estimate::{Dir, OBS};
 use crate::store::{Body, ConcatPart, Layout, ObjectInfo, StoreError, StoreResult};
 use anyhow::{Context, anyhow};
 use aws_credential_types::Credentials;
@@ -261,6 +262,9 @@ impl S3Store {
                     let wait = delay.mul_f64(jitter()).min(left);
                     warn!("{what}: attempt {tries} failed ({e:#}), retrying in {wait:?}");
                     crate::stats::STATS.retries.inc();
+                    if let Some(dir) = Dir::of(what) {
+                        OBS.retry(dir);
+                    }
                     tokio::time::sleep(wait).await;
                     // Never past the budget: a longer pause could not be waited out.
                     delay = Duration::try_from_secs_f64(
@@ -275,10 +279,13 @@ impl S3Store {
     pub async fn put(&self, key: &str, body: Body) -> StoreResult<()> {
         let url = self.object_url(key);
         self.with_retries(&format!("PUT {key}"), || async {
+            let started = Instant::now();
             let resp = self
                 .send(reqwest::Method::PUT, &url, &[], Some(&body))
                 .await?;
-            check(resp, key).await.map(drop)
+            check(resp, key).await?;
+            OBS.put(body.len(), started.elapsed());
+            Ok(())
         })
         .await
     }
@@ -396,10 +403,12 @@ impl S3Store {
     ) -> StoreResult<Option<u64>> {
         let url = format!("{}?append&position={position}", self.object_url(key));
         self.with_retries(&format!("APPEND {key} at {position}"), || async {
+            let started = Instant::now();
             let resp = self
                 .send(reqwest::Method::PUT, &url, &[], Some(&body))
                 .await?;
             let resp = check(resp, key).await?;
+            OBS.put(body.len(), started.elapsed());
             Ok(resp
                 .headers()
                 .get("x-rgw-next-append-position")
@@ -433,10 +442,13 @@ impl S3Store {
         let range = format!("bytes {}-{}/*", offset, offset + body.len() - 1);
         self.with_retries(&format!("PATCH {key} {range}"), || async {
             let headers = [("content-range", range.clone())];
+            let started = Instant::now();
             let resp = self
                 .send(reqwest::Method::PATCH, &url, &headers, Some(&body))
                 .await?;
-            check(resp, key).await.map(drop)
+            check(resp, key).await?;
+            OBS.put(body.len(), started.elapsed());
+            Ok(())
         })
         .await
     }
@@ -633,9 +645,11 @@ impl S3Store {
         let range = format!("bytes={}-{}", offset, offset + len - 1);
         self.with_retries(&format!("GET {key} {range}"), || async {
             let headers = [("range", range.clone())];
+            let started = Instant::now();
             let resp = self
                 .send(reqwest::Method::GET, &url, &headers, None)
                 .await?;
+            let headers_at = Instant::now();
             let data = read_body(check(resp, key).await?, len).await?;
             if data.len() as u64 != len {
                 return Err(Attempt::Retry(anyhow!(
@@ -643,6 +657,7 @@ impl S3Store {
                     data.len()
                 )));
             }
+            OBS.get(headers_at - started, len, headers_at.elapsed());
             Ok(data)
         })
         .await

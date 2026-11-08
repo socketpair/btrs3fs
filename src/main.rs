@@ -3,6 +3,7 @@ mod btrfs_zone;
 mod config;
 mod device;
 mod ident;
+mod estimate;
 mod limiter;
 mod linkconf;
 mod logging;
