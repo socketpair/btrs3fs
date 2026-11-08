@@ -1,0 +1,41 @@
+# btrs3fs link settings: `btrs3fs mount --link-config link.yaml ...` (also `run`).
+#
+# Each key is either a value (manual) or null / absent (auto: the daemon estimates
+# it from its own S3 traffic and adapts as the link changes, SPEC.md §6.1).
+# An unknown key is an error, so a typo never turns into "auto" silently.
+# The statistics page (section "S3 link") shows the auto values next to these
+# and can change any of them until the daemon restarts; it also prints a
+# ready file with the current manual values. `btrs3fs measure` prints the five
+# link characteristics in this format.
+#
+# Units: durations as 38ms / 2s; sizes and rates (per second) as 24M = 24 MiB,
+# 512K, 1G; counts as plain numbers.
+
+# --- Characteristics of the link to S3 ---
+
+# Time to the first byte of a small GET.
+latency: 38ms
+# Rate of one GET after its first byte.
+read_stream: 33M
+# Rate of all GETs together.
+read_total: null
+# Rate of one PUT after its first byte.
+write_stream: 24M
+# Rate of all PUTs together; absent = auto.
+# write_total: 24M
+
+# --- Derived (computed from the above when null) ---
+
+# Read-ahead window and part size of large reads (power of two, 128K..4M).
+read_unit: null
+# btrfs readahead window, bdi/read_ahead_kb (4M..256M).
+fs_readahead: null
+# Parallel uploads (1..64); auto = adaptive, starting from 1.
+uploads: 8
+# Parallel GETs (1..64); auto = adaptive, starting from 1.
+reads: null
+
+# --- Memory ---
+
+# RAM for read-ahead windows; 0 disables them. Manual only (default 64M).
+read_cache: 64M
