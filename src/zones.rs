@@ -30,6 +30,10 @@ use tokio::sync::Notify;
 /// busy with zone-sized bodies, few enough not to hit S3 request rate limits.
 /// With a link, uploads and GETs follow it (SPEC.md §6.1).
 const S3_PARALLELISM: usize = 16;
+/// A probe GET (SPEC.md §6.1): this many read parts at once, so its body takes
+/// about as many latencies, once in `PROBE_EVERY` (user decision: 10 s).
+const PROBE_PARTS: u64 = 4;
+const PROBE_EVERY: Duration = Duration::from_secs(10);
 
 /// Shared zero-filled buffer for reads past the write pointer; a larger read
 /// is served as several 1 MiB pieces. Size is a judgement call: 1 MiB of static
@@ -383,6 +387,10 @@ pub struct Engine {
     /// Store reads larger than this go out as parallel GETs of this size
     /// (SPEC.md §6.2); `u64::MAX`: not split.
     get_part: AtomicU64,
+    /// When a large read last went out as one probe GET of `PROBE_PARTS`
+    /// parts (boottime, ms), and how often it does (SPEC.md §6.1).
+    last_probe_ms: AtomicU64,
+    probe_every: Mutex<Duration>,
     /// A SEGMENTS disk: every upload is a new object (SPEC.md §5).
     segments: bool,
     compact_queue: Mutex<CompactQueue>,
@@ -587,6 +595,8 @@ impl Engine {
             upload_slots: Limiter::new(S3_PARALLELISM),
             get_slots: Limiter::new(S3_PARALLELISM),
             get_part: AtomicU64::new(u64::MAX),
+            last_probe_ms: AtomicU64::new(0),
+            probe_every: Mutex::new(PROBE_EVERY),
             segments,
             compact_queue: Mutex::new(CompactQueue {
                 urgent: VecDeque::new(),
@@ -875,13 +885,49 @@ impl Engine {
     }
 
     /// `[offset, offset + len)` of an object as parallel GETs of `get_part`.
+    /// Once in `probe_every`, the first `PROBE_PARTS` parts of a read that
+    /// long go as one GET: its body takes several latencies, long enough to
+    /// show the rate of one stream (no GET of a part is; SPEC.md §6.1). The
+    /// same bytes, no extra traffic.
     async fn get_parts(&self, zi: usize, key: &str, offset: u64, len: u64) -> ZResult<Vec<Bytes>> {
         let end = offset + len;
         let part = self.get_part.load(Ordering::SeqCst);
-        let parts = (offset..end)
+        let probe = part
+            .checked_mul(PROBE_PARTS)
+            .filter(|&p| len >= p && self.probe_due())
+            .unwrap_or(0);
+        let first = (probe > 0).then(|| self.get(zi, key, offset, probe));
+        let parts = (offset + probe..end)
             .step_by(usize::try_from(part).unwrap_or(usize::MAX))
             .map(|from| self.get(zi, key, from, part.min(end - from)));
-        futures_util::future::try_join_all(parts).await
+        let (head, rest) = futures_util::future::join(
+            async {
+                match first {
+                    Some(f) => f.await.map(Some),
+                    None => Ok(None),
+                }
+            },
+            futures_util::future::try_join_all(parts),
+        )
+        .await;
+        Ok(head?.into_iter().chain(rest?).collect())
+    }
+
+    /// Takes the probe if one is due.
+    fn probe_due(&self) -> bool {
+        let now = (boottime() * 1e3) as u64;
+        let every = self.probe_every.lock().unwrap().as_millis() as u64;
+        let last = self.last_probe_ms.load(Ordering::SeqCst);
+        (last == 0 || now.saturating_sub(last) >= every)
+            && self
+                .last_probe_ms
+                .compare_exchange(last, now.max(1), Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+    }
+
+    #[cfg(test)]
+    fn set_probe_every(&self, every: Duration) {
+        *self.probe_every.lock().unwrap() = every;
     }
 
     /// `[from, from + len)` of a zone's stored data, planned from its objects
@@ -3381,6 +3427,30 @@ mod tests {
         flush.await.unwrap().unwrap();
         assert!(e.unflushed().is_empty());
     }
+    #[tokio::test]
+    async fn large_reads_probe_the_stream_every_interval() {
+        let store = mem();
+        let e = engine_with(store.clone()).await;
+        e.set_get_part(4 * B);
+        let data: Vec<u8> = (0..40 * B).map(|i| (i / B) as u8).collect();
+        e.write(0, Bytes::from(data.clone()), false).unwrap();
+        e.flush_all(Reason::Explicit).await.unwrap();
+        let gets = || mem_store(&store).range_gets();
+        // The first large read: one GET of 4 parts, then parts.
+        assert_eq!(read(&e, 0, 32 * B).await, data[..(32 * B) as usize]);
+        assert_eq!(gets(), 1 + 4);
+        // Within the interval: parts only.
+        assert_eq!(read(&e, 8 * B, 32 * B).await, data[(8 * B) as usize..]);
+        assert_eq!(gets(), 5 + 8);
+        // A read smaller than 4 parts never probes.
+        e.set_probe_every(Duration::ZERO);
+        read(&e, 0, 12 * B).await;
+        assert_eq!(gets(), 13 + 3);
+        // The interval passed: a probe again.
+        assert_eq!(read(&e, 0, 32 * B).await, data[..(32 * B) as usize]);
+        assert_eq!(gets(), 16 + 5);
+    }
+
     #[tokio::test]
     async fn large_read_goes_out_in_parts() {
         let store = mem();

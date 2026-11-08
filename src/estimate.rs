@@ -1,7 +1,7 @@
 //! Passive estimates of the link to S3 from the daemon's own requests
 //! (SPEC.md §6.1): latency from GET time-to-headers, the rate of one stream
-//! from large GETs and uploads. The totals come from the connection
-//! regulator, which sees the whole link.
+//! from GETs and uploads whose body took long enough to show it. The totals
+//! come from the connection regulator, which sees the whole link.
 
 use crate::tuning::Chars;
 use std::collections::VecDeque;
@@ -12,12 +12,16 @@ use std::time::Duration;
 /// Samples kept per estimate: the last ones only, so a change of the link
 /// (VPN on or off) shows within a few dozen requests.
 const SAMPLES: usize = 64;
-/// Requests smaller than this say little about the rate of a stream. It is
-/// the smallest read window: the daemon's GETs are never larger than the
-/// window, so a higher floor would keep the window from ever growing.
-const STREAM_MIN: u64 = 128 << 10;
-/// Uploads up to this size are mostly latency (an estimate of it before any GET).
-const SMALL_PUT: u64 = 64 << 10;
+/// A body shorter than this many latencies measures socket buffers and the
+/// start of TCP, not the link: such requests never count for a stream rate
+/// (user decision). The read window is sized so its body takes one latency;
+/// the probe GETs of 4 windows (SPEC.md §6.1) pass this.
+const BODY_LATENCIES: u32 = 2;
+/// Stream rates need at least this many long requests.
+pub const STREAM_SAMPLES_MIN: usize = 8;
+/// Before any latency is known, uploads at least this large are kept, to be
+/// judged once it is.
+const PUT_KEEP: u64 = 1 << 20;
 
 /// Direction of a request, for the regulators.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,15 +41,58 @@ impl Dir {
     }
 }
 
+/// What an estimate stands on, for the statistics page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// Requests that count, and their bytes; fewer than the minimum: not
+    /// enough yet.
+    Samples { n: usize, bytes: u64 },
+    /// The last measurement, no newer samples.
+    Measured,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sources {
+    pub latency: Source,
+    pub read_stream: Source,
+    pub write_stream: Source,
+}
+
 struct Samples {
-    /// GET time to the response headers.
-    ttfb: VecDeque<Duration>,
-    /// Bytes per second of large GET bodies.
-    read_rates: VecDeque<f64>,
-    /// (bytes, whole time) of uploads.
+    /// GET time to the response headers, and its bytes.
+    ttfb: VecDeque<(Duration, u64)>,
+    /// (bytes, body time) of GETs whose body was long.
+    reads: VecDeque<(u64, Duration)>,
+    /// (bytes, whole time) of uploads that may count.
     puts: VecDeque<(u64, Duration)>,
     /// The last measurement: stands for what has no samples since.
     seeded: Chars,
+}
+
+impl Samples {
+    fn latency(&self) -> Option<Duration> {
+        quantile(self.ttfb.iter().map(|&(t, _)| t), 0.5).or(self.seeded.latency)
+    }
+
+    fn long_reads(&self, l: Duration) -> Vec<(u64, Duration)> {
+        self.reads
+            .iter()
+            .copied()
+            .filter(|&(_, body)| body >= l * BODY_LATENCIES)
+            .collect()
+    }
+
+    /// (bytes, body time) of uploads whose body (time − L) was long.
+    fn long_puts(&self, l: Option<Duration>) -> Vec<(u64, Duration)> {
+        let Some(l) = l else { return Vec::new() };
+        self.puts
+            .iter()
+            .filter_map(|&(bytes, t)| {
+                let body = t.checked_sub(l)?;
+                (body >= l * BODY_LATENCIES).then_some((bytes, body))
+            })
+            .collect()
+    }
 }
 
 pub struct Observations {
@@ -71,6 +118,28 @@ fn quantile<T: Copy + PartialOrd>(v: impl Iterator<Item = T>, q: f64) -> Option<
     Some(v[i])
 }
 
+/// p90 of the rates of long requests, if there are enough: concurrent
+/// requests share the link and understate one stream, so not the mean.
+fn stream_rate(long: &[(u64, Duration)]) -> Option<u64> {
+    if long.len() < STREAM_SAMPLES_MIN {
+        return None;
+    }
+    let rates = long
+        .iter()
+        .map(|&(bytes, t)| bytes as f64 / t.as_secs_f64());
+    quantile(rates, 0.9).map(|r| r as u64)
+}
+
+fn source(long: &[(u64, Duration)], seeded: bool) -> Source {
+    if long.len() < STREAM_SAMPLES_MIN && seeded {
+        return Source::Measured;
+    }
+    Source::Samples {
+        n: long.len(),
+        bytes: long.iter().map(|&(b, _)| b).sum(),
+    }
+}
+
 pub static OBS: Observations = Observations::new();
 
 impl Observations {
@@ -78,7 +147,7 @@ impl Observations {
         Self {
             samples: Mutex::new(Samples {
                 ttfb: VecDeque::new(),
-                read_rates: VecDeque::new(),
+                reads: VecDeque::new(),
                 puts: VecDeque::new(),
                 seeded: Chars {
                     latency: None,
@@ -92,18 +161,28 @@ impl Observations {
         }
     }
 
-    /// A GET that succeeded: time to its headers, then its body.
+    /// A GET that succeeded: time to its headers, then its body. Kept for a
+    /// stream rate only if its body was long, so the many short GETs do not
+    /// push the few long ones out.
     pub fn get(&self, ttfb: Duration, bytes: u64, body: Duration) {
         let mut s = self.samples.lock().unwrap();
-        push(&mut s.ttfb, ttfb);
-        if bytes >= STREAM_MIN && !body.is_zero() {
-            push(&mut s.read_rates, bytes as f64 / body.as_secs_f64());
+        push(&mut s.ttfb, (ttfb, bytes));
+        let l = s.latency().unwrap_or(ttfb);
+        if body >= l * BODY_LATENCIES {
+            push(&mut s.reads, (bytes, body));
         }
     }
 
     /// An upload that succeeded (its answer comes only after the body).
     pub fn put(&self, bytes: u64, total: Duration) {
-        push(&mut self.samples.lock().unwrap().puts, (bytes, total));
+        let mut s = self.samples.lock().unwrap();
+        let keep = match s.latency() {
+            Some(l) => total >= l * (BODY_LATENCIES + 1),
+            None => bytes >= PUT_KEEP,
+        };
+        if keep {
+            push(&mut s.puts, (bytes, total));
+        }
     }
 
     pub fn retry(&self, dir: Dir) {
@@ -119,38 +198,22 @@ impl Observations {
     pub fn seed(&self, c: Chars) {
         let mut s = self.samples.lock().unwrap();
         s.ttfb.clear();
-        s.read_rates.clear();
+        s.reads.clear();
         s.puts.clear();
         s.seeded = c;
     }
 
-    /// Latency and the rates of one stream (SPEC.md §6.1); what has no
-    /// samples keeps the seeded value, else `prev`. Totals are `prev`'s.
+    /// Latency and the rates of one stream (SPEC.md §6.1); what has not
+    /// enough samples keeps the measured value, else `prev`. Totals are
+    /// `prev`'s.
     pub fn estimate(&self, prev: Chars) -> Chars {
         let s = self.samples.lock().unwrap();
-        // The median: one slow answer does not move it.
-        let latency = quantile(s.ttfb.iter().copied(), 0.5)
-            .or(s.seeded.latency)
-            .or(prev.latency);
-        // p90: concurrent requests share the link and understate one stream.
-        let read_stream = quantile(s.read_rates.iter().copied(), 0.9)
-            .map(|r| r as u64)
+        let latency = s.latency().or(prev.latency);
+        let read_stream = latency
+            .and_then(|l| stream_rate(&s.long_reads(l)))
             .or(s.seeded.read_stream)
             .or(prev.read_stream);
-        // time = L + size / W₁, L from GETs or the quickest small upload.
-        let l = latency.or_else(|| {
-            s.puts
-                .iter()
-                .filter(|(b, _)| *b <= SMALL_PUT)
-                .map(|(_, t)| *t)
-                .min()
-        });
-        let write_rates = s.puts.iter().filter_map(|&(bytes, t)| {
-            let body = t.checked_sub(l?)?;
-            (bytes >= STREAM_MIN && !body.is_zero()).then(|| bytes as f64 / body.as_secs_f64())
-        });
-        let write_stream = quantile(write_rates, 0.9)
-            .map(|r| r as u64)
+        let write_stream = stream_rate(&s.long_puts(latency))
             .or(s.seeded.write_stream)
             .or(prev.write_stream);
         Chars {
@@ -158,6 +221,26 @@ impl Observations {
             read_stream,
             write_stream,
             ..prev
+        }
+    }
+
+    /// What each estimate stands on.
+    pub fn sources(&self) -> Sources {
+        let s = self.samples.lock().unwrap();
+        let l = s.latency();
+        let latency = if s.ttfb.is_empty() && s.seeded.latency.is_some() {
+            Source::Measured
+        } else {
+            Source::Samples {
+                n: s.ttfb.len(),
+                bytes: s.ttfb.iter().map(|&(_, b)| b).sum(),
+            }
+        };
+        let reads = l.map_or_else(Vec::new, |l| s.long_reads(l));
+        Sources {
+            latency,
+            read_stream: source(&reads, s.seeded.read_stream.is_some()),
+            write_stream: source(&s.long_puts(l), s.seeded.write_stream.is_some()),
         }
     }
 }
@@ -174,6 +257,13 @@ mod tests {
         got.is_some_and(|g| (g as f64 - want).abs() <= want * tolerance)
     }
 
+    /// Small GETs: latency 30 ms.
+    fn with_latency(o: &Observations, n: usize) {
+        for _ in 0..n {
+            o.get(MS(30), 4 * KIB, MS(1));
+        }
+    }
+
     #[test]
     fn latency_is_median_ttfb() {
         let o = Observations::new();
@@ -184,68 +274,102 @@ mod tests {
         assert!((MS(20)..=MS(30)).contains(&l), "{l:?}");
     }
 
+    /// A body shorter than two latencies measures buffers and the start of
+    /// TCP, not the link: such GETs never count, however many.
     #[test]
-    fn read_stream_ignores_small_gets() {
+    fn short_bodies_never_count() {
         let o = Observations::new();
+        with_latency(&o, 8);
+        for _ in 0..50 {
+            o.get(MS(30), 128 * KIB, MS(10));
+        }
         let prev = Chars {
             read_stream: Some(7),
             ..Chars::default()
         };
-        for _ in 0..10 {
-            o.get(MS(30), 4 * KIB, MS(1));
-        }
         assert_eq!(o.estimate(prev).read_stream, Some(7));
+        assert_eq!(o.sources().read_stream, Source::Samples { n: 0, bytes: 0 });
     }
 
-    /// GETs of the smallest read window still feed the estimate: it must be
-    /// able to grow the window from its start value.
     #[test]
-    fn read_stream_counts_unit_sized_gets() {
+    fn long_bodies_count_from_eight() {
         let o = Observations::new();
-        for _ in 0..8 {
-            o.get(MS(30), 128 * KIB, MS(10));
+        with_latency(&o, 8);
+        for _ in 0..7 {
+            o.get(MS(30), 512 * KIB, MS(100));
         }
+        assert_eq!(o.estimate(Chars::default()).read_stream, None);
+        o.get(MS(30), 512 * KIB, MS(100));
         let r = o.estimate(Chars::default()).read_stream;
-        assert!(near(r, 128.0 * KIB as f64 / 0.010, 0.01), "{r:?}");
+        assert!(near(r, 512.0 * KIB as f64 / 0.100, 0.01), "{r:?}");
+        assert_eq!(
+            o.sources().read_stream,
+            Source::Samples {
+                n: 8,
+                bytes: 8 * 512 * KIB
+            }
+        );
+    }
+
+    /// Probes come once in 10 s among many small GETs: these must not push
+    /// them out of the samples.
+    #[test]
+    fn small_gets_do_not_push_out_long_ones() {
+        let o = Observations::new();
+        with_latency(&o, 8);
+        for _ in 0..8 {
+            o.get(MS(30), 512 * KIB, MS(100));
+        }
+        with_latency(&o, 500);
+        assert!(o.estimate(Chars::default()).read_stream.is_some());
     }
 
     #[test]
     fn read_stream_p90() {
         let o = Observations::new();
+        with_latency(&o, 8);
         for i in 1..=64u64 {
-            o.get(MS(30), MIB, MS(10 * i));
+            o.get(MS(30), 4 * MIB, MS(60 + 10 * i));
         }
-        // Rates 1 MiB / (10..640 ms); p90 is the 7th fastest: 1 MiB / 70 ms.
+        // Rates 4 MiB / (70..700 ms); p90 is the 7th fastest: 4 MiB / 130 ms.
         let r = o.estimate(Chars::default()).read_stream;
-        assert!(near(r, MIB as f64 / 0.070, 0.15), "{r:?}");
+        assert!(near(r, 4.0 * MIB as f64 / 0.130, 0.15), "{r:?}");
     }
 
     #[test]
-    fn write_stream_from_line() {
+    fn write_stream_from_long_uploads() {
         let o = Observations::new();
-        for _ in 0..8 {
-            o.get(MS(30), 4 * KIB, MS(1));
+        with_latency(&o, 8);
+        // FUA-sized uploads: all latency, they never count.
+        for _ in 0..50 {
+            o.put(4 * KIB, MS(35));
+        }
+        for _ in 0..7 {
             o.put(4 * MIB, MS(130));
         }
-        let w = o.estimate(Chars::default()).write_stream;
-        assert!(near(w, 40.0 * MIB as f64, 0.05), "{w:?}");
-    }
-
-    #[test]
-    fn write_stream_without_gets_uses_small_puts() {
-        let o = Observations::new();
-        o.put(4 * KIB, MS(30));
+        assert_eq!(o.estimate(Chars::default()).write_stream, None);
         o.put(4 * MIB, MS(130));
         let w = o.estimate(Chars::default()).write_stream;
         assert!(near(w, 40.0 * MIB as f64, 0.05), "{w:?}");
     }
 
     #[test]
-    fn seed_replaces() {
+    fn write_stream_waits_for_a_latency() {
         let o = Observations::new();
         for _ in 0..8 {
-            o.get(MS(30), MIB, MS(100));
+            o.put(16 * MIB, MS(700));
         }
+        // Without a latency the line has no start: nothing yet.
+        assert_eq!(o.estimate(Chars::default()).write_stream, None);
+        with_latency(&o, 8);
+        let w = o.estimate(Chars::default()).write_stream;
+        assert!(near(w, 16.0 * MIB as f64 / 0.670, 0.02), "{w:?}");
+    }
+
+    #[test]
+    fn seed_replaces() {
+        let o = Observations::new();
+        with_latency(&o, 8);
         let seeded = Chars {
             latency: Some(MS(50)),
             read_stream: Some(3 * MIB),
@@ -258,9 +382,17 @@ mod tests {
             (e.latency, e.read_stream, e.write_stream),
             (Some(MS(50)), Some(3 * MIB), Some(2 * MIB))
         );
+        assert_eq!(o.sources().read_stream, Source::Measured);
         // New samples count again.
         o.get(MS(10), 4 * KIB, MS(1));
         assert_eq!(o.estimate(Chars::default()).latency, Some(MS(10)));
+        assert_eq!(
+            o.sources().latency,
+            Source::Samples {
+                n: 1,
+                bytes: 4 * KIB
+            }
+        );
     }
 
     #[test]

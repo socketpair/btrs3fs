@@ -160,6 +160,8 @@
   .lt td.man input[type=text]:disabled { color: var(--muted); background: transparent; }
   .lt td.name small { display: block; color: var(--muted); font-size: 12px; white-space: normal; }
   .lt tr.manual td.eff { font-weight: 600; }
+  .lt td.eff small.src { display: block; color: var(--muted); font-size: 12px; font-weight: 400; white-space: normal; }
+  .lt td.eff small.src.weak { color: var(--warn); }
   #l-yaml { margin: 8px 0 0; padding: 10px 12px; background: var(--bg); border-radius: 4px; overflow-x: auto; font-size: 12.5px; }
   .regs { display: grid; gap: 4px; }
   table.grid { width: 100%; border-collapse: collapse; }
@@ -876,7 +878,9 @@ function linkRows(table, values) {
     const manual = v.manual !== null;
     row.className = manual ? "manual" : "";
     row.querySelector(".auto").textContent = v.key === "read_cache" ? "–" : linkValue(v, v.auto_raw);
-    row.querySelector(".eff").textContent = linkValue(v, v.effective_raw);
+    // The value and what it stands on (set by hand, measured, how many requests).
+    row.querySelector(".eff").innerHTML = esc(linkValue(v, v.effective_raw)) +
+      (v.source ? `<small class="src${/^not enough|^minimum/.test(v.source) ? " weak" : ""}">${esc(v.source)}</small>` : "");
     const box = row.querySelector("input[type=checkbox]"), field = row.querySelector("input[type=text]");
     if (document.activeElement === field || field.dataset.dirty) continue;
     box.checked = manual;

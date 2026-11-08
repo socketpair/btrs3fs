@@ -3,7 +3,7 @@
 //! nine values resolve to (manual where set, auto elsewhere), and runs the
 //! measurement of the statistics page button.
 
-use crate::estimate::{Dir, OBS};
+use crate::estimate::{Dir, OBS, STREAM_SAMPLES_MIN, Source};
 use crate::linkconf;
 use crate::measure;
 use crate::readahead::ReadAhead;
@@ -105,6 +105,8 @@ struct State {
     /// steps in a row it has held.
     pending: Option<((u64, u64), u32)>,
     measure: MeasureState,
+    /// When the last measurement ended well.
+    measured_at: Option<Instant>,
 }
 
 pub struct Autotune {
@@ -129,6 +131,9 @@ pub struct Value {
     pub effective: Option<String>,
     pub auto_raw: Option<f64>,
     pub effective_raw: Option<f64>,
+    /// What the applied value stands on: set by hand, a measurement, how
+    /// many requests, or not enough data yet.
+    pub source: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -191,6 +196,7 @@ impl Autotune {
                 ticks: Ticks::default(),
                 last: None,
                 pending: None,
+                measured_at: None,
                 measure: MeasureState {
                     state: "idle",
                     ..MeasureState::default()
@@ -414,42 +420,93 @@ impl Autotune {
         let size = |v: Option<u64>| v.map(linkconf::size_text);
         let count = |v: Option<usize>| v.map(|n| n.to_string());
         let a = st.chars;
+        let (ad, d, c) = (e.auto_derived, e.derived, e.chars);
+
+        // What each value stands on.
+        let obs = OBS.sources();
+        let measured = || {
+            st.measured_at.map_or("measured".to_string(), |t| {
+                format!("measured {} s ago", t.elapsed().as_secs())
+            })
+        };
+        let stream_src = |src: Source| match src {
+            Source::Measured => measured(),
+            Source::Samples { n, bytes } if n >= STREAM_SAMPLES_MIN => format!(
+                "{n} long requests, {:.1} MiB",
+                bytes as f64 / (1 << 20) as f64
+            ),
+            Source::Samples { n, .. } => format!(
+                "not enough data: {n} of {STREAM_SAMPLES_MIN} requests long enough to show it"
+            ),
+        };
+        let total_src = |r: &Regulator| match (r.best_rate(), st.measured_at) {
+            (Some(_), _) => format!("regulator: best at {} connections", r.limit()),
+            (None, Some(_)) => measured(),
+            (None, None) => "not enough data: needs every connection busy".to_string(),
+        };
+        let latency_src = match obs.latency {
+            Source::Measured => measured(),
+            Source::Samples { n: 0, .. } => "not enough data: no GET yet".to_string(),
+            Source::Samples { n, .. } => format!("median of {n} GETs"),
+        };
+        let formula = |known: bool, what: &str| {
+            if known {
+                what.to_string()
+            } else {
+                format!("minimum: {what} not known yet")
+            }
+        };
+        let regulated = |eff: usize, r: &Regulator| {
+            if eff == r.limit() {
+                format!("regulator: {}", r.phase())
+            } else {
+                "from the characteristics set by hand".to_string()
+            }
+        };
+        let source = |set: bool, auto: String| Some(if set { "set by hand".into() } else { auto });
+
         let mut values = vec![Value {
             key: "latency",
             group: "link",
             unit: "ms",
             auto: dur(a.latency),
             manual: dur(m.chars.latency),
-            effective: dur(e.chars.latency),
+            effective: dur(c.latency),
             auto_raw: ms(a.latency),
-            effective_raw: ms(e.chars.latency),
+            effective_raw: ms(c.latency),
+            source: source(m.chars.latency.is_some(), latency_src),
         }];
-        for (key, auto, manual, eff) in [
+        let rates = [
             (
                 "read_stream",
                 a.read_stream,
                 m.chars.read_stream,
-                e.chars.read_stream,
+                c.read_stream,
+                stream_src(obs.read_stream),
             ),
             (
                 "read_total",
                 a.read_total,
                 m.chars.read_total,
-                e.chars.read_total,
+                c.read_total,
+                total_src(&st.reads),
             ),
             (
                 "write_stream",
                 a.write_stream,
                 m.chars.write_stream,
-                e.chars.write_stream,
+                c.write_stream,
+                stream_src(obs.write_stream),
             ),
             (
                 "write_total",
                 a.write_total,
                 m.chars.write_total,
-                e.chars.write_total,
+                c.write_total,
+                total_src(&st.uploads),
             ),
-        ] {
+        ];
+        for (key, auto, manual, eff, src) in rates {
             values.push(Value {
                 key,
                 group: "link",
@@ -459,18 +516,32 @@ impl Autotune {
                 effective: rate(eff),
                 auto_raw: f(auto),
                 effective_raw: f(eff),
+                source: source(manual.is_some(), src),
             });
         }
-        let (ad, d) = (e.auto_derived, e.derived);
-        for (key, auto, manual, eff) in [
-            ("read_unit", ad.read_unit, m.read_unit, d.read_unit),
+        let windows = [
+            (
+                "read_unit",
+                ad.read_unit,
+                m.read_unit,
+                d.read_unit,
+                formula(
+                    c.latency.is_some() && c.read_stream.is_some(),
+                    "latency × read stream",
+                ),
+            ),
             (
                 "fs_readahead",
                 ad.fs_readahead,
                 m.fs_readahead,
                 d.fs_readahead,
+                formula(
+                    c.latency.is_some() && c.read_total.is_some(),
+                    "4 × latency × total read",
+                ),
             ),
-        ] {
+        ];
+        for (key, auto, manual, eff, src) in windows {
             values.push(Value {
                 key,
                 group: "derived",
@@ -480,12 +551,26 @@ impl Autotune {
                 effective: size(Some(eff)),
                 auto_raw: f(Some(auto)),
                 effective_raw: f(Some(eff)),
+                source: source(manual.is_some(), src),
             });
         }
-        for (key, auto, manual, eff) in [
-            ("uploads", ad.uploads, m.uploads, d.uploads),
-            ("reads", ad.reads, m.reads, d.reads),
-        ] {
+        let connections = [
+            (
+                "uploads",
+                ad.uploads,
+                m.uploads,
+                d.uploads,
+                regulated(d.uploads, &st.uploads),
+            ),
+            (
+                "reads",
+                ad.reads,
+                m.reads,
+                d.reads,
+                regulated(d.reads, &st.reads),
+            ),
+        ];
+        for (key, auto, manual, eff, src) in connections {
             values.push(Value {
                 key,
                 group: "derived",
@@ -495,6 +580,7 @@ impl Autotune {
                 effective: count(Some(eff)),
                 auto_raw: Some(auto as f64),
                 effective_raw: Some(eff as f64),
+                source: source(manual.is_some(), src),
             });
         }
         let cache = m.read_cache.unwrap_or(crate::config::DEFAULT_READ_CACHE);
@@ -507,6 +593,7 @@ impl Autotune {
             effective: size(Some(cache)),
             auto_raw: Some(crate::config::DEFAULT_READ_CACHE as f64),
             effective_raw: Some(cache as f64),
+            source: source(m.read_cache.is_some(), "default".into()),
         });
         let now = now_secs();
         let reg = |r: &Regulator, active: bool| RegulatorState {
@@ -629,6 +716,7 @@ impl Autotune {
                 let d = tuning::resolve(&measured, &Self::auto(&st), self.zone_size).derived;
                 st.uploads.restart_from(d.uploads);
                 st.reads.restart_from(d.reads);
+                st.measured_at = Some(Instant::now());
                 st.measure = MeasureState {
                     state: "done",
                     elapsed_secs: Some(m.elapsed.as_secs_f64()),
@@ -776,6 +864,29 @@ mod tests {
             step();
         }
         assert_eq!(t.engine.get_part(), Some(2 << 20));
+    }
+
+    /// The page says what each auto value stands on.
+    #[tokio::test]
+    async fn values_say_what_they_stand_on() {
+        let t = tuner(Manual::default()).await;
+        let source = |key: &str| {
+            t.snapshot()
+                .values
+                .into_iter()
+                .find(|v| v.key == key)
+                .unwrap()
+                .source
+        };
+        assert!(
+            source("read_stream")
+                .unwrap()
+                .starts_with("not enough data")
+        );
+        assert!(source("read_total").unwrap().starts_with("not enough data"));
+        assert!(source("read_unit").unwrap().contains("minimum"));
+        t.set("read_stream", "4M").unwrap();
+        assert_eq!(source("read_stream").as_deref(), Some("set by hand"));
     }
 
     #[tokio::test]
