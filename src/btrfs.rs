@@ -96,6 +96,8 @@ pub struct Info {
     pub global_rsv_size: Option<u64>,
     pub global_rsv_reserved: Option<u64>,
     pub balance: Balance,
+    /// The automatic removal of empty block groups.
+    pub auto: crate::autobalance::AutoInfo,
     /// The action in progress and how long it runs, seconds.
     pub running: Option<String>,
     pub running_secs: f64,
@@ -106,6 +108,7 @@ pub struct Info {
 pub struct Btrfs {
     device: String,
     action: Mutex<ActionState>,
+    auto: Arc<crate::autobalance::AutoBalance>,
 }
 
 #[derive(Default)]
@@ -126,6 +129,7 @@ impl Btrfs {
         Self {
             device: device.to_string(),
             action: Mutex::default(),
+            auto: Arc::default(),
         }
     }
 
@@ -143,6 +147,11 @@ impl Btrfs {
         }
     }
 
+    /// The automatic removal of empty block groups on this filesystem.
+    pub fn auto(&self) -> Arc<crate::autobalance::AutoBalance> {
+        self.auto.clone()
+    }
+
     /// Where the filesystem on the device is mounted (the top-most mount).
     pub fn mountpoint(&self) -> Option<PathBuf> {
         mount_of(&format!("/dev/{}", self.device))
@@ -151,6 +160,7 @@ impl Btrfs {
     pub fn info(&self) -> Info {
         let mut info = Info {
             device: format!("/dev/{}", self.device),
+            auto: self.auto.info(),
             ..Default::default()
         };
         {
@@ -178,7 +188,8 @@ impl Btrfs {
     /// another action runs or when the filesystem is not mounted.
     pub fn start(self: &Arc<Self>, name: &str) -> Result<(), String> {
         let run: fn(&Path) -> Result<String, String> = match name {
-            "balance" => balance_empty,
+            // The same as the button, started by the daemon (SPEC.md §9.3).
+            "balance" | "autobalance" => balance_empty,
             "syncfs" => sync_fs,
             _ => return Err(format!("unknown action {name}")),
         };
@@ -337,6 +348,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "auto",
                 "balance",
                 "bg_reclaim_threshold",
                 "device",

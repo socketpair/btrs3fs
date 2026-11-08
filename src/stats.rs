@@ -782,7 +782,8 @@ pub fn serve_http(
                         Some(json) => (200, json, "application/json"),
                         None => (404, "no such action\n".into(), "text/plain; charset=utf-8"),
                     },
-                    "/compact" | "/flush" | "/balance" | "/syncfs" | "/link" | "/measure" => {
+                    "/compact" | "/flush" | "/balance" | "/syncfs" | "/link" | "/measure"
+                    | "/autobalance-pause" | "/autobalance-resume" => {
                         (405, "use POST\n".into(), "text/plain; charset=utf-8")
                     }
                     "/" | "/index.html" => (200, PAGE.to_string(), "text/html; charset=utf-8"),

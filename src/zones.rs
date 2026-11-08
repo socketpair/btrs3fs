@@ -1954,6 +1954,13 @@ impl Engine {
         }
     }
 
+    /// Whether zone `zi` holds anything, in S3 or in RAM (not EMPTY).
+    pub fn zone_in_use(&self, zi: usize) -> bool {
+        self.zones
+            .get(zi)
+            .is_some_and(|z| z.state.lock().unwrap().cond != Cond::Empty)
+    }
+
     /// Objects a link measurement may read (SPEC.md §6.1): (key, size) of
     /// every zone stored in exactly one object.
     pub fn measure_candidates(&self) -> Vec<(String, u64)> {
@@ -3467,6 +3474,17 @@ mod tests {
         assert_eq!(read(&e, B, B).await, blk(5, 1).to_vec());
         assert_eq!(gets(), 3);
         assert!(e.set_read_ahead(ra(3 * B)).is_err());
+    }
+
+    #[tokio::test]
+    async fn zone_in_use_means_something_stored_or_buffered() {
+        let e = engine_with(mem()).await;
+        assert!(!e.zone_in_use(1));
+        e.write(ZS, blk(1, 1), false).unwrap();
+        assert!(e.zone_in_use(1));
+        e.reset_zone(ZS).await.unwrap();
+        assert!(!e.zone_in_use(1));
+        assert!(!e.zone_in_use(10_000)); // past the disk
     }
 
     #[tokio::test]

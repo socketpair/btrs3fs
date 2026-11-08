@@ -1,3 +1,4 @@
+mod autobalance;
 mod autotune;
 mod bench;
 mod btrfs;
@@ -438,7 +439,24 @@ fn serve_disk(
     let act_rt = rt.handle().clone();
     let (append, copy_min_part) = (cfg.append, cfg.copy_min_part);
     stats::set_zone_size(cfg.zone_size);
+    let auto_engine = engine.clone();
+    let zone_size = cfg.zone_size;
     let on_ready: device::OnReady = Box::new(move |bdev| {
+        let name = bdev.trim_start_matches("/dev/").to_string();
+        let fs = Arc::new(btrfs::Btrfs::new(&name));
+        // A device of `run` or `mount` (not the temporary one of `create`)
+        // that may write: empty block groups go by themselves (SPEC.md §9.3).
+        if stats_opt.is_some() && !read_only {
+            let auto = fs.auto();
+            let auto_fs = fs.clone();
+            let e = auto_engine.clone();
+            let spawned = std::thread::Builder::new()
+                .name("btrs3fs-autobalance".into())
+                .spawn(move || auto.run(name, auto_fs, e, zone_size));
+            if let Err(e) = spawned {
+                warn!("cannot start the automatic removal of empty block groups: {e}");
+            }
+        }
         let port = stats_opt.filter(|o| !o.no_stats).and_then(|o| {
             o.stats_port.or_else(|| {
                 ublk_dev_id(bdev).and_then(|id| stats::BASE_PORT.checked_add(id.try_into().ok()?))
@@ -446,7 +464,6 @@ fn serve_disk(
         });
         if let Some(port) = port {
             let device = bdev.to_string();
-            let fs = Arc::new(btrfs::Btrfs::new(device.trim_start_matches("/dev/")));
             let json_fs = fs.clone();
             let snap_fs = fs.clone();
             let act_engine = stats_engine.clone();
@@ -499,6 +516,10 @@ fn serve_disk(
                         Ok(()) => r#"{"started":true}"#.to_string(),
                         Err(e) => serde_json::json!({ "error": e }).to_string(),
                     }),
+                    "autobalance-pause" | "autobalance-resume" => {
+                        fs.auto().set_paused(name == "autobalance-pause");
+                        Some(r#"{"ok":true}"#.to_string())
+                    }
                     "compact" => Some(format!("{{\"queued\":{}}}", act_engine.compact_all())),
                     "flush" => {
                         let pending = act_engine.unflushed();

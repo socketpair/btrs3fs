@@ -296,6 +296,68 @@ fn parse_chunk(logical: u64, data: &[u8], physical: u64) -> Option<Chunk> {
     })
 }
 
+/// Device offsets of the block groups that hold nothing (`used == 0`), from
+/// the block group tree; `None` on a filesystem made without one (the extent
+/// tree would have to be read whole to find them).
+pub fn empty_groups(mountpoint: &Path) -> Result<Option<Vec<u64>>, String> {
+    let dir =
+        File::open(mountpoint).map_err(|e| format!("cannot open {}: {e}", mountpoint.display()))?;
+    let fd = dir.as_raw_fd();
+    let mut groups = Vec::new();
+    let searched = tree_search(
+        fd,
+        BLOCK_GROUP_TREE,
+        (0, BLOCK_GROUP_ITEM_KEY, 0),
+        (u64::MAX, BLOCK_GROUP_ITEM_KEY, u64::MAX),
+        |(logical, kind, _), data| {
+            if kind == BLOCK_GROUP_ITEM_KEY
+                && let Some(used) = le64(data, 0)
+            {
+                groups.push((logical, used));
+            }
+        },
+    );
+    if searched.is_err() {
+        return Ok(None);
+    }
+    let mut chunks = Vec::new();
+    tree_search(
+        fd,
+        CHUNK_TREE,
+        (FIRST_CHUNK_TREE_OBJECTID, CHUNK_ITEM_KEY, 0),
+        (FIRST_CHUNK_TREE_OBJECTID, CHUNK_ITEM_KEY, u64::MAX),
+        |(_, kind, logical), data| {
+            if kind == CHUNK_ITEM_KEY {
+                chunks.push((logical, chunk_stripes(data)));
+            }
+        },
+    )?;
+    Ok(Some(empty_offsets(&groups, &chunks)))
+}
+
+/// Device offsets of the stripes of a `struct btrfs_chunk`.
+fn chunk_stripes(data: &[u8]) -> Vec<u64> {
+    let Some(stripes) = data
+        .get(44..46)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+    else {
+        return Vec::new();
+    };
+    (0..stripes)
+        .filter_map(|i| le64(data, 48 + i * 32 + 8))
+        .collect()
+}
+
+/// The stripe offsets of the groups (logical, used) with nothing used.
+fn empty_offsets(groups: &[(u64, u64)], chunks: &[(u64, Vec<u64>)]) -> Vec<u64> {
+    groups
+        .iter()
+        .filter(|&&(_, used)| used == 0)
+        .filter_map(|&(logical, _)| chunks.iter().find(|(l, _)| *l == logical))
+        .flat_map(|(_, stripes)| stripes.iter().copied())
+        .collect()
+}
+
 /// Used bytes of the block group at `logical`: in the extent tree, or in
 /// the block group tree on filesystems made with it.
 fn block_group_used(fd: i32, logical: u64, length: u64) -> Result<Option<u64>, String> {
@@ -700,6 +762,18 @@ mod tests {
 
     fn le(v: u64) -> [u8; 8] {
         v.to_le_bytes()
+    }
+
+    #[test]
+    fn empty_groups_by_device_offset() {
+        let groups = [(1 << 30, 0), (2 << 30, 4096), (3 << 30, 0)];
+        let chunks = [
+            (1 << 30, vec![16 << 20]),
+            (2 << 30, vec![32 << 20]),
+            (3 << 30, vec![48 << 20]),
+        ];
+        assert_eq!(empty_offsets(&groups, &chunks), [16 << 20, 48 << 20]);
+        assert!(empty_offsets(&[(5, 0)], &chunks).is_empty()); // no chunk item
     }
 
     #[test]

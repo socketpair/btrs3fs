@@ -241,6 +241,7 @@
       <button class="btn" data-act="compact" id="btn-compact">Concatenate fragmented zones</button>
       <button class="btn" data-fsact="syncfs">Commit the filesystem</button>
       <button class="btn" data-fsact="balance">Remove empty block groups</button>
+      <button class="btn" id="btn-auto">Pause automatic removal</button>
     </div>
     <div id="b-action" class="note" style="margin-top:8px"></div>
     <p class="note">One cell per zone in disk order, left to right; partly written zones fill from the bottom.
@@ -249,7 +250,8 @@
       merges the S3 objects of every zone that has more than one. “Commit the filesystem” is <code>syncfs()</code>: btrfs
       writes its transaction, so every written file is stored in S3. “Remove empty block groups” is
       <code>btrfs balance start -dusage=0 -musage=0</code> (data, metadata and system): their zones are reset and their S3
-      objects deleted.</p>
+      objects deleted. The daemon runs the same by itself, at most once a minute, when btrfs freed space and an empty
+      block group still holds a zone stored in S3; “Pause automatic removal” stops that until resumed.</p>
   </div>
   <div class="panel" id="b-op" style="margin-top:12px"></div>
   <div class="panel" id="zinfo" hidden></div>
@@ -770,12 +772,27 @@ function renderBtrfs(b) {
     $("b-op").innerHTML = panelTitle("btrfs operation") + `<p class="note">No btrfs on ${esc(b.device)} is mounted.</p>`;
     return;
   }
-  $("b-op").innerHTML = panelTitle("btrfs operation") + kv([["exclusive operation", esc(b.exclusive_operation || "none")],
+  const a = b.auto || {};
+  autoPaused = !!a.paused;
+  $("btn-auto").textContent = autoPaused ? "Resume automatic removal" : "Pause automatic removal";
+  const autoLine = (a.paused ? "paused" : "on") +
+    (a.last_run_secs_ago == null ? " · not run yet" : ` · last ${span(a.last_run_secs_ago)} ago, ${num(a.last_groups)} empty groups`);
+  $("b-op").innerHTML = panelTitle("btrfs operation") + kv([["automatic removal of empty groups", autoLine],
+    ["exclusive operation", esc(b.exclusive_operation || "none")],
     ["balance", b.balance.running ? `${num(b.balance.completed)} of ${num(b.balance.expected)} block groups` : "not running"],
     ["global reserve", `${bytes(b.global_rsv_reserved)} of ${bytes(b.global_rsv_size)}`],
     ["reclaim starts at", b.bg_reclaim_threshold === null ? "–" : `${num(b.bg_reclaim_threshold)}% allocated`]]);
 }
 const panelTitle = t => `<div class="title">${t}</div>`;
+let autoPaused = false;
+$("btn-auto").onclick = async () => {
+  const pause = !autoPaused;
+  try {
+    await post(pause ? "autobalance-pause" : "autobalance-resume");
+    toast(pause ? "Automatic removal of empty block groups paused." : "Automatic removal of empty block groups resumed.");
+  } catch (e) { toast(`${$("btn-auto").textContent} failed: ${e.message}`, true); }
+  tickBtrfs();
+};
 
 /* ---------- actions ---------- */
 /* The answer of an action; a refusal ({"error": ...}) is thrown like a failure. */
