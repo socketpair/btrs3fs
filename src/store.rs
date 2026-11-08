@@ -457,9 +457,9 @@ pub struct Layout {
 
 impl Layout {
     pub fn new(prefix: &str) -> anyhow::Result<Self> {
-        let prefix = prefix.trim_end_matches('/');
+        // `qwe`, `qwe/`, `/qwe` and `/qwe/` are one disk (user decision).
+        let prefix = prefix.trim_matches('/');
         anyhow::ensure!(!prefix.is_empty(), "prefix must not be empty");
-        anyhow::ensure!(!prefix.starts_with('/'), "prefix must not start with '/'");
         // `.` and `..` are folded by URL parsing after signing (the signature
         // then fails); empty parts and control characters make odd keys.
         anyhow::ensure!(
@@ -667,8 +667,12 @@ mod tests {
 
     #[test]
     fn prefixes() {
-        assert!(Layout::new("disks/data/").is_ok());
-        for bad in ["", "/a", "a//b", "a/./b", "a/..", "a\nb"] {
+        // Slashes around the prefix mean nothing: all of these are one disk.
+        for same in ["qwe", "qwe/", "/qwe", "/qwe/", "//qwe//"] {
+            assert_eq!(Layout::new(same).unwrap().prefix(), "qwe", "{same:?}");
+        }
+        assert_eq!(Layout::new("/a/b/").unwrap().prefix(), "a/b");
+        for bad in ["", "/", "//", "a//b", "a/./b", "a/..", "a\nb"] {
             assert!(Layout::new(bad).is_err(), "{bad:?}");
         }
     }
