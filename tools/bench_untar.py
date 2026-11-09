@@ -45,6 +45,9 @@ from datetime import datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+# Mount options of the FUSE filesystems, as btrs3fs mounts btrfs (user
+# decision): fusermount3 passes both to the kernel.
+FUSE_OPTIONS = "noatime,lazytime"
 BENCH_DIR = "bench-untar"  # only this directory is cleaned on the tested filesystems
 WORKLOADS = ("untar", "tar")
 
@@ -68,6 +71,21 @@ def syncfs(path):
             raise OSError(e, f"syncfs({path}): {os.strerror(e)}")
     finally:
         os.close(fd)
+
+
+def check_fuse_options(mnt):
+    """Both options took effect: noatime is a mount flag, lazytime one of the
+    superblock (/proc/self/mountinfo fields 6 and 11)."""
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        left, _, right = line.partition(" - ")
+        f = left.split()
+        if f[4] == str(mnt):
+            opts = set(f[5].split(",")) | set(right.split()[2].split(","))
+            missing = set(FUSE_OPTIONS.split(",")) - opts
+            if missing:
+                sys.exit(f"{mnt} is mounted without {sorted(missing)}")
+            return
+    sys.exit(f"{mnt} is not mounted")
 
 
 def warm_page_cache(archive):
@@ -222,12 +240,13 @@ class Geesefs:
     def mount(self):
         n = str(self.uploads)
         cmd = [str(self.a.geesefs_bin), "--endpoint", self.endpoint, "--region", self.region,
-               "--max-flushers", n, "--max-parallel-parts", n,
+               "--max-flushers", n, "--max-parallel-parts", n, "-o", FUSE_OPTIONS,
                "--log-file", str(self.a.out / "geesefs.log"),
                self.source, str(self.a.geesefs_mnt)]
         # The keys stay in the environment and out of the printed command.
         log("$ " + " ".join(cmd))
         subprocess.run(cmd, check=True, env=self.env)  # returns once mounted
+        check_fuse_options(self.a.geesefs_mnt)
 
     def unmount(self, timeout=3600):
         """fusermount3 -u and wait for geesefs to finish uploading and exit."""
@@ -333,10 +352,11 @@ enabled = false
         self.server = self.start([str(self.a.zerofs_bin), "run", "-c", str(self.config)],
                                  "zerofs-server.log", lambda: self.sock.exists() and self.rpc.exists(),
                                  "zerofs server")
-        self.client = self.start([str(self.a.zerofs_bin), "mount", f"unix:{self.sock}",
+        self.client = self.start([str(self.a.zerofs_bin), "mount", "-o", FUSE_OPTIONS, f"unix:{self.sock}",
                                   str(self.a.zerofs_mnt)],
                                  "zerofs-mount.log", lambda: os.path.ismount(self.a.zerofs_mnt),
                                  "zerofs mount")
+        check_fuse_options(self.a.zerofs_mnt)
 
     @staticmethod
     def wait(proc, what, timeout=3600):
@@ -394,7 +414,7 @@ enabled = false
     def finish(self):
         if self.server is not None and (self.client is None or self.client.poll() is not None):
             # Mounted again for the user, like geesefs.
-            self.client = self.start([str(self.a.zerofs_bin), "mount", f"unix:{self.sock}",
+            self.client = self.start([str(self.a.zerofs_bin), "mount", "-o", FUSE_OPTIONS, f"unix:{self.sock}",
                                       str(self.a.zerofs_mnt)],
                                      "zerofs-mount.log", lambda: os.path.ismount(self.a.zerofs_mnt),
                                      "zerofs mount")
