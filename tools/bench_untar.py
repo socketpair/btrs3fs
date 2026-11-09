@@ -12,10 +12,10 @@ into one tar file (tar: one large file):
                                              the unmount and only then exits;
                                              the clock stops at its exit)
   zerofs   write -> syncfs() -> unmount -> `zerofs flush`
-                                            (the FUSE client hands its write-back
-                                             cache to the server on unmount; the
-                                             flush returns once the server has
-                                             put everything into S3)
+                                            (SIGTERM to the FUSE client: it unmounts
+                                             and hands its write-back cache to the
+                                             server; the flush returns once the
+                                             server has put everything into S3)
 
 Not measured: deleting the previous run, the syncfs after it and the
 background work of btrs3fs (balance of empty block groups, concatenation
@@ -346,9 +346,14 @@ enabled = false
             raise TimeoutError(f"{what} still running {timeout} s later")
 
     def unmount(self):
-        """fusermount3 -u and wait for the client to hand everything over and exit."""
-        subprocess.run(["fusermount3", "-u", str(self.a.zerofs_mnt)], check=True)
+        """SIGTERM to the client and wait for it to exit: it unmounts and serves
+        the kernel's write-back of dirty pages until done. An unmount from
+        outside (fusermount3 -u) leaves `zerofs mount` running: it ends only
+        on a signal, as its CSI plugin does it."""
+        self.client.send_signal(signal.SIGTERM)
         self.wait(self.client, "zerofs mount")
+        if os.path.ismount(self.a.zerofs_mnt):
+            raise RuntimeError(f"{self.a.zerofs_mnt} is still mounted after zerofs mount exited")
 
     def down(self):
         """Unmount, then stop the server gracefully (it flushes everything)."""
