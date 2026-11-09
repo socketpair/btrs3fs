@@ -144,17 +144,21 @@ pub struct ZoneInfo {
 /// `/zones.json`: per zone, in zone order. Sizes in blocks keep it small.
 #[derive(serde::Serialize)]
 pub struct ZoneMap {
+    #[serde(rename = "zone_size_bytes")]
     pub zone_size: u64,
+    #[serde(rename = "block_size_bytes")]
     pub block_size: u64,
     /// One letter per zone: `e`mpty, `o`pen, `c`losed, `f`ull.
     pub cond: String,
     /// One letter per zone: `d`ata, `m`etadata, `u`nknown (no request since start).
     pub kind: String,
     /// Blocks holding data (stored or in RAM).
+    #[serde(rename = "used_blocks")]
     pub used: Vec<u32>,
     /// S3 objects serving the zone.
     pub objects: Vec<u32>,
     /// Blocks in RAM, not stored yet.
+    #[serde(rename = "buffered_blocks")]
     pub buffered: Vec<u32>,
 }
 
@@ -163,14 +167,19 @@ pub struct ZoneMap {
 pub struct ZoneDetail {
     pub index: usize,
     /// Byte offset on the device.
+    #[serde(rename = "start_bytes")]
     pub start: u64,
+    #[serde(rename = "size_bytes")]
     pub size: u64,
     pub cond: &'static str,
     /// Bytes written by the kernel (stored or in RAM).
+    #[serde(rename = "written_bytes")]
     pub written: u64,
     /// Bytes confirmed by S3.
+    #[serde(rename = "stored_bytes")]
     pub stored: u64,
     /// Bytes in RAM, not in S3 yet.
+    #[serde(rename = "buffered_bytes")]
     pub buffered: u64,
     pub kind: &'static str,
     /// S3 objects serving the zone and its markers (`from = to = 0`).
@@ -192,9 +201,12 @@ pub struct ZoneDetail {
 pub struct ObjectDetail {
     pub key: String,
     /// Object size; 0 for markers.
+    #[serde(rename = "size_bytes")]
     pub size: u64,
     /// Zone bytes `[from, to)` the object serves.
+    #[serde(rename = "from_bytes")]
     pub from: u64,
+    #[serde(rename = "to_bytes")]
     pub to: u64,
 }
 
@@ -685,9 +697,9 @@ impl Engine {
         let cache = ReadCache::new(ra).map(Arc::new);
         if let Some(c) = &cache {
             info!(
-                "read-ahead: {} byte windows, {} bytes of cache",
-                c.window(),
-                ra.cache
+                "read-ahead: {} windows, {} of cache",
+                crate::units::size(c.window()),
+                crate::units::size(ra.cache)
             );
         }
         *self.read_cache.lock().unwrap() = cache;

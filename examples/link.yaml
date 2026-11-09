@@ -8,27 +8,29 @@
 # ready file with the current manual values. `btrs3fs measure` prints the five
 # link characteristics in this format.
 #
-# Units: durations as 38ms / 2s; sizes and rates (per second) as 24M = 24 MiB,
-# 512K, 1G; counts as plain numbers.
+# Units are required (SPEC.md §9.5): durations as 38 ms / 2 s; rates per second
+# in bits (300 Mbit/s, 1.2 Gbit/s) or bytes (40 MB/s, 37 MiB/s); sizes as
+# 512 KiB, 16 MiB (binary) or 5 MB (decimal); counts as plain numbers.
+# A bare letter (24M, 512K) is an error.
 
 # --- Characteristics of the link to S3 ---
 
 # Time to the first byte of a small GET.
-latency: 38ms
+latency: 38 ms
 # Rate of one GET after its first byte.
-read_stream: 33M
+read_stream: 277 Mbit/s
 # Rate of all GETs together.
 read_total: null
 # Rate of one PUT after its first byte.
-write_stream: 24M
+write_stream: 201 Mbit/s
 # Rate of all PUTs together; absent = auto.
-# write_total: 24M
+# write_total: 201 Mbit/s
 
 # --- Derived (computed from the above when null) ---
 
-# Read-ahead window and part size of large reads (power of two, 128K..4M).
+# Read-ahead window and part size of large reads (power of two, 128 KiB..4 MiB).
 read_unit: null
-# btrfs readahead window, bdi/read_ahead_kb (4M..256M).
+# btrfs readahead window, bdi/read_ahead_kb (4 MiB..256 MiB).
 fs_readahead: null
 # Parallel uploads (1..64); auto = adaptive, starting from 1.
 uploads: 8
@@ -37,5 +39,5 @@ reads: null
 
 # --- Memory ---
 
-# RAM for read-ahead windows; 0 disables them. Manual only (default 64M).
-read_cache: 64M
+# RAM for read-ahead windows; 0 disables them. Manual only (default 64 MiB).
+read_cache: 64 MiB

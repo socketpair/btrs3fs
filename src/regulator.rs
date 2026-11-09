@@ -171,9 +171,9 @@ impl Regulator {
                     self.back_off(
                         now,
                         format!(
-                            "throughput fell to {:.0}% of {:.1} MiB/s",
+                            "throughput fell to {:.0}% of {}",
                             rate / best * 100.0,
-                            best / (1 << 20) as f64
+                            crate::units::bitrate(best as u64)
                         ),
                     );
                     return self.limit;

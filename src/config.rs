@@ -297,42 +297,6 @@ impl fmt::Debug for Creds {
     }
 }
 
-/// Parses sizes like `10G`, `32M`, `4096`, `1.5T` (binary units).
-pub fn parse_size(s: &str) -> anyhow::Result<u64> {
-    let s = s.trim();
-    let (num, mult) = match s.char_indices().find(|(_, c)| c.is_ascii_alphabetic()) {
-        None => (s, 1u64),
-        Some((i, _)) => {
-            let unit = s[i..].to_ascii_uppercase();
-            let mult = match unit.trim_end_matches("IB").trim_end_matches('B') {
-                "" => 1,
-                "K" => 1 << 10,
-                "M" => 1 << 20,
-                "G" => 1 << 30,
-                "T" => 1 << 40,
-                _ => bail!("unknown size unit in {s:?}"),
-            };
-            (&s[..i], mult)
-        }
-    };
-    let value: f64 = num
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid size {s:?}"))?;
-    ensure!(value >= 0.0, "size must not be negative: {s:?}");
-    let bytes = value * mult as f64;
-    ensure!(
-        bytes.fract() == 0.0,
-        "size {s:?} is not a whole number of bytes"
-    );
-    // 2^64 exactly: `u64::MAX as f64` rounds up to it.
-    ensure!(
-        bytes < 18_446_744_073_709_551_616.0,
-        "size {s:?} is too large"
-    );
-    Ok(bytes as u64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,16 +465,5 @@ mod tests {
             serde_norway::from_str(include_str!("../examples/creds.yaml")).unwrap();
         assert!(example.secret_key.contains("SECRET"));
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn sizes() {
-        assert_eq!(parse_size("4096").unwrap(), 4096);
-        assert_eq!(parse_size("32M").unwrap(), 32 << 20);
-        assert_eq!(parse_size("10GiB").unwrap(), 10 << 30);
-        assert_eq!(parse_size("1.5k").unwrap(), 1536);
-        assert!(parse_size("12X").is_err());
-        assert!(parse_size("20000000T").is_err()); // past 2^64
-        assert!(parse_size("99999999999999999999").is_err());
     }
 }

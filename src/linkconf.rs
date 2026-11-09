@@ -3,18 +3,28 @@
 //! `serde_norway`, written by hand so the output carries comments.
 
 use crate::tuning::Manual;
+use crate::units;
 use anyhow::Context;
 use serde::Deserialize;
 use std::path::Path;
-use std::time::Duration;
 
 /// A value as written: YAML gives counts as numbers and sizes, rates and
-/// durations as strings (`24M`, `38ms`); a bare number is bytes.
+/// durations as strings with a unit (`16 MiB`, `300 Mbit/s`, `38 ms`,
+/// SPEC.md §9.5); a bare number is a count, or a zero size.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum Value {
     Number(u64),
     Text(String),
+}
+
+impl Value {
+    fn text(self) -> String {
+        match self {
+            Value::Number(n) => n.to_string(),
+            Value::Text(t) => t,
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -42,14 +52,17 @@ pub fn parse(text: &str) -> anyhow::Result<Manual> {
     // An empty document (or comments only) is null to YAML: all auto.
     let file: Option<File> = serde_norway::from_str(text)?;
     let f = file.unwrap_or_default();
-    let size = |key: &str, v: Option<Value>| -> anyhow::Result<Option<u64>> {
-        v.map(|v| match v {
-            Value::Number(n) => Ok(n),
-            Value::Text(t) => crate::config::parse_size(&t),
-        })
-        .transpose()
-        .with_context(|| key.to_string())
-    };
+    fn each<T>(
+        key: &str,
+        v: Option<Value>,
+        parse: impl Fn(&str) -> anyhow::Result<T>,
+    ) -> anyhow::Result<Option<T>> {
+        v.map(|v| parse(&v.text()))
+            .transpose()
+            .with_context(|| key.to_string())
+    }
+    let size = |key, v| each(key, v, units::parse_size);
+    let rate = |key, v| each(key, v, units::parse_rate);
     let count = |key: &str, v: Option<Value>| -> anyhow::Result<Option<usize>> {
         v.map(|v| match v {
             Value::Number(n) => usize::try_from(n).map_err(anyhow::Error::from),
@@ -58,21 +71,14 @@ pub fn parse(text: &str) -> anyhow::Result<Manual> {
         .transpose()
         .with_context(|| key.to_string())
     };
-    let latency = f
-        .latency
-        .map(|v| match v {
-            Value::Text(t) => crate::tuning::parse_duration(&t),
-            Value::Number(_) => Err(anyhow::anyhow!("a duration needs a unit: ms or s")),
-        })
-        .transpose()
-        .context("latency")?;
+    let latency = each("latency", f.latency, units::parse_duration)?;
     Ok(Manual {
         chars: crate::tuning::Chars {
             latency,
-            read_stream: size("read_stream", f.read_stream)?,
-            read_total: size("read_total", f.read_total)?,
-            write_stream: size("write_stream", f.write_stream)?,
-            write_total: size("write_total", f.write_total)?,
+            read_stream: rate("read_stream", f.read_stream)?,
+            read_total: rate("read_total", f.read_total)?,
+            write_stream: rate("write_stream", f.write_stream)?,
+            write_total: rate("write_total", f.write_total)?,
         },
         read_unit: size("read_unit", f.read_unit)?,
         fs_readahead: size("fs_readahead", f.fs_readahead)?,
@@ -80,41 +86,6 @@ pub fn parse(text: &str) -> anyhow::Result<Manual> {
         reads: count("reads", f.reads)?,
         read_cache: size("read_cache", f.read_cache)?,
     })
-}
-
-/// `24M`, `512K`, or bytes when not a whole number of KiB.
-pub fn size_text(bytes: u64) -> String {
-    const KIB: u64 = 1 << 10;
-    const MIB: u64 = 1 << 20;
-    const GIB: u64 = 1 << 30;
-    match bytes {
-        0 => "0".into(),
-        b if b.is_multiple_of(GIB) => format!("{}G", b / GIB),
-        b if b.is_multiple_of(MIB) => format!("{}M", b / MIB),
-        b if b.is_multiple_of(KIB) => format!("{}K", b / KIB),
-        b => b.to_string(),
-    }
-}
-
-/// Whole seconds, else milliseconds to one decimal: a latency needs no more.
-pub fn duration_text(d: Duration) -> String {
-    if d.subsec_nanos() == 0 {
-        format!("{}s", d.as_secs())
-    } else {
-        let ms = (d.as_secs_f64() * 1e4).round() / 10.0;
-        format!("{ms}ms")
-    }
-}
-
-/// A rate as an estimate: whole MiB/s from 10 MiB/s, else whole KiB/s.
-pub fn rate_text(bytes: u64) -> String {
-    const KIB: u64 = 1 << 10;
-    const MIB: u64 = 1 << 20;
-    if bytes >= 10 * MIB {
-        format!("{}M", (bytes + MIB / 2) / MIB)
-    } else {
-        format!("{}K", ((bytes + KIB / 2) / KIB).max(1))
-    }
 }
 
 /// The manual values as a `--link-config` file; auto keys are `null`.
@@ -126,7 +97,7 @@ pub fn render(m: &Manual) -> String {
     format!(
         "# btrs3fs link settings for `mount --link-config` (SPEC.md §6.1).\n\
          # null = auto: estimated from the daemon's own S3 traffic.\n\
-         # Characteristics of the link to S3; rates are per second.\n\
+         # Characteristics of the link to S3; units as in SPEC.md §9.5.\n\
          latency: {}\n\
          read_stream: {}\n\
          read_total: {}\n\
@@ -137,24 +108,25 @@ pub fn render(m: &Manual) -> String {
          fs_readahead: {}\n\
          uploads: {}\n\
          reads: {}\n\
-         # RAM for read-ahead windows (null = 64M, 0 = none).\n\
+         # RAM for read-ahead windows (null = 64 MiB, 0 = none).\n\
          read_cache: {}\n",
-        or_null(c.latency, duration_text),
-        or_null(c.read_stream, rate_text),
-        or_null(c.read_total, rate_text),
-        or_null(c.write_stream, rate_text),
-        or_null(c.write_total, rate_text),
-        or_null(m.read_unit, size_text),
-        or_null(m.fs_readahead, size_text),
+        or_null(c.latency, units::duration),
+        or_null(c.read_stream, units::bitrate),
+        or_null(c.read_total, units::bitrate),
+        or_null(c.write_stream, units::bitrate),
+        or_null(c.write_total, units::bitrate),
+        or_null(m.read_unit, units::size_exact),
+        or_null(m.fs_readahead, units::size_exact),
         or_null(m.uploads, |n| n.to_string()),
         or_null(m.reads, |n| n.to_string()),
-        or_null(m.read_cache, size_text),
+        or_null(m.read_cache, units::size_exact),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const MIB: u64 = 1 << 20;
 
@@ -162,9 +134,9 @@ mod tests {
     fn example_parses() {
         let m = parse(include_str!("../examples/link.yaml")).unwrap();
         assert_eq!(m.chars.latency, Some(Duration::from_millis(38)));
-        assert_eq!(m.chars.read_stream, Some(33 * MIB));
+        assert_eq!(m.chars.read_stream, Some(34_625_000)); // 277 Mbit/s
         assert_eq!(m.chars.read_total, None);
-        assert_eq!(m.chars.write_stream, Some(24 * MIB));
+        assert_eq!(m.chars.write_stream, Some(25_125_000)); // 201 Mbit/s
         assert_eq!(m.chars.write_total, None);
         assert_eq!(m.uploads, Some(8));
         assert_eq!(m.reads, None);
@@ -191,6 +163,18 @@ mod tests {
         assert!(e.contains("latency"), "{e}");
         assert!(parse("uploads: many").is_err());
         assert!(parse("uploads: -1").is_err());
+        // The old format without units (SPEC.md §9.5).
+        for old in [
+            "read_stream: 38M",
+            "read_unit: 128K",
+            "read_cache: 64M",
+            "latency: 38",
+        ] {
+            let e = format!("{:#}", parse(old).unwrap_err());
+            assert!(e.contains("unit"), "{old}: {e}");
+        }
+        assert!(parse("read_stream: 38MiB").is_err()); // a rate needs /s
+        assert_eq!(parse("read_cache: 0").unwrap().read_cache, Some(0));
     }
 
     #[test]
@@ -219,9 +203,9 @@ mod tests {
             ..Manual::default()
         };
         let text = render(&m);
-        assert!(text.contains("latency: 108.1ms"), "{text}");
-        assert!(text.contains("read_stream: 7255K"), "{text}");
-        assert!(text.contains("read_total: 33M"), "{text}");
+        assert!(text.contains("latency: 108.1 ms"), "{text}");
+        assert!(text.contains("read_stream: 59.4 Mbit/s"), "{text}");
+        assert!(text.contains("read_total: 279 Mbit/s"), "{text}");
         assert!(parse(&text).is_ok());
     }
 

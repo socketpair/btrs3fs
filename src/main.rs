@@ -18,12 +18,13 @@ mod s3;
 mod stats;
 mod store;
 mod tuning;
+mod units;
 mod zones;
 
 use anyhow::{Context, bail, ensure};
 use bytes::Bytes;
 use clap::{Args, Parser, Subcommand};
-use config::{DiskConfig, parse_size};
+use config::DiskConfig;
 use log::{error, info, warn};
 use s3::{RetryPolicy, S3Store, Transport};
 use std::fs::File;
@@ -36,6 +37,7 @@ use std::time::{Duration, Instant};
 use store::{Backend, Body, Layout, MemStore, Store};
 use tokio::runtime::Runtime;
 use tuning::Manual;
+use units::parse_size;
 use zones::Engine;
 
 /// btrfs mount options always used by `mount`: user decision (SPEC.md §9.2);
@@ -101,7 +103,7 @@ struct BenchArgs {
     #[arg(long, value_delimiter = ',', default_values_t = [256u64, 1024])]
     appends: Vec<u64>,
     /// Bytes per append (one write + fsync of btrfs).
-    #[arg(long, value_parser = parse_size, default_value = "4K")]
+    #[arg(long, value_parser = parse_size, default_value = "4KiB")]
     piece: u64,
     /// Reads of each object.
     #[arg(long, default_value_t = 3)]
@@ -110,7 +112,7 @@ struct BenchArgs {
     #[arg(long, default_value_t = 8)]
     parallel: usize,
     /// Part size of reads in parts (the daemon's read window).
-    #[arg(long, value_parser = parse_size, default_value = "128K")]
+    #[arg(long, value_parser = parse_size, default_value = "128KiB")]
     part: u64,
 }
 
@@ -130,10 +132,10 @@ struct DiskArgs {
 struct CreateArgs {
     #[command(flatten)]
     disk: DiskArgs,
-    /// Disk size, e.g. 10G.
+    /// Disk size with a unit, e.g. 10GiB or 100GB.
     #[arg(long, value_parser = parse_size)]
     size: u64,
-    /// Zone size, a power of two up to 32M [default: 16M].
+    /// Zone size, a power of two up to 32MiB [default: 16MiB].
     #[arg(long, value_parser = parse_size)]
     zone_size: Option<u64>,
     #[arg(long, value_parser = parse_size)]
@@ -222,7 +224,7 @@ struct RunArgs {
     /// Disk size for --memory.
     #[arg(long, value_parser = parse_size)]
     size: Option<u64>,
-    /// Zone size for --memory [default: 16M].
+    /// Zone size for --memory [default: 16MiB].
     #[arg(long, value_parser = parse_size)]
     zone_size: Option<u64>,
     /// ublk device id: the device is /dev/ublkb<dev-id>.
@@ -387,11 +389,11 @@ fn serve_disk(
         tuning::validate(m, cfg.zone_size)?;
     }
     info!(
-        "disk {}: {} bytes, {} zones of {} bytes",
+        "disk {}: {}, {} zones of {}",
         layout.dir(),
-        cfg.disk_size,
+        units::size(cfg.disk_size),
         cfg.nr_zones(),
-        cfg.zone_size
+        units::size(cfg.zone_size)
     );
     let disk = layout.dir();
     let store = if read_only {
@@ -525,7 +527,8 @@ fn serve_disk(
                         let pending = act_engine.unflushed();
                         let bytes: u64 = pending.iter().map(|&(_, b)| b).sum();
                         info!(
-                            "statistics page: uploading {bytes} buffered bytes of {} zones",
+                            "statistics page: uploading {} buffered in {} zones",
+                            units::size(bytes),
                             pending.len()
                         );
                         let e = act_engine.clone();
@@ -652,7 +655,8 @@ fn report_discarded(engine: &Engine) {
     }
     let bytes: u64 = pending.iter().map(|&(_, b)| b).sum();
     info!(
-        "not storing {bytes} bytes in {} zones: they were never flushed from userspace (no fsync/FLUSH)",
+        "not storing {} in {} zones: they were never flushed from userspace (no fsync/FLUSH)",
+        units::size(bytes),
         pending.len()
     );
 }
@@ -1065,11 +1069,11 @@ fn cmd_create(a: CreateArgs) -> anyhow::Result<i32> {
     })?;
     let s3 = s3.with_append(cfg.append);
     info!(
-        "created {}: {} bytes, {} zones of {} bytes",
+        "created {}: {}, {} zones of {}",
         layout.config_key(),
-        cfg.disk_size,
+        units::size(cfg.disk_size),
         cfg.nr_zones(),
-        cfg.zone_size
+        units::size(cfg.zone_size)
     );
 
     if let Err(e) = format_disk(&cfg, &layout, &s3) {

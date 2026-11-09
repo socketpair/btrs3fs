@@ -344,15 +344,6 @@ where
     Ok((bytes > 0).then(|| (bytes as f64 / secs) as u64))
 }
 
-/// A rate as `parse_size` reads it back: whole MiB, or KiB below 10 MiB.
-pub fn rate_flag(bytes: u64) -> String {
-    if bytes >= 10 * MIB {
-        format!("{}M", bytes / MIB)
-    } else {
-        format!("{}K", (bytes / KIB).max(1))
-    }
-}
-
 /// Report for the admin: what was measured, what the daemon would derive,
 /// and a `--link-config` file with the measured characteristics.
 pub fn report(m: &Measured) -> String {
@@ -371,7 +362,7 @@ pub fn report(m: &Measured) -> String {
         zone,
     )
     .derived;
-    let rate = |r: Option<u64>| r.map_or("not measured".into(), |r| format!("{}/s", rate_flag(r)));
+    let rate = |r: Option<u64>| r.map_or("not measured".into(), crate::units::bitrate);
     let skipped = if m.skipped.is_empty() {
         String::new()
     } else {
@@ -386,18 +377,17 @@ pub fn report(m: &Measured) -> String {
          #   latency (first byte of a small GET): {}, p90 {}\n\
          #   read:  one stream {}, all together {}\n\
          #   write: one stream {}, all together {}\n\
-         #   for a {} MiB zone the daemon would derive: {}{}\n\
+         #   for a {} zone the daemon would derive: {}{}\n\
          # Save as a file for `mount --link-config`:\n{yaml}",
         m.elapsed.as_secs_f64(),
         c.latency
-            .map_or("not measured".into(), |l| format!("{} ms", l.as_millis())),
-        m.latency_p90
-            .map_or("–".into(), |l| format!("{} ms", l.as_millis())),
+            .map_or("not measured".into(), crate::units::duration),
+        m.latency_p90.map_or("–".into(), crate::units::duration),
         rate(c.read_stream),
         rate(c.read_total),
         rate(c.write_stream),
         rate(c.write_total),
-        zone / MIB,
+        crate::units::size(zone),
         derived,
         skipped.replace('\n', "\n# "),
     )
@@ -406,7 +396,6 @@ pub fn report(m: &Measured) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::parse_size;
 
     #[tokio::test]
     async fn no_candidates_skips_reads() {
@@ -437,14 +426,6 @@ mod tests {
                 "write_total"
             ]
         );
-    }
-
-    #[test]
-    fn rate_flags_parse_back() {
-        for (bytes, flag) in [(55 * MIB, "55M"), (3 * MIB + 7, "3072K"), (100, "1K")] {
-            assert_eq!(rate_flag(bytes), flag);
-            assert!(parse_size(flag).unwrap() <= bytes.max(KIB));
-        }
     }
 
     #[test]

@@ -131,7 +131,7 @@ class Btrs3fs:
     def uploads(self):
         for v in self.get("link.json")["values"]:
             if v["key"] == "uploads":
-                return int(v["effective_raw"])
+                return int(v["effective"])
         raise RuntimeError("link.json has no uploads value")
 
     def pause_auto(self):

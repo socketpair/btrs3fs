@@ -266,7 +266,7 @@ fn set_max_request(bdev: &str, bytes: u64) {
     };
     let path = format!("/sys/block/{name}/queue/max_sectors_kb");
     match write_sysfs(&path, (bytes >> 10).to_string()) {
-        Ok(()) => info!("{path}: requests up to {bytes} bytes"),
+        Ok(()) => info!("{path}: requests up to {}", crate::units::size(bytes)),
         Err(e) => warn!("cannot set request size in {path}: {e}"),
     }
 }
@@ -299,7 +299,11 @@ fn keep_fs_tuned(name: &str, readahead: Option<Arc<AtomicU64>>, reclaim: bool) {
             if target > 0 && done.get(&fs) != Some(&target) {
                 let path = fs.join("bdi/read_ahead_kb");
                 match write_sysfs(&path, (target >> 10).to_string()) {
-                    Ok(()) => info!("{}: btrfs readahead set to {target} bytes", path.display()),
+                    Ok(()) => info!(
+                        "{}: btrfs readahead set to {}",
+                        path.display(),
+                        crate::units::size(target)
+                    ),
                     Err(e) => warn!("cannot set btrfs readahead in {}: {e}", path.display()),
                 }
             }

@@ -118,19 +118,18 @@ pub struct Autotune {
     st: Mutex<State>,
 }
 
-/// One of the values on the page: as file text, and raw for charts.
+/// One of the values on the page, in the base unit of `unit` (SPEC.md §9.5):
+/// the page formats it.
 #[derive(Serialize, Clone, Debug)]
 pub struct Value {
     pub key: &'static str,
     /// link, derived or memory.
     pub group: &'static str,
-    /// ms, bytes, bytes/s or count.
+    /// ms, bytes, bytes_per_sec or count.
     pub unit: &'static str,
-    pub auto: Option<String>,
-    pub manual: Option<String>,
-    pub effective: Option<String>,
-    pub auto_raw: Option<f64>,
-    pub effective_raw: Option<f64>,
+    pub auto: Option<f64>,
+    pub manual: Option<f64>,
+    pub effective: Option<f64>,
     /// What the applied value stands on: set by hand, a measurement, how
     /// many requests, or not enough data yet.
     pub source: Option<String>,
@@ -385,7 +384,10 @@ impl Autotune {
     fn with(mut manual: Manual, key: &str, value: &str) -> Result<Manual, String> {
         let one = if value == "auto" {
             linkconf::parse(&format!("{key}: null"))
-        } else if value.is_empty() || !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
+        } else if value.is_empty()
+            || !value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ' ' | '/'))
         {
             return Err(format!("{key}: invalid value {value:?}"));
         } else {
@@ -415,10 +417,7 @@ impl Autotune {
         let m = &st.manual;
         let ms = |d: Option<Duration>| d.map(|d| d.as_secs_f64() * 1e3);
         let f = |v: Option<u64>| v.map(|v| v as f64);
-        let dur = |d: Option<Duration>| d.map(linkconf::duration_text);
-        let rate = |v: Option<u64>| v.map(linkconf::rate_text);
-        let size = |v: Option<u64>| v.map(linkconf::size_text);
-        let count = |v: Option<usize>| v.map(|n| n.to_string());
+        let n = |v: Option<usize>| v.map(|v| v as f64);
         let a = st.chars;
         let (ad, d, c) = (e.auto_derived, e.derived, e.chars);
 
@@ -469,11 +468,9 @@ impl Autotune {
             key: "latency",
             group: "link",
             unit: "ms",
-            auto: dur(a.latency),
-            manual: dur(m.chars.latency),
-            effective: dur(c.latency),
-            auto_raw: ms(a.latency),
-            effective_raw: ms(c.latency),
+            auto: ms(a.latency),
+            manual: ms(m.chars.latency),
+            effective: ms(c.latency),
             source: source(m.chars.latency.is_some(), latency_src),
         }];
         let rates = [
@@ -510,12 +507,10 @@ impl Autotune {
             values.push(Value {
                 key,
                 group: "link",
-                unit: "bytes/s",
-                auto: rate(auto),
-                manual: rate(manual),
-                effective: rate(eff),
-                auto_raw: f(auto),
-                effective_raw: f(eff),
+                unit: "bytes_per_sec",
+                auto: f(auto),
+                manual: f(manual),
+                effective: f(eff),
                 source: source(manual.is_some(), src),
             });
         }
@@ -546,11 +541,9 @@ impl Autotune {
                 key,
                 group: "derived",
                 unit: "bytes",
-                auto: size(Some(auto)),
-                manual: size(manual),
-                effective: size(Some(eff)),
-                auto_raw: f(Some(auto)),
-                effective_raw: f(Some(eff)),
+                auto: f(Some(auto)),
+                manual: f(manual),
+                effective: f(Some(eff)),
                 source: source(manual.is_some(), src),
             });
         }
@@ -575,11 +568,9 @@ impl Autotune {
                 key,
                 group: "derived",
                 unit: "count",
-                auto: count(Some(auto)),
-                manual: count(manual),
-                effective: count(Some(eff)),
-                auto_raw: Some(auto as f64),
-                effective_raw: Some(eff as f64),
+                auto: n(Some(auto)),
+                manual: n(manual),
+                effective: n(Some(eff)),
                 source: source(manual.is_some(), src),
             });
         }
@@ -588,11 +579,9 @@ impl Autotune {
             key: "read_cache",
             group: "memory",
             unit: "bytes",
-            auto: size(Some(crate::config::DEFAULT_READ_CACHE)),
-            manual: size(m.read_cache),
-            effective: size(Some(cache)),
-            auto_raw: Some(crate::config::DEFAULT_READ_CACHE as f64),
-            effective_raw: Some(cache as f64),
+            auto: f(Some(crate::config::DEFAULT_READ_CACHE)),
+            manual: f(m.read_cache),
+            effective: f(Some(cache)),
             source: source(m.read_cache.is_some(), "default".into()),
         });
         let now = now_secs();
@@ -787,9 +776,9 @@ mod tests {
         assert_eq!(t.engine.uploads_limit(), 8);
         let s = t.snapshot();
         let uploads = s.values.iter().find(|v| v.key == "uploads").unwrap();
-        assert_eq!(uploads.manual.as_deref(), Some("8"));
-        assert_eq!(uploads.auto.as_deref(), Some("1")); // the regulator's
-        assert_eq!(uploads.effective.as_deref(), Some("8"));
+        assert_eq!(uploads.manual, Some(8.0));
+        assert_eq!(uploads.auto, Some(1.0)); // the regulator's
+        assert_eq!(uploads.effective, Some(8.0));
         assert!(s.yaml.contains("uploads: 8"), "{}", s.yaml);
     }
 
@@ -885,7 +874,7 @@ mod tests {
         );
         assert!(source("read_total").unwrap().starts_with("not enough data"));
         assert!(source("read_unit").unwrap().contains("minimum"));
-        t.set("read_stream", "4M").unwrap();
+        t.set("read_stream", "4MiB/s").unwrap();
         assert_eq!(source("read_stream").as_deref(), Some("set by hand"));
     }
 
@@ -895,9 +884,9 @@ mod tests {
         t.set("uploads", "8").unwrap();
         assert_eq!(t.engine.uploads_limit(), 8);
         t.set("latency", "40ms").unwrap();
-        t.set("read_stream", "4M").unwrap();
+        t.set("read_stream", "4MiB/s").unwrap();
         assert_eq!(t.engine.get_part(), Some(128 << 10)); // 160 KiB → 128 KiB
-        t.set("read_stream", "50M").unwrap();
+        t.set("read_stream", "50 MiB/s").unwrap(); // as the page sends it
         assert_eq!(t.engine.get_part(), Some(2 << 20));
         t.set("uploads", "auto").unwrap();
         assert_eq!(t.engine.uploads_limit(), 1);
@@ -913,7 +902,8 @@ mod tests {
         assert!(t.set("nope", "1").is_err());
         assert!(t.set("latency", "fast").is_err());
         assert!(t.set("uploads", "8\nreads: 3").is_err());
-        assert!(t.set("read_unit", "3M").is_err());
+        assert!(t.set("read_unit", "3MiB").is_err()); // not a power of two
+        assert!(t.set("read_stream", "38M").is_err()); // no unit
         assert_eq!(t.engine.uploads_limit(), 1); // nothing applied
     }
 

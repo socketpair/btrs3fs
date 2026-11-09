@@ -5,7 +5,7 @@
 поверх.
 
 ```bash
-sudo btrs3fs create --creds creds.json --prefix disks/data --size 10G
+sudo btrs3fs create --creds creds.json --prefix disks/data --size 10GiB
 sudo btrs3fs mount  --creds creds.json --prefix disks/data /mnt/data
 sudo btrs3fs umount /mnt/data
 ```

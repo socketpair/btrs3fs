@@ -245,21 +245,6 @@ pub struct Alert {
 const ALERT_RECENT_SECS: u64 = 60;
 const ALERT_IO_SECS: u64 = 600;
 
-/// `1.5 MiB`-style size for alert texts.
-fn human_bytes(n: u64) -> String {
-    let units = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let (mut v, mut i) = (n as f64, 0);
-    while v >= 1024.0 && i < units.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    if i == 0 {
-        format!("{n} B")
-    } else {
-        format!("{v:.1} {}", units[i])
-    }
-}
-
 /// Current and highest number of operations in progress.
 pub struct InFlight {
     current: AtomicU64,
@@ -502,6 +487,7 @@ pub struct Snapshot {
     pub append: crate::config::AppendMode,
     /// SEGMENTS: pieces below this concatenation reads and uploads instead
     /// of copying them on the server (SPEC.md §5); 0: any are copied.
+    #[serde(rename = "copy_min_part_bytes")]
     pub copy_min_part: u64,
     /// The S3 service and bucket of the disk (`None` for a RAM disk) and its
     /// prefix in the bucket.
@@ -513,7 +499,9 @@ pub struct Snapshot {
     pub uptime_secs: u64,
     pub dirty_bytes: u64,
     /// Background uploads start above `dirty_limit`; writes wait at `dirty_hard_limit`.
+    #[serde(rename = "dirty_limit_bytes")]
     pub dirty_limit: u64,
+    #[serde(rename = "dirty_hard_limit_bytes")]
     pub dirty_hard_limit: u64,
     pub dirty_zones: u64,
     pub zones: ZoneCounts,
@@ -537,7 +525,9 @@ pub struct Snapshot {
     pub gets: u64,
     pub get_size: Hist,
     pub get_latency_ms: Hist,
+    #[serde(rename = "read_from_s3_bytes")]
     pub read_from_s3: u64,
+    #[serde(rename = "read_from_cache_bytes")]
     pub read_from_cache: u64,
     pub read_ahead_hits: u64,
     pub read_ahead_misses: u64,
@@ -556,7 +546,9 @@ pub struct Snapshot {
     pub compact_queued_button: u64,
     pub compact_time_ms: Hist,
     pub segments_per_compaction: Hist,
+    #[serde(rename = "read_from_ram_bytes")]
     pub read_from_ram: u64,
+    #[serde(rename = "read_zeros_bytes")]
     pub read_zeros: u64,
     pub req_read: u64,
     pub req_read_bytes: u64,
@@ -580,6 +572,7 @@ pub struct Snapshot {
     /// Uploads allowed at once.
     pub uploads_limit: u64,
     /// Part size large reads are split into for parallel GETs (`null`: not split).
+    #[serde(rename = "get_part_bytes")]
     pub get_part: Option<u64>,
     /// GETs allowed at once.
     pub reads_limit: u64,
@@ -639,8 +632,8 @@ impl Stats {
                 format!(
                     "{waiting} writes are waiting for room in RAM ({} of {} buffered): \
                      uploads to S3 are slower than the writes.",
-                    human_bytes(d.dirty_bytes),
-                    human_bytes(d.dirty_hard_limit)
+                    crate::units::size(d.dirty_bytes),
+                    crate::units::size(d.dirty_hard_limit)
                 ),
             );
         }
@@ -782,8 +775,14 @@ pub fn serve_http(
                         Some(json) => (200, json, "application/json"),
                         None => (404, "no such action\n".into(), "text/plain; charset=utf-8"),
                     },
-                    "/compact" | "/flush" | "/balance" | "/syncfs" | "/link" | "/measure"
-                    | "/autobalance-pause" | "/autobalance-resume" => {
+                    "/compact"
+                    | "/flush"
+                    | "/balance"
+                    | "/syncfs"
+                    | "/link"
+                    | "/measure"
+                    | "/autobalance-pause"
+                    | "/autobalance-resume" => {
                         (405, "use POST\n".into(), "text/plain; charset=utf-8")
                     }
                     "/" | "/index.html" => (200, PAGE.to_string(), "text/html; charset=utf-8"),
@@ -955,7 +954,7 @@ mod tests {
         };
         let json = serde_json::to_value(STATS.snapshot(d)).unwrap();
         assert_eq!(json["append"], "SEGMENTS");
-        assert_eq!(json["copy_min_part"], 5 << 20);
+        assert_eq!(json["copy_min_part_bytes"], 5 << 20);
         assert_eq!(json["endpoint"], "https://s3.example");
         assert_eq!(json["bucket"], "b");
         assert_eq!(json["prefix"], "disks/a");
@@ -1010,7 +1009,6 @@ mod tests {
         assert_eq!(a.len(), 2, "{texts:?}");
         assert!(texts[0].contains("I/O error 30 s ago: EIO"));
         assert!(texts[1].contains("Upload to S3 failed 5 s ago"));
-        assert_eq!(human_bytes(512 << 20), "512.0 MiB");
     }
 
     #[test]

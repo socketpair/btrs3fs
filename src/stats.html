@@ -312,20 +312,33 @@ let diskRO = false;  // the disk is served read-only: nothing to upload, actions
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const num = n => n === null || n === undefined ? "–" : Number(n).toLocaleString("en-US", { maximumFractionDigits: n < 10 ? 1 : 0 });
-function bytes(n) {
-  if (n === null || n === undefined) return "–";
-  const u = ["B", "KiB", "MiB", "GiB", "TiB"];
+/* Units (SPEC.md §9.5; the same as src/units.rs): sizes in bytes with binary prefixes; traffic
+   to and from S3 in bits per second with decimal prefixes; data of the kernel, the read cache
+   and RAM in bytes per second. The prefix follows the value, or `ref` — the largest value of
+   the same kind in a panel, so the panel keeps one unit. Three significant digits. */
+const BYTE_UNITS = ["B", "KiB", "MiB", "GiB", "TiB"];
+const BIT_UNITS = ["bit/s", "Kbit/s", "Mbit/s", "Gbit/s", "Tbit/s"];
+function digits3(v) {
+  const t = v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2);
+  return t.includes(".") ? t.replace(/\.?0+$/, "") : t;
+}
+function prefix(v, step) {
   let i = 0;
-  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
-  return (i === 0 ? n.toFixed(0) : n.toFixed(n < 10 ? 2 : 1)) + " " + u[i];
+  while (v >= step && i < 4) { v /= step; i++; }
+  return i;
 }
-/* Speeds in megabits per second (decimal, as network links are rated): user decision. */
-function rate(n) {
-  const mbit = n * 8 / 1e6;
-  return mbit.toLocaleString("en-US", { maximumFractionDigits: mbit < 10 ? 2 : mbit < 100 ? 1 : 0 }) + " Mbit/s";
+const none = n => n === null || n === undefined;
+const bytes = (n, ref) => none(n) ? "–" : (i => `${digits3(n / 1024 ** i)} ${BYTE_UNITS[i]}`)(prefix(ref ?? n, 1024));
+const byterate = (n, ref) => none(n) ? "–" : bytes(n, ref) + "/s";
+const bitrate = (n, ref) => none(n) ? "–" : (i => `${digits3(n * 8 / 1000 ** i)} ${BIT_UNITS[i]}`)(prefix((ref ?? n) * 8, 1000));
+/* An exact size, as in the file: 16 MiB, 512 KiB, else bytes. */
+function sizeExact(n) {
+  if (n === 0) return "0";
+  let i = 0;
+  while (i < 4 && n % 1024 === 0) { n /= 1024; i++; }
+  return `${n} ${BYTE_UNITS[i]}`;
 }
-const sizeLabel = b => b >= 1048576 ? (b / 1048576) + "M" : b >= 1024 ? (b / 1024) + "K" : String(b);
-const ms = v => v >= 1000 ? (v / 1000) + " s" : v + " ms";
+const ms = v => v >= 1000 ? `${digits3(v / 1000)} s` : `${digits3(v)} ms`;
 function span(s) {
   s = Math.max(0, Math.round(s));
   const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
@@ -381,12 +394,12 @@ function renderOverview(s) {
     : `<div class="allgood">All good: no recent errors, writes are not waiting.</div>`;
 
   // Writes: kernel → RAM → S3.
-  const hard = s.dirty_hard_limit, soft = s.dirty_limit, waiting = s.writes_waiting > 0;
+  const hard = s.dirty_hard_limit_bytes, soft = s.dirty_limit_bytes, waiting = s.writes_waiting > 0;
   const drain = r.up > 0 ? `drains in about ${span(s.dirty_bytes / r.up)}` : s.dirty_bytes ? "not draining now" : "nothing to upload";
   const gauge = `<div class="gauge ${waiting ? "full" : ""}"><div class="fill" style="width:${Math.min(100, s.dirty_bytes / hard * 100).toFixed(1)}%"></div>` +
     `<div class="mark" style="left:${(soft / hard * 100).toFixed(1)}%" title="background uploads start here"></div></div>`;
   $("pipe-w").innerHTML =
-    stage("Kernel writes", rate(r.kw),
+    stage("Kernel writes", byterate(r.kw),
           waiting ? `<span class="warn">${num(s.writes_waiting)} requests waiting for room</span>` : "into the daemon") +
     link(`${num(r.kwReq)} req/s`, "into RAM", r.kw > 0) +
     stage("RAM buffers", `${bytes(s.dirty_bytes)} <small>of ${bytes(hard)}</small>`,
@@ -401,16 +414,16 @@ function renderOverview(s) {
   const hits = s.read_ahead_hits, miss = s.read_ahead_misses;
   const hitRate = hits + miss ? `${(hits / (hits + miss) * 100).toFixed(0)}% of small reads hit the cache` : "no small reads yet";
   $("pipe-r").innerHTML =
-    stage("Kernel reads", rate(r.kr), "out of the daemon") +
+    stage("Kernel reads", byterate(r.kr), "out of the daemon") +
     link(`${num(r.krReq)} req/s`, "to the kernel", r.kr > 0, true) +
-    stage("Read cache and RAM", rate(r.cache + r.ram), `${hitRate} · ${rate(r.ram)} of not yet stored data`) +
+    stage("Read cache and RAM", byterate(r.cache + r.ram), `${hitRate} · ${byterate(r.ram, r.cache + r.ram)} of not yet stored data`) +
     link(`${num(r.gets)} GET/s`, "from S3", r.rd > 0, true) +
-    stage("S3", rate(r.rd), `up to ${num(s.reads_limit)} GETs at once${mode("reads")} · ` +
+    stage("S3", bitrate(r.rd), `up to ${num(s.reads_limit)} GETs at once${mode("reads")} · ` +
           `median GET time ${s.get_latency_ms.p50 ? "≤ " + ms(s.get_latency_ms.p50) : "–"}`);
 
   $("charts").innerHTML =
-    chart("Upload to S3", series.up, rate) +
-    chart("Read from S3", series.rd, rate) +
+    chart("Upload to S3", series.up, bitrate) +
+    chart("Read from S3", series.rd, bitrate) +
     chart("RAM buffers", series.dirty, bytes, hard) +
     chart("Uploads in flight", series.par, num, s.uploads_limit);
 
@@ -430,9 +443,10 @@ function chart(title, data, fmt, limit) {
   const area = n ? `${x(0)},100 ${pts} 100,100` : "";
   const ly = limit ? (1 - limit / max) * 100 : 0;
   const lim = limit ? `<line class="limit" x1="0" x2="100" y1="${ly}" y2="${ly}"/>` : "";
-  return `<div class="panel chart"><div class="head"><span>${title}</span><span class="now">${fmt(n ? data[n - 1] : 0)}</span></div>` +
+  // One unit in the panel: the prefix of the largest value shown.
+  return `<div class="panel chart"><div class="head"><span>${title}</span><span class="now">${fmt(n ? data[n - 1] : 0, max)}</span></div>` +
     `<svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><polygon points="${area}"/><polyline points="${pts}"/>${lim}</svg>` +
-    `<div class="axis"><span>−5 min</span><span>peak ${fmt(peak)}${limit ? ` · limit ${fmt(limit)}` : ""}</span><span>now</span></div></div>`;
+    `<div class="axis"><span>−5 min</span><span>peak ${fmt(peak, max)}${limit ? ` · limit ${fmt(limit, max)}` : ""}</span><span>now</span></div></div>`;
 }
 
 /* ---------- zones ---------- */
@@ -488,7 +502,7 @@ function drawZones() {
   const col = { e: cssVar("--z-empty"), o: cssVar("--z-open"), c: cssVar("--z-closed"), f: cssVar("--z-full"),
                 faint: cssVar("--z-full-faint") };
   const ram = cssVar("--bad"), dot = cssVar("--surface");
-  const zoneBlocks = zmap.zone_size / zmap.block_size;
+  const zoneBlocks = zmap.zone_size_bytes / zmap.block_size_bytes;
   for (let i = 0; i < n; i++) {
     const x = (i % cols) * (cell + gap), y = Math.floor(i / cols) * (cell + gap), k = zmap.cond[i];
     // The kind filter dims the other zones instead of adding marks to every cell.
@@ -498,14 +512,14 @@ function drawZones() {
     g.fillRect(x, y, cell, cell);
     // Zones fill from the bottom by how much they hold. A zone FINISHed early is
     // full too, but its unwritten rest is faint: it can never be written.
-    const h = k === "e" ? 0 : Math.max(k === "f" ? 0 : 1, Math.round(zmap.used[i] / zoneBlocks * cell));
+    const h = k === "e" ? 0 : Math.max(k === "f" ? 0 : 1, Math.round(zmap.used_blocks[i] / zoneBlocks * cell));
     if (k === "f" && h < cell) {
       g.fillStyle = col.faint;
       g.fillRect(x, y, cell, cell - h);
     }
     g.fillStyle = col[k];
     g.fillRect(x, y + cell - h, cell, h);
-    if (zmap.buffered[i] > 0) {
+    if (zmap.buffered_blocks[i] > 0) {
       g.strokeStyle = ram; g.lineWidth = 1.5;
       g.strokeRect(x + .75, y + .75, cell - 1.5, cell - 1.5);
     }
@@ -560,23 +574,23 @@ async function refreshZone(i) {
 }
 /* The clicked cell stretched along the zone: S3 objects, RAM, the unwritten rest. */
 function zoneBar(b) {
-  const pct = v => (v / b.size * 100).toFixed(3) + "%";
+  const pct = v => (v / b.size_bytes * 100).toFixed(3) + "%";
   const color = { empty: "--z-empty", closed: "--z-closed", full: "--z-full" }[b.cond] || "--z-open";
-  const parts = b.objects.filter(o => o.to > o.from).map(o =>
-    `<i style="left:${pct(o.from)};width:${pct(o.to - o.from)};background:var(${color})" title="${esc(o.key)}"></i>`);
-  if (b.buffered) parts.push(`<i class="ram" style="left:${pct(b.stored)};width:${pct(b.buffered)}" title="in RAM"></i>`);
-  if (b.cond === "full" && b.written < b.size)
-    parts.push(`<i class="faint" style="left:${pct(b.written)};width:${pct(b.size - b.written)}" title="finished early: never written"></i>`);
-  const objects = b.objects.filter(o => o.to > o.from).length;
+  const parts = b.objects.filter(o => o.to_bytes > o.from_bytes).map(o =>
+    `<i style="left:${pct(o.from_bytes)};width:${pct(o.to_bytes - o.from_bytes)};background:var(${color})" title="${esc(o.key)}"></i>`);
+  if (b.buffered_bytes) parts.push(`<i class="ram" style="left:${pct(b.stored_bytes)};width:${pct(b.buffered_bytes)}" title="in RAM"></i>`);
+  if (b.cond === "full" && b.written_bytes < b.size_bytes)
+    parts.push(`<i class="faint" style="left:${pct(b.written_bytes)};width:${pct(b.size_bytes - b.written_bytes)}" title="finished early: never written"></i>`);
+  const objects = b.objects.filter(o => o.to_bytes > o.from_bytes).length;
   const said = [];
-  if (b.stored) said.push(`${bytes(b.stored)} in ${num(objects)} S3 object${objects === 1 ? "" : "s"}`);
-  if (b.buffered) said.push(`${bytes(b.buffered)} in RAM`);
-  if (b.cond === "full" && b.written < b.size) said.push(`${bytes(b.size - b.written)} never to be written (finished early)`);
+  if (b.stored_bytes) said.push(`${bytes(b.stored_bytes)} in ${num(objects)} S3 object${objects === 1 ? "" : "s"}`);
+  if (b.buffered_bytes) said.push(`${bytes(b.buffered_bytes)} in RAM`);
+  if (b.cond === "full" && b.written_bytes < b.size_bytes) said.push(`${bytes(b.size_bytes - b.written_bytes)} never to be written (finished early)`);
   if (!said.length) said.push("nothing written");
   return `<div class="zbar" role="img" aria-label="${esc(said.join(", "))}">${parts.join("")}</div><p class="note">${said.join(", ")}.</p>`;
 }
 function zoneView(b, f) {
-  return `<div class="title">Zone ${num(b.index)}, at ${bytes(b.start)} on the disk</div><div id="zbarbox">${zoneBar(b)}</div>` +
+  return `<div class="title">Zone ${num(b.index)}, at ${bytes(b.start_bytes)} on the disk</div><div id="zbarbox">${zoneBar(b)}</div>` +
     `<div class="zcols"><section id="zblock">${zoneBlock(b)}</section><section>${zoneFs(f)}</section></div>`;
 }
 /* What a zone condition means (ZBC): "closed" is often taken for "finished". */
@@ -587,16 +601,16 @@ const COND_MEANS = {
   full: "no more writes until a reset: written to the end or finished early",
 };
 function zoneBlock(b) {
-  const markers = b.objects.filter(o => o.to === o.from);
-  const objects = b.objects.filter(o => o.to > o.from);
+  const markers = b.objects.filter(o => o.to_bytes === o.from_bytes);
+  const objects = b.objects.filter(o => o.to_bytes > o.from_bytes);
   const list = objects.length
     ? `<h4>S3 objects</h4><div class="zlist"><table class="grid"><tr><th>key</th><th>size</th></tr>` +
-      objects.map(o => `<tr><td>${esc(o.key)}</td><td>${bytes(o.size)}</td></tr>`).join("") + `</table></div>`
+      objects.map(o => `<tr><td>${esc(o.key)}</td><td>${bytes(o.size_bytes)}</td></tr>`).join("") + `</table></div>`
     : "";
   return `<h3>Block device</h3>` + kv([
     ["condition", `${esc(b.cond)}<br><span class="note">${COND_MEANS[b.cond.split(" ")[0]] || ""}</span>`],
     ["kind", esc(b.kind)],
-    ["in RAM, waiting for upload to S3", b.buffered ? bytes(b.buffered) : "nothing"],
+    ["in RAM, waiting for upload to S3", b.buffered_bytes ? bytes(b.buffered_bytes) : "nothing"],
     ["S3 reads now", b.gets ? `${num(b.gets)} GET${b.gets === 1 ? "" : "s"}` : "none"],
     ["S3 write now", b.writing.length ? esc(b.writing.join(", ")) : "none"],
     ["last write", b.secs_since_write === null ? "none since the daemon started" : `${span(b.secs_since_write)} ago`],
@@ -619,14 +633,14 @@ function zoneFs(f) {
   if (!g && !f.superblock) body += `<p class="note">Free: btrfs has not allocated this zone.</p>`;
   if (g) body += kv([
     ["block group", `${esc(g.kind)}, ${esc(g.profile)}`],
-    ["logical addresses", `${bytes(g.logical)} – ${bytes(g.logical + g.length)}`],
-    ["used", g.used === null ? "–" : `${bytes(g.used)} of ${bytes(g.length)}`],
+    ["logical addresses", `${bytes(g.logical_bytes)} – ${bytes(g.logical_bytes + g.length_bytes)}`],
+    ["used", g.used_bytes === null ? "–" : `${bytes(g.used_bytes)} of ${bytes(g.length_bytes)}`],
   ]);
   if (f.files.length) {
-    const total = f.files.reduce((a, x) => a + (x.size || 0), 0);
+    const total = f.files.reduce((a, x) => a + (x.size_bytes || 0), 0);
     body += `<h4>${num(f.files.length)} file${f.files.length === 1 ? "" : "s"} with data in this zone, ${bytes(total)} in all</h4>` +
       `<div class="zlist"><table class="grid"><tr><th>path</th><th>size</th></tr>` +
-      f.files.map(x => `<tr><td>${pathCell(x.path)}</td><td>${x.size === null ? "deleted" : bytes(x.size)}</td></tr>`).join("") +
+      f.files.map(x => `<tr><td>${pathCell(x.path)}</td><td>${x.size_bytes === null ? "deleted" : bytes(x.size_bytes)}</td></tr>`).join("") +
       `</table></div>`;
   } else if (g && g.kind.split("+").includes("data")) {
     body += `<p class="note">No file data: what was written here is deleted and waits for btrfs to reset the zone.</p>`;
@@ -652,12 +666,12 @@ $("zmap").addEventListener("mousemove", ev => {
   if (i < 0) { tip.style.display = "none"; return; }
   const rect = $("zmap").getBoundingClientRect();
   const cx = ev.clientX - rect.left, cy = ev.clientY - rect.top;
-  const b = zmap.block_size;
-  const early = zmap.cond[i] === "f" && zmap.used[i] * zmap.block_size < zmap.zone_size;
-  tip.innerHTML = `zone ${num(i)} at ${bytes(i * zmap.zone_size)} · ${early ? "full: finished early" : ZONE[zmap.cond[i]][0]}` +
+  const b = zmap.block_size_bytes;
+  const early = zmap.cond[i] === "f" && zmap.used_blocks[i] * zmap.block_size_bytes < zmap.zone_size_bytes;
+  tip.innerHTML = `zone ${num(i)} at ${bytes(i * zmap.zone_size_bytes)} · ${early ? "full: finished early" : ZONE[zmap.cond[i]][0]}` +
     (zmap.cond[i] === "e" ? "" : ` · ${KIND[kindOf(i)]}`) + `<br>` +
-    `${bytes(zmap.used[i] * b)} of ${bytes(zmap.zone_size)} written · ${num(zmap.objects[i])} S3 object${zmap.objects[i] === 1 ? "" : "s"}` +
-    (zmap.buffered[i] ? ` · ${bytes(zmap.buffered[i] * b)} in RAM` : "");
+    `${bytes(zmap.used_blocks[i] * b)} of ${bytes(zmap.zone_size_bytes)} written · ${num(zmap.objects[i])} S3 object${zmap.objects[i] === 1 ? "" : "s"}` +
+    (zmap.buffered_blocks[i] ? ` · ${bytes(zmap.buffered_blocks[i] * b)} in RAM` : "");
   tip.style.display = "block";
   tip.style.left = Math.max(0, Math.min(cx + 14, rect.width - tip.offsetWidth - 4)) + "px";
   tip.style.top = (cy + 16) + "px";
@@ -670,15 +684,15 @@ window.addEventListener("resize", drawZones);
 /* How zone objects grow, for the header: SEGMENTS also says how it concatenates. */
 function appendMode(s) {
   if (s.append !== "SEGMENTS") return s.append;
-  return s.copy_min_part ? `SEGMENTS, parts under ${bytes(s.copy_min_part)} read` : "SEGMENTS, all parts copied";
+  return s.copy_min_part_bytes ? `SEGMENTS, parts under ${bytes(s.copy_min_part_bytes)} read` : "SEGMENTS, all parts copied";
 }
 
 function concatLine(s) {
   if (s.append !== "SEGMENTS") return "";
   const z = s.zones, d = delta;
   const busy = s.compacting || z.compact_queued;
-  const parts = s.copy_min_part
-    ? `pieces under ${bytes(s.copy_min_part)} are read and uploaded again (${bytes(s.compact_read_bytes)} since start), larger ones copied on the server`
+  const parts = s.copy_min_part_bytes
+    ? `pieces under ${bytes(s.copy_min_part_bytes)} are read and uploaded again (${bytes(s.compact_read_bytes)} since start), larger ones copied on the server`
     : "every piece is copied on the server";
   return `<p class="note" style="margin-bottom:0">Concatenation (${parts}): ${busy ? `${num(s.compacting)} running, ${num(z.compact_queued)} waiting` : "idle"}` +
     ` · ${num(d("compactions"))}/s, ${num(d("compacted_segments"))} segments/s merged · ${num(s.compactions)} done since start` +
@@ -694,7 +708,7 @@ function renderZones(s) {
 }
 
 /* ---------- details ---------- */
-const fmtOf = unit => ({ bytes: sizeLabel, ms: ms }[unit] || num);
+const fmtOf = unit => ({ bytes: sizeExact, ms: ms }[unit] || num);
 function hist(title, h) {
   let body;
   if (!h || !h.count) body = `<p class="note">No data yet.</p>`;
@@ -719,8 +733,8 @@ function renderDetails(s) {
   $("h-up").innerHTML = hist("Upload size", s.upload_size) + hist("Upload time", s.upload_latency_ms) +
     hist("Zones uploaded per FLUSH", s.zones_per_flush);
   $("h-rd").innerHTML = hist("GET size", s.get_size) + hist("GET time", s.get_latency_ms);
-  $("d-get-part").innerHTML = s.get_part
-    ? `Reads are cut into GETs of at most <b>${bytes(s.get_part)}</b> run in parallel: S3 would return larger pieces, ` +
+  $("d-get-part").innerHTML = s.get_part_bytes
+    ? `Reads are cut into GETs of at most <b>${bytes(s.get_part_bytes)}</b> run in parallel: S3 would return larger pieces, ` +
       `but one GET streams only at the per-stream rate. The size is latency × read stream (S3 link section); ` +
       `read-ahead fetches windows of the same size. Up to <b>${num(s.reads_limit)}</b> GETs run at once ` +
       `(S3 link section).`
@@ -735,9 +749,9 @@ function renderDetails(s) {
       ["zone closed", per("uploads_zone_closed")], ["over the RAM limit", per("uploads_background")],
       ["zone FINISH", per("uploads_finish")], ["upload button", per("uploads_manual")], ["create", per("uploads_explicit")],
       ["S3 retries", per("retries"), s.retries > 0], ["failed", per("upload_errors"), s.upload_errors > 0]])) +
-    panel("Reads by source", kv([["from S3", bytes(s.read_from_s3)], ["GET requests", num(s.gets)],
-      ["from the read cache", bytes(s.read_from_cache)], ["cache windows hit / fetched", `${num(s.read_ahead_hits)} / ${num(s.read_ahead_misses)}`],
-      ["from RAM buffers", bytes(s.read_from_ram)], ["zeros past the write pointer", bytes(s.read_zeros)]])) +
+    panel("Reads by source", kv([["from S3", bytes(s.read_from_s3_bytes)], ["GET requests", num(s.gets)],
+      ["from the read cache", bytes(s.read_from_cache_bytes)], ["cache windows hit / fetched", `${num(s.read_ahead_hits)} / ${num(s.read_ahead_misses)}`],
+      ["from RAM buffers", bytes(s.read_from_ram_bytes)], ["zeros past the write pointer", bytes(s.read_zeros_bytes)]])) +
     panel("Kernel requests", kv([["READ", `${num(s.req_read)} · ${bytes(s.req_read_bytes)}`],
       ["ZONE_APPEND (data)", `${num(s.req_append)} · ${bytes(s.req_append_bytes)}`],
       ["WRITE (metadata)", `${num(s.req_write)} · ${bytes(s.req_write_bytes)}`], ["FLUSH", num(s.req_flush)], ["FUA writes", num(s.req_fua)],
@@ -780,8 +794,8 @@ function renderBtrfs(b) {
   $("b-op").innerHTML = panelTitle("btrfs operation") + kv([["automatic removal of empty groups", autoLine],
     ["exclusive operation", esc(b.exclusive_operation || "none")],
     ["balance", b.balance.running ? `${num(b.balance.completed)} of ${num(b.balance.expected)} block groups` : "not running"],
-    ["global reserve", `${bytes(b.global_rsv_reserved)} of ${bytes(b.global_rsv_size)}`],
-    ["reclaim starts at", b.bg_reclaim_threshold === null ? "–" : `${num(b.bg_reclaim_threshold)}% allocated`]]);
+    ["global reserve", `${bytes(b.global_rsv_reserved_bytes)} of ${bytes(b.global_rsv_size_bytes)}`],
+    ["reclaim starts at", b.bg_reclaim_threshold_pct === null ? "–" : `${num(b.bg_reclaim_threshold_pct)}% allocated`]]);
 }
 const panelTitle = t => `<div class="title">${t}</div>`;
 let autoPaused = false;
@@ -838,9 +852,15 @@ const LINK_NAMES = {
   reads: ["Parallel GETs", "auto: grown from 1 while it pays"],
   read_cache: ["Read cache", "RAM for read-ahead windows; manual only (0 = none)"],
 };
-function linkValue(v, raw) {
-  if (raw === null || raw === undefined) return "–";
-  return { ms: x => ms(Math.round(x * 10) / 10), "bytes/s": rate, bytes, count: num }[v.unit](raw);
+/* A value of link.json for reading; rates of one table share the unit of `ref`. */
+function linkValue(v, x, ref) {
+  if (none(x)) return "–";
+  return { ms: x => ms(Math.round(x * 10) / 10), bytes_per_sec: x => bitrate(x, ref), bytes, count: num }[v.unit](x);
+}
+/* The same for the manual field: what the daemon reads back (SPEC.md §9.5). */
+function linkInput(v, x) {
+  if (none(x)) return "";
+  return { ms: x => `${Math.round(x * 10) / 10} ms`, bytes_per_sec: x => bitrate(x), bytes: sizeExact, count: String }[v.unit](x);
 }
 /* Rows are built once and then updated in place, so typing in a field is never interrupted. */
 function linkRows(table, values) {
@@ -857,7 +877,7 @@ function linkRows(table, values) {
       if (box.checked) {
         const v = lastLink.values.find(x => x.key === box.dataset.key);
         field.disabled = false;
-        field.value = v.manual || v.effective || "";
+        field.value = linkInput(v, v.manual ?? v.effective);
         // Ticking alone pins the value shown: Enter or leaving the field applies it.
         field.dataset.dirty = "1";
         field.focus(); field.select();
@@ -875,19 +895,20 @@ function linkRows(table, values) {
       field.onblur = apply;
     }
   }
+  const ref = Math.max(0, ...values.filter(v => v.unit === "bytes_per_sec").flatMap(v => [v.auto ?? 0, v.effective ?? 0]));
   for (const v of values) {
     const row = table.querySelector(`tr[data-row="${v.key}"]`);
     const manual = v.manual !== null;
     row.className = manual ? "manual" : "";
-    row.querySelector(".auto").textContent = v.key === "read_cache" ? "–" : linkValue(v, v.auto_raw);
+    row.querySelector(".auto").textContent = v.key === "read_cache" ? "–" : linkValue(v, v.auto, ref);
     // The value and what it stands on (set by hand, measured, how many requests).
-    row.querySelector(".eff").innerHTML = esc(linkValue(v, v.effective_raw)) +
+    row.querySelector(".eff").innerHTML = esc(linkValue(v, v.effective, ref)) +
       (v.source ? `<small class="src${/^not enough|^minimum/.test(v.source) ? " weak" : ""}">${esc(v.source)}</small>` : "");
     const box = row.querySelector("input[type=checkbox]"), field = row.querySelector("input[type=text]");
     if (document.activeElement === field || field.dataset.dirty) continue;
     box.checked = manual;
     field.disabled = !manual;
-    field.value = manual ? v.manual : "";
+    field.value = manual ? linkInput(v, v.manual) : "";
   }
 }
 async function setLink(key, value) {
@@ -967,7 +988,7 @@ function update(s, p, dt) {
     kw: d("req_append_bytes") + d("req_write_bytes"), kwReq: d("req_append") + d("req_write"),
     kr: d("req_read_bytes"), krReq: d("req_read"),
     up: dsum("upload_size"), upReq: d("uploads_put") + d("uploads_patch"),
-    rd: d("read_from_s3"), gets: d("gets"), cache: d("read_from_cache"), ram: d("read_from_ram"),
+    rd: d("read_from_s3_bytes"), gets: d("gets"), cache: d("read_from_cache_bytes"), ram: d("read_from_ram_bytes"),
   };
   delta = d;
   push("up", rates.up); push("rd", rates.rd); push("dirty", s.dirty_bytes); push("par", s.uploads_in_flight);

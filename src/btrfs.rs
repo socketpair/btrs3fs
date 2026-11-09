@@ -92,8 +92,11 @@ pub struct Info {
     pub mounted: bool,
     pub device: String,
     pub exclusive_operation: String,
+    #[serde(rename = "bg_reclaim_threshold_pct")]
     pub bg_reclaim_threshold: Option<u64>,
+    #[serde(rename = "global_rsv_size_bytes")]
     pub global_rsv_size: Option<u64>,
+    #[serde(rename = "global_rsv_reserved_bytes")]
     pub global_rsv_reserved: Option<u64>,
     pub balance: Balance,
     /// The automatic removal of empty block groups.
@@ -352,11 +355,11 @@ mod tests {
             [
                 "auto",
                 "balance",
-                "bg_reclaim_threshold",
+                "bg_reclaim_threshold_pct",
                 "device",
                 "exclusive_operation",
-                "global_rsv_reserved",
-                "global_rsv_size",
+                "global_rsv_reserved_bytes",
+                "global_rsv_size_bytes",
                 "last",
                 "mounted",
                 "running",

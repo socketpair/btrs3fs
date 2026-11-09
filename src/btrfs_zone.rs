@@ -138,15 +138,19 @@ pub struct ZoneFs {
 #[derive(Serialize)]
 pub struct BlockGroup {
     /// Logical address of the block group.
+    #[serde(rename = "logical_bytes")]
     pub logical: u64,
+    #[serde(rename = "length_bytes")]
     pub length: u64,
     /// `data`, `metadata`, `system`, or several joined by `+`.
     pub kind: String,
     /// `single`, `DUP`, `RAID1`, …
     pub profile: String,
     /// Bytes btrfs counts as used in the block group.
+    #[serde(rename = "used_bytes")]
     pub used: Option<u64>,
     /// Logical address the zone starts at (a block group may span zones).
+    #[serde(rename = "zone_logical_bytes")]
     pub zone_logical: u64,
 }
 
@@ -155,6 +159,7 @@ pub struct FileEntry {
     /// Path from the mount point.
     pub path: String,
     /// File size; `None` if it vanished since.
+    #[serde(rename = "size_bytes")]
     pub size: Option<u64>,
 }
 

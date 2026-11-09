@@ -66,12 +66,11 @@ impl Chars {
 
 impl fmt::Display for Chars {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let rate = |r: Option<u64>| r.map_or("?".to_string(), |r| format!("{}", r / MIB));
+        let rate = |r: Option<u64>| r.map_or("?".to_string(), crate::units::bitrate);
         write!(
             f,
-            "latency {} ms, read {} MiB/s per stream / {} MiB/s total, write {} / {} MiB/s",
-            self.latency
-                .map_or("?".to_string(), |l| l.as_millis().to_string()),
+            "latency {}, read {} per stream / {} total, write {} per stream / {} total",
+            self.latency.map_or("?".to_string(), crate::units::duration),
             rate(self.read_stream),
             rate(self.read_total),
             rate(self.write_stream),
@@ -100,10 +99,10 @@ impl fmt::Display for Derived {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "read window and GET part {} KiB, btrfs readahead {} MiB, \
+            "read window and GET part {}, btrfs readahead {}, \
              {} parallel uploads, {} parallel GETs",
-            self.read_unit / KIB,
-            self.fs_readahead / MIB,
+            crate::units::size(self.read_unit),
+            crate::units::size(self.fs_readahead),
             self.uploads,
             self.reads
         )
@@ -251,25 +250,6 @@ fn pow2_round(x: f64) -> u64 {
         return 1;
     }
     2f64.powf(x.log2().round()) as u64
-}
-
-/// `36ms`, `0.036s`, `1s`: a duration with a unit.
-pub fn parse_duration(s: &str) -> anyhow::Result<Duration> {
-    let s = s.trim();
-    let (num, scale) = if let Some(n) = s.strip_suffix("ms") {
-        (n, 1e-3)
-    } else if let Some(n) = s.strip_suffix('s') {
-        (n, 1.0)
-    } else {
-        anyhow::bail!("duration {s:?} needs a unit: ms or s");
-    };
-    let v: f64 = num
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid duration {s:?}"))?;
-    anyhow::ensure!(v > 0.0 && v.is_finite(), "duration {s:?} must be positive");
-    Duration::try_from_secs_f64(v * scale)
-        .map_err(|_| anyhow::anyhow!("duration {s:?} is too large"))
 }
 
 #[cfg(test)]
@@ -443,14 +423,5 @@ mod tests {
             ..Chars::default()
         };
         assert!(!ok(manual(zero_rate)));
-    }
-
-    #[test]
-    fn durations() {
-        assert_eq!(parse_duration("36ms").unwrap(), Duration::from_millis(36));
-        assert_eq!(parse_duration("0.5s").unwrap(), Duration::from_millis(500));
-        assert!(parse_duration("36").is_err());
-        assert!(parse_duration("0ms").is_err());
-        assert!(parse_duration("1e30s").is_err());
     }
 }
