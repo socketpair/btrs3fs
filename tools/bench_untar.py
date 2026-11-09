@@ -352,6 +352,12 @@ enabled = false
         self.server = self.start([str(self.a.zerofs_bin), "run", "-c", str(self.config)],
                                  "zerofs-server.log", lambda: self.sock.exists() and self.rpc.exists(),
                                  "zerofs server")
+        self.mount()
+
+    def mount(self):
+        """The FUSE client on the running server."""
+        if os.path.ismount(self.a.zerofs_mnt):
+            sys.exit(f"{self.a.zerofs_mnt} is mounted already: unmount it first")
         self.client = self.start([str(self.a.zerofs_bin), "mount", "-o", FUSE_OPTIONS, f"unix:{self.sock}",
                                   str(self.a.zerofs_mnt)],
                                  "zerofs-mount.log", lambda: os.path.ismount(self.a.zerofs_mnt),
@@ -389,10 +395,10 @@ enabled = false
 
     def prepare(self):
         """Empty benchmark directory and a freshly started server."""
-        if self.server is None:
-            if os.path.ismount(self.a.zerofs_mnt):
-                sys.exit(f"{self.a.zerofs_mnt} is mounted already: unmount it first")
+        if self.server is None or self.server.poll() is not None:
             self.up()
+        elif self.client is None or self.client.poll() is not None:
+            self.mount()  # the last measurement unmounted it
         wipe(self.dir)
         syncfs(self.a.zerofs_mnt)
         self.down()
@@ -413,11 +419,7 @@ enabled = false
 
     def finish(self):
         if self.server is not None and (self.client is None or self.client.poll() is not None):
-            # Mounted again for the user, like geesefs.
-            self.client = self.start([str(self.a.zerofs_bin), "mount", "-o", FUSE_OPTIONS, f"unix:{self.sock}",
-                                      str(self.a.zerofs_mnt)],
-                                     "zerofs-mount.log", lambda: os.path.ismount(self.a.zerofs_mnt),
-                                     "zerofs mount")
+            self.mount()  # mounted again for the user, like geesefs
 
 
 def summary(rows):
