@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Untar benchmark: btrs3fs against geesefs on the same bucket.
+"""Write benchmark: btrs3fs against geesefs on the same bucket.
 
-Each round unpacks the archive on both filesystems in turn (btrs3fs, then
-geesefs) and measures the time until every byte is in S3:
+Each round writes on both filesystems in turn (btrs3fs, then geesefs) and
+measures the time until every byte is in S3. The workload (--workload) is
+either unpacking the archive (untar: many small files) or copying the
+archive itself (copy: one large file):
 
-  btrs3fs  untar -> syncfs()               (syncfs commits btrfs; the device
+  btrs3fs  write -> syncfs()               (syncfs commits btrfs; the device
                                              answers FLUSH after S3 confirms)
-  geesefs  untar -> syncfs() -> unmount    (geesefs uploads what is left after
+  geesefs  write -> syncfs() -> unmount    (geesefs uploads what is left after
                                              the unmount and only then exits;
                                              the clock stops at its exit)
 
@@ -36,6 +38,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 BENCH_DIR = "bench-untar"  # only this directory is cleaned on the tested filesystems
+WORKLOADS = ("untar", "copy")
 
 libc = ctypes.CDLL(None, use_errno=True)
 
@@ -72,8 +75,11 @@ def wipe(directory):
     directory.mkdir()
 
 
-def untar(archive, directory):
-    run(["tar", "-I", "zstd", "-xf", str(archive), "-C", str(directory)])
+def write(workload, archive, directory):
+    if workload == "untar":
+        run(["tar", "-I", "zstd", "-xf", str(archive), "-C", str(directory)])
+    else:
+        run(["cp", str(archive), str(directory)])
 
 
 class Btrs3fs:
@@ -161,13 +167,13 @@ class Btrs3fs:
         self.post("flush")
         self.wait("concatenation and uploads", self.idle, 1800)
 
-    def measure(self, archive):
+    def measure(self, workload, archive):
         t0 = time.monotonic()
-        untar(archive, self.dir)
+        write(workload, archive, self.dir)
         t1 = time.monotonic()
         syncfs(self.dir)
         t2 = time.monotonic()
-        return {"untar_s": t1 - t0, "syncfs_s": t2 - t1, "umount_s": None, "total_s": t2 - t0}
+        return {"write_s": t1 - t0, "syncfs_s": t2 - t1, "umount_s": None, "total_s": t2 - t0}
 
     def finish(self):
         self.restore_auto()
@@ -233,15 +239,15 @@ class Geesefs:
         self.unmount()
         self.mount()
 
-    def measure(self, archive):
+    def measure(self, workload, archive):
         t0 = time.monotonic()
-        untar(archive, self.dir)
+        write(workload, archive, self.dir)
         t1 = time.monotonic()
         syncfs(self.dir)
         t2 = time.monotonic()
         self.unmount()
         t3 = time.monotonic()
-        return {"untar_s": t1 - t0, "syncfs_s": t2 - t1, "umount_s": t3 - t2, "total_s": t3 - t0}
+        return {"write_s": t1 - t0, "syncfs_s": t2 - t1, "umount_s": t3 - t2, "total_s": t3 - t0}
 
     def finish(self):
         if not os.path.ismount(self.a.geesefs_mnt):
@@ -253,7 +259,7 @@ def summary(rows):
     for fs in dict.fromkeys(r["fs"] for r in rows):
         mine = [r for r in rows if r["fs"] == fs]
         parts = []
-        for k in ("untar_s", "syncfs_s", "umount_s", "total_s"):
+        for k in ("write_s", "syncfs_s", "umount_s", "total_s"):
             v = [r[k] for r in mine if r[k] is not None]
             if v:
                 parts.append(f"{k[:-2]} {statistics.median(v):.1f} ({min(v):.1f}..{max(v):.1f})")
@@ -263,6 +269,8 @@ def summary(rows):
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--archive", type=Path, default=Path.home() / "drivers.tar.zstd")
+    p.add_argument("--workload", choices=WORKLOADS, default="untar",
+                   help="untar: unpack the archive (many small files); copy: copy the archive file")
     p.add_argument("--rounds", type=int, default=3)
     p.add_argument("--creds", type=Path, default=REPO / "creds2.json")
     p.add_argument("--btrs3fs-bin", type=Path, default=REPO / "target/debug/btrs3fs")
@@ -275,8 +283,10 @@ def main():
     p.add_argument("--geesefs-mnt", type=Path, default=Path("/mnt/geesefs"))
     p.add_argument("--geesefs-prefix", default="geesefs/")
     p.add_argument("--out", type=Path,
-                   default=Path.home() / "bench-untar" / f"{datetime.now():%Y%m%d-%H%M%S}")
+                   default=None, help="default: ~/bench-untar/<time>-<workload>")
     a = p.parse_args()
+    if a.out is None:
+        a.out = Path.home() / "bench-untar" / f"{datetime.now():%Y%m%d-%H%M%S}-{a.workload}"
     a.out.mkdir(parents=True)
 
     link_yaml = a.out / "link.yaml"
@@ -297,7 +307,7 @@ def main():
 
     rows = []
     csv_path = a.out / "results.csv"
-    fields = ["round", "fs", "untar_s", "syncfs_s", "umount_s", "total_s"]
+    fields = ["round", "fs", "write_s", "syncfs_s", "umount_s", "total_s"]
     try:
         with open(csv_path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fields)
@@ -307,8 +317,8 @@ def main():
                     log(f"round {rnd}/{a.rounds} {fs.name}: preparing")
                     warm_page_cache(a.archive)
                     fs.prepare()
-                    log(f"round {rnd}/{a.rounds} {fs.name}: measuring")
-                    r = {"round": rnd, "fs": fs.name, **fs.measure(a.archive)}
+                    log(f"round {rnd}/{a.rounds} {fs.name}: measuring {a.workload}")
+                    r = {"round": rnd, "fs": fs.name, **fs.measure(a.workload, a.archive)}
                     log("  " + "  ".join(f"{k} {v:.2f}" for k, v in r.items()
                                          if isinstance(v, float)))
                     rows.append(r)
