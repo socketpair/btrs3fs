@@ -63,12 +63,15 @@ def run(cmd, **kw):
     return subprocess.run(cmd, check=True, **kw)
 
 
-def syncfs(path):
+def syncfs(path, tolerate=False):
+    """syncfs(2); with `tolerate`, an error is logged instead of raised."""
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         if libc.syncfs(fd) != 0:
             e = ctypes.get_errno()
-            raise OSError(e, f"syncfs({path}): {os.strerror(e)}")
+            if not tolerate:
+                raise OSError(e, f"syncfs({path}): {os.strerror(e)}")
+            log(f"syncfs({path}): {os.strerror(e)}, ignored")
     finally:
         os.close(fd)
 
@@ -400,7 +403,7 @@ enabled = false
         elif self.client is None or self.client.poll() is not None:
             self.mount()  # the last measurement unmounted it
         wipe(self.dir)
-        syncfs(self.a.zerofs_mnt)
+        syncfs(self.a.zerofs_mnt, tolerate=True)
         self.down()
         self.up()
 
@@ -408,7 +411,9 @@ enabled = false
         t0 = time.monotonic()
         write(workload, archive, self.dir)
         t1 = time.monotonic()
-        syncfs(self.dir)
+        # ZeroFS: syncfs reports writeback errors of files deleted meanwhile
+        # (ENOENT from the server); the data is in S3 after the flush anyway.
+        syncfs(self.dir, tolerate=True)
         t2 = time.monotonic()
         self.unmount()
         t3 = time.monotonic()
