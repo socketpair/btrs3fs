@@ -43,6 +43,11 @@ pub const CONFIG_VERSION: u32 = 1;
 /// 2026-10-24 (instead of the originally chosen 32 MiB).
 pub const DEFAULT_ZONE_SIZE: u64 = 16 << 20;
 
+/// btrfs commit interval, seconds: `mount` passes it as `commit=` (user
+/// decision, SPEC.md §9.2), so writes merge into fewer, larger S3 appends;
+/// metadata zones count as idle after half of it (SPEC.md §5).
+pub const COMMIT_SECS: u64 = 300;
+
 /// Buffered (not yet uploaded) data above which zones are uploaded in the
 /// background without waiting for a FLUSH; writes wait at twice this amount
 /// (SPEC.md §5). Judgement call proposed at the start and accepted by the

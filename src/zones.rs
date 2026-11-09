@@ -52,7 +52,10 @@ const COMPACT_SEGMENTS_MAX: usize = 1024;
 const COMPACT_GROWTH: u64 = 8;
 /// Idle: no write for k × the zone's average write interval, within bounds.
 const IDLE_DATA: (f64, u64, u64) = (4.0, 30, 600);
-const IDLE_META: (f64, u64, u64) = (8.0, 300, 3600);
+/// Metadata from half the commit interval (user decision): btrfs writes
+/// metadata at every commit, so with a bound of a whole interval an open
+/// metadata zone under load would never be idle long enough.
+const IDLE_META: (f64, u64, u64) = (8.0, crate::config::COMMIT_SECS / 2, 3600);
 /// Weight of a new interval in the zone's average (EWMA).
 const IDLE_EWMA_WEIGHT: f64 = 0.2;
 /// How often the compactor looks for idle fragmented zones.

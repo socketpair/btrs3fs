@@ -40,12 +40,11 @@ use tuning::Manual;
 use units::parse_size;
 use zones::Engine;
 
-/// btrfs mount options always used by `mount`: user decision (SPEC.md §9.2);
-/// commit=300 makes btrfs commit (and FLUSH) every 5 minutes, so writes merge
-/// into fewer, larger S3 appends. nosuid,nodev: the image comes from the
-/// bucket, so whoever can write there must not get setuid files or device
-/// nodes onto this host.
-const MOUNT_OPTIONS: &str = "nosuid,nodev,noatime,lazytime,commit=300";
+/// btrfs mount options always used by `mount`, with `commit=` from
+/// `config::COMMIT_SECS`: user decision (SPEC.md §9.2). nosuid,nodev: the
+/// image comes from the bucket, so whoever can write there must not get
+/// setuid files or device nodes onto this host.
+const MOUNT_OPTIONS: &str = "nosuid,nodev,noatime,lazytime";
 
 /// How long `mount` waits for udev to create /dev/ublkbN after the device
 /// server reported it ready. Judgement call: udev needs milliseconds.
@@ -158,8 +157,10 @@ struct MountArgs {
     disk: DiskArgs,
     /// Directory to mount the filesystem on.
     mountpoint: PathBuf,
-    /// Extra mount options, appended to nosuid,nodev,noatime,lazytime,commit=300.
-    #[arg(short = 'o', long)]
+    #[arg(short = 'o', long, help = format!(
+        "Extra mount options, appended to {MOUNT_OPTIONS},commit={}",
+        config::COMMIT_SECS
+    ))]
     options: Option<String>,
     /// Serve the disk read-only and mount it ro,rescue=nologreplay: works with
     /// credentials that may only read the bucket.
@@ -691,7 +692,7 @@ fn cmd_run(a: RunArgs) -> anyhow::Result<i32> {
 /// Options of `mount`: ours, read-only ones for a read-only disk (SPEC.md
 /// §9.2: a fsync log cannot be replayed on a read-only device), then `extra`.
 fn mount_options(extra: Option<&str>, read_only: bool) -> String {
-    let mut options = MOUNT_OPTIONS.to_string();
+    let mut options = format!("{MOUNT_OPTIONS},commit={}", config::COMMIT_SECS);
     if read_only {
         options.push_str(",ro,rescue=nologreplay");
     }
