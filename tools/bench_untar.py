@@ -3,8 +3,8 @@
 
 Each round writes on both filesystems in turn (btrs3fs, then geesefs) and
 measures the time until every byte is in S3. The workload (--workload) is
-either unpacking the archive (untar: many small files) or copying the
-archive itself (copy: one large file):
+either unpacking the archive (untar: many small files) or decompressing it
+into one tar file (tar: one large file):
 
   btrs3fs  write -> syncfs()               (syncfs commits btrfs; the device
                                              answers FLUSH after S3 confirms)
@@ -38,7 +38,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 BENCH_DIR = "bench-untar"  # only this directory is cleaned on the tested filesystems
-WORKLOADS = ("untar", "copy")
+WORKLOADS = ("untar", "tar")
 
 libc = ctypes.CDLL(None, use_errno=True)
 
@@ -79,7 +79,9 @@ def write(workload, archive, directory):
     if workload == "untar":
         run(["tar", "-I", "zstd", "-xf", str(archive), "-C", str(directory)])
     else:
-        run(["cp", str(archive), str(directory)])
+        tar = directory / Path(archive.name).with_suffix("").name  # drivers.tar.zstd -> drivers.tar
+        with open(tar, "wb") as out:
+            run(["zstd", "-d", "-q", "-c", str(archive)], stdout=out)
 
 
 class Btrs3fs:
@@ -270,7 +272,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--archive", type=Path, default=Path.home() / "drivers.tar.zstd")
     p.add_argument("--workload", choices=WORKLOADS, default="untar",
-                   help="untar: unpack the archive (many small files); copy: copy the archive file")
+                   help="untar: unpack the archive (many small files); tar: decompress it into one tar file")
     p.add_argument("--rounds", type=int, default=3)
     p.add_argument("--creds", type=Path, default=REPO / "creds2.json")
     p.add_argument("--btrs3fs-bin", type=Path, default=REPO / "target/debug/btrs3fs")
