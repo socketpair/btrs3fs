@@ -99,17 +99,21 @@ impl AutoBalance {
     /// Watches the filesystem on `device` (`ublkbN`) until the process ends.
     pub fn run(self: Arc<Self>, device: String, fs: Arc<Btrfs>, engine: Arc<Engine>, zone: u64) {
         let mut base: Option<Totals> = None;
+        // One look right after mounting: the counters say what is freed from
+        // now on, not what was freed before (by an earlier daemon, say).
+        let mut look_at_mount = true;
         loop {
             std::thread::sleep(POLL);
             let Some(sysfs) = crate::btrfs::sysfs_dirs(&device).into_iter().next() else {
                 base = None; // not mounted
+                look_at_mount = true;
                 continue;
             };
             let Some(now) = read_totals(&sysfs) else {
                 continue;
             };
             let start = *base.get_or_insert(now);
-            if self.paused.load(Ordering::SeqCst) || !due(start, now, zone) {
+            if self.paused.load(Ordering::SeqCst) || !(look_at_mount || due(start, now, zone)) {
                 continue;
             }
             let recent = self
@@ -122,6 +126,7 @@ impl AutoBalance {
             }
             *self.last_check.lock().unwrap() = Some(Instant::now());
             base = Some(now);
+            look_at_mount = false;
             let Some(mountpoint) = fs.mountpoint() else {
                 continue;
             };
