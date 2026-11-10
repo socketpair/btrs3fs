@@ -1,9 +1,9 @@
-//! Automatic removal of empty block groups (SPEC.md §9.3): btrfs deletes a
-//! block group by itself only once its whole zone is written and freed, so a
-//! zone written in part and then freed keeps its objects in the bucket until
-//! `balance -dusage=0` runs. The daemon watches the filesystem's own
-//! accounting in sysfs and runs that balance when an emptied group holds a
-//! zone that is not empty in S3; a button pauses and resumes it.
+//! Automatic removal of empty block groups (SPEC.md §9.3): btrfs deletes
+//! empty block groups by itself, but only once per commit interval and never
+//! the last group of each type (SPEC.md §11). The daemon watches the
+//! filesystem's own accounting in sysfs and runs `balance -dusage=0` when an
+//! emptied group holds a zone that is not empty in S3. Off by default (user
+//! decision); a button resumes and pauses it until the daemon restarts.
 
 use crate::btrfs::Btrfs;
 use crate::zones::Engine;
@@ -71,11 +71,21 @@ pub struct AutoInfo {
     pub last_groups: Option<usize>,
 }
 
-#[derive(Default)]
 pub struct AutoBalance {
     paused: AtomicBool,
     last_run: Mutex<Option<(Instant, usize)>>,
     last_check: Mutex<Option<Instant>>,
+}
+
+impl Default for AutoBalance {
+    /// Paused: btrfs removes empty groups itself (SPEC.md §9.3).
+    fn default() -> Self {
+        Self {
+            paused: AtomicBool::new(true),
+            last_run: Mutex::default(),
+            last_check: Mutex::default(),
+        }
+    }
 }
 
 impl AutoBalance {

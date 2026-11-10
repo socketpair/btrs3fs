@@ -1270,19 +1270,19 @@ mod tests {
     fn options() {
         assert_eq!(
             mount_options(None, false),
-            "nosuid,nodev,noatime,lazytime,commit=300"
+            "nosuid,nodev,noatime,lazytime,commit=30"
         );
         assert_eq!(
             mount_options(Some(" "), false),
-            "nosuid,nodev,noatime,lazytime,commit=300"
+            "nosuid,nodev,noatime,lazytime,commit=30"
         );
         assert_eq!(
             mount_options(Some("compress=zstd"), false),
-            "nosuid,nodev,noatime,lazytime,commit=300,compress=zstd"
+            "nosuid,nodev,noatime,lazytime,commit=30,compress=zstd"
         );
         assert_eq!(
             mount_options(Some("subvol=a"), true),
-            "nosuid,nodev,noatime,lazytime,commit=300,ro,rescue=nologreplay,subvol=a"
+            "nosuid,nodev,noatime,lazytime,commit=30,ro,rescue=nologreplay,subvol=a"
         );
     }
 }

@@ -44,14 +44,15 @@ pub const CONFIG_VERSION: u32 = 1;
 pub const DEFAULT_ZONE_SIZE: u64 = 16 << 20;
 
 /// btrfs commit interval, seconds: `mount` passes it as `commit=` (user
-/// decision, SPEC.md §9.2), so writes merge into fewer, larger S3 appends;
+/// decision, SPEC.md §9.2): the btrfs default, so at most this much work is
+/// lost without fsync and empty block groups go within two intervals;
 /// metadata zones count as idle after half of it (SPEC.md §5).
-pub const COMMIT_SECS: u64 = 300;
+pub const COMMIT_SECS: u64 = 30;
 
 /// Buffered (not yet uploaded) data above which zones are uploaded in the
 /// background without waiting for a FLUSH; writes wait at twice this amount
 /// (SPEC.md §5). Judgement call proposed at the start and accepted by the
-/// user: room for one commit=300 interval of moderate writes while bounding the
+/// user: room for several commit intervals of moderate writes while bounding the
 /// daemon's RAM; not measured. Per disk, `create --dirty-limit`.
 pub const DEFAULT_DIRTY_LIMIT: u64 = 256 << 20;
 
