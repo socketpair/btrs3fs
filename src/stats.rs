@@ -1070,9 +1070,11 @@ mod tests {
                 "{method} {path} HTTP/1.1\r\nHost: {host}\r\n{origin}Content-Length: 0\r\nConnection: close\r\n\r\n"
             )
             .unwrap();
-            let mut out = String::new();
-            s.read_to_string(&mut out).unwrap();
-            out
+            // Bytes, not a string: a large page comes chunked, and a chunk
+            // header may split a character in two.
+            let mut out = Vec::new();
+            s.read_to_end(&mut out).unwrap();
+            String::from_utf8_lossy(&out).into_owned()
         };
         let send = |method: &str, path: &str| request(method, path, &ours, None);
         let get = |path: &str| send("GET", path);
