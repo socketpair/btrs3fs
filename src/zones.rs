@@ -401,15 +401,20 @@ impl ZoneState {
         self.data_end - self.flushed
     }
 
-    /// EMPTY with nothing stored or buffered: no object of the zone exists
-    /// (startup deleted any leftovers), so RESET has nothing to do.
-    fn is_clean(&self) -> bool {
+    /// Nothing stored or buffered: no object of the zone exists (startup
+    /// deleted any leftovers), so a RESET has nothing to delete. A zone
+    /// FINISHed without data is such a zone, only FULL.
+    fn holds_nothing(&self) -> bool {
         !self.broken
-            && self.cond == Cond::Empty
             && self.data_end == 0
             && self.objects.is_empty()
             && !self.marker
             && !self.meta_marker
+    }
+
+    /// EMPTY and holding nothing: RESET has nothing to do.
+    fn is_clean(&self) -> bool {
+        self.cond == Cond::Empty && self.holds_nothing()
     }
 }
 
@@ -1304,6 +1309,14 @@ impl Engine {
         let marker = {
             let mut st = zone.state.lock().unwrap();
             if st.is_clean() {
+                return Ok(());
+            }
+            if st.holds_nothing() {
+                // FINISHed or opened without data: no S3 request. btrfs
+                // resets thousands of such zones inside one commit.
+                drop(st);
+                self.clear_locked(zi);
+                debug!("zone {zi} reset, nothing stored");
                 return Ok(());
             }
             // A concatenation under way never completes now, even if the
@@ -3377,6 +3390,21 @@ mod tests {
         e.write(0, blk(1, 1), true).unwrap();
         assert_eq!(e.report(0, 1)[0].cond, Cond::Full);
         assert!(e.write(0, blk(1, 1), true).is_err()); // full
+    }
+
+    /// btrfs FINISHes zones it never wrote and resets thousands of them in
+    /// one commit: such a RESET sends nothing to S3.
+    #[tokio::test]
+    async fn reset_of_a_zone_finished_empty_sends_nothing() {
+        for e in [engine_with(mem()).await, segments_engine(mem()).await] {
+            e.finish_zone(ZS).await.unwrap();
+            assert_eq!(e.report(1, 1)[0].cond, Cond::Full);
+            mem_store(&e.store).fail_deletes_of(Some(""));
+            e.reset_zone(ZS).await.unwrap();
+            let z = &e.report(1, 1)[0];
+            assert_eq!((z.cond, z.wp), (Cond::Empty, ZS)); // absolute: the zone start
+            e.write(ZS, blk(3, 1), false).unwrap(); // usable again
+        }
     }
 
     #[tokio::test]
