@@ -777,11 +777,17 @@ async function tickBtrfs() {
   } catch (e) { $("b-op").innerHTML = `<p class="note">Cannot read btrfs.json: ${esc(e.message)}</p>`; }
 }
 function renderBtrfs(b) {
-  const busy = !!b.running;
-  for (const btn of document.querySelectorAll("[data-fsact]")) btn.disabled = busy || !b.mounted;
+  // A balance waits for a balance, a syncfs for a syncfs (SPEC.md §9.3).
+  const running = b.running || [];
+  const runs = kind => running.some(r => (r.name === "autobalance" ? "balance" : r.name) === kind);
+  for (const btn of document.querySelectorAll("[data-fsact]")) {
+    const act = btn.dataset.fsact;
+    btn.disabled = runs(act) || (act === "syncfs" ? diskRO : !b.mounted);
+  }
   const l = b.last;
-  $("b-action").innerHTML = busy ? `${esc(b.running)} is running for ${span(b.running_secs)}.`
-    : l ? `Last: ${esc(l.name)} ${l.ok ? "finished" : '<span style="color:var(--bad)">failed</span>'} in ${num(l.secs)} s — ${esc(l.message)}` : "";
+  $("b-action").innerHTML = [...running.map(r => `${esc(r.name)} is running for ${span(r.running_secs)}.`),
+    l ? `Last: ${esc(l.name)} ${l.ok ? "finished" : '<span style="color:var(--bad)">failed</span>'} in ${num(l.secs)} s — ${esc(l.message)}` : ""]
+    .filter(Boolean).join(" ");
   if (!b.mounted) {
     $("b-op").innerHTML = panelTitle("btrfs operation") + `<p class="note">No btrfs on ${esc(b.device)} is mounted.</p>`;
     return;

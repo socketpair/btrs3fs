@@ -101,10 +101,16 @@ pub struct Info {
     pub balance: Balance,
     /// The automatic removal of empty block groups.
     pub auto: crate::autobalance::AutoInfo,
-    /// The action in progress and how long it runs, seconds.
-    pub running: Option<String>,
-    pub running_secs: f64,
+    /// The actions in progress: at most one balance and one `syncfs`.
+    pub running: Vec<Running>,
     pub last: Option<ActionResult>,
+}
+
+#[derive(Serialize)]
+pub struct Running {
+    pub name: String,
+    /// How long it runs.
+    pub running_secs: f64,
 }
 
 /// The btrfs of one device (`ublkbN`) and the actions on it.
@@ -116,8 +122,29 @@ pub struct Btrfs {
 
 #[derive(Default)]
 struct ActionState {
-    running: Option<(String, Instant)>,
+    running: Vec<(String, Instant)>,
     last: Option<ActionResult>,
+}
+
+impl ActionState {
+    /// Marks `name` running unless one of its kind already runs.
+    fn begin(&mut self, name: &str) -> Result<(), String> {
+        if let Some((busy, _)) = self.running.iter().find(|(n, _)| kind(n) == kind(name)) {
+            return Err(format!("{busy} is still running"));
+        }
+        self.running.push((name.to_string(), Instant::now()));
+        Ok(())
+    }
+}
+
+/// Actions that wait for each other: a balance (by the button or by the
+/// daemon) for a balance, a `syncfs` for a `syncfs`. A `syncfs` during a
+/// balance is an ordinary commit.
+fn kind(name: &str) -> &str {
+    match name {
+        "autobalance" => "balance",
+        n => n,
+    }
 }
 
 /// The filesystem as found: sysfs directory and mount point.
@@ -168,10 +195,14 @@ impl Btrfs {
         };
         {
             let a = self.action.lock().unwrap();
-            if let Some((name, started)) = &a.running {
-                info.running = Some(name.clone());
-                info.running_secs = started.elapsed().as_secs_f64();
-            }
+            info.running = a
+                .running
+                .iter()
+                .map(|(name, started)| Running {
+                    name: name.clone(),
+                    running_secs: started.elapsed().as_secs_f64(),
+                })
+                .collect();
             info.last = a.last.clone();
         }
         let Some(fs) = self.find() else {
@@ -188,7 +219,7 @@ impl Btrfs {
     }
 
     /// Starts `balance` or `syncfs` in a thread of its own; refuses while
-    /// another action runs or when the filesystem is not mounted.
+    /// one of the same kind runs or when the filesystem is not mounted.
     pub fn start(self: &Arc<Self>, name: &str) -> Result<(), String> {
         let run: fn(&Path) -> Result<String, String> = match name {
             // The same as the button, started by the daemon (SPEC.md §9.3).
@@ -197,13 +228,8 @@ impl Btrfs {
             _ => return Err(format!("unknown action {name}")),
         };
         let fs = self.find().ok_or("the filesystem is not mounted")?;
-        {
-            let mut a = self.action.lock().unwrap();
-            if let Some((busy, _)) = &a.running {
-                return Err(format!("{busy} is still running"));
-            }
-            a.running = Some((name.to_string(), Instant::now()));
-        }
+        self.action.lock().unwrap().begin(name)?;
+        let slot = kind(name).to_string();
         let name = name.to_string();
         let this = self.clone();
         let spawned = std::thread::Builder::new()
@@ -223,7 +249,7 @@ impl Btrfs {
                     Err(m) => warn!("{name} failed after {secs:.1} s: {m}"),
                 }
                 let mut a = this.action.lock().unwrap();
-                a.running = None;
+                a.running.retain(|(n, _)| *n != name);
                 a.last = Some(ActionResult {
                     name,
                     ok: res.is_ok(),
@@ -232,7 +258,8 @@ impl Btrfs {
                 });
             });
         if let Err(e) = spawned {
-            self.action.lock().unwrap().running = None;
+            let mut a = self.action.lock().unwrap();
+            a.running.retain(|(n, _)| kind(n) != slot);
             return Err(format!("cannot start a thread: {e}"));
         }
         Ok(())
@@ -362,9 +389,20 @@ mod tests {
                 "global_rsv_size_bytes",
                 "last",
                 "mounted",
-                "running",
-                "running_secs"
+                "running"
             ]
         );
+    }
+
+    /// A balance waits for a balance, a syncfs for a syncfs; not for each other.
+    #[test]
+    fn syncfs_does_not_wait_for_balance() {
+        let mut a = ActionState::default();
+        a.begin("autobalance").unwrap();
+        assert!(a.begin("balance").is_err());
+        a.begin("syncfs").unwrap();
+        assert_eq!(a.begin("syncfs").unwrap_err(), "syncfs is still running");
+        a.running.retain(|(n, _)| n != "autobalance");
+        a.begin("balance").unwrap();
     }
 }
