@@ -8,7 +8,7 @@ use serde::Serialize;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// `struct btrfs_balance_args` (`linux/btrfs.h`, packed, 136 bytes).
 #[repr(C, packed)]
@@ -68,7 +68,7 @@ impl IoctlBalanceArgs {
     }
 }
 
-#[derive(Serialize, Default)]
+#[derive(Serialize, Default, Clone)]
 pub struct Balance {
     pub running: bool,
     pub expected: u64,
@@ -99,6 +99,9 @@ pub struct Info {
     #[serde(rename = "global_rsv_reserved_bytes")]
     pub global_rsv_reserved: Option<u64>,
     pub balance: Balance,
+    /// How long the progress query has been waiting for btrfs: a balance
+    /// holds `balance_mutex` through whole transaction commits.
+    pub balance_waiting_secs: Option<f64>,
     /// The automatic removal of empty block groups.
     pub auto: crate::autobalance::AutoInfo,
     /// The actions in progress: at most one balance and one `syncfs`.
@@ -118,6 +121,16 @@ pub struct Btrfs {
     device: String,
     action: Mutex<ActionState>,
     auto: Arc<crate::autobalance::AutoBalance>,
+    progress: Arc<Mutex<Progress>>,
+}
+
+/// `BTRFS_IOC_BALANCE_PROGRESS` waits for `balance_mutex`, which a balance
+/// holds for minutes at times: the query runs in a thread of its own, one at
+/// a time, so the statistics page never waits for it.
+#[derive(Default)]
+struct Progress {
+    last: Balance,
+    asked: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -160,6 +173,7 @@ impl Btrfs {
             device: device.to_string(),
             action: Mutex::default(),
             auto: Arc::default(),
+            progress: Arc::default(),
         }
     }
 
@@ -214,8 +228,43 @@ impl Btrfs {
         info.bg_reclaim_threshold = read_u64(&s.join("bg_reclaim_threshold"));
         info.global_rsv_size = read_u64(&s.join("allocation/global_rsv_size"));
         info.global_rsv_reserved = read_u64(&s.join("allocation/global_rsv_reserved"));
-        info.balance = balance_progress(&fs.mountpoint);
+        (info.balance, info.balance_waiting_secs) = self.progress(fs.mountpoint);
         info
+    }
+
+    /// The balance progress: fresh if btrfs answers within a moment, else
+    /// the last answer and how long the query waits.
+    fn progress(&self, mountpoint: PathBuf) -> (Balance, Option<f64>) {
+        const WAIT: Duration = Duration::from_millis(200);
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let mut p = self.progress.lock().unwrap();
+            if let Some(asked) = p.asked {
+                return (p.last.clone(), Some(asked.elapsed().as_secs_f64()));
+            }
+            p.asked = Some(Instant::now());
+            let progress = self.progress.clone();
+            let spawned = std::thread::Builder::new()
+                .name("btrs3fs-progress".into())
+                .spawn(move || {
+                    let b = balance_progress(&mountpoint);
+                    let mut p = progress.lock().unwrap();
+                    p.last = b.clone();
+                    p.asked = None;
+                    let _ = tx.send(b);
+                });
+            if spawned.is_err() {
+                p.asked = None;
+                return (p.last.clone(), None);
+            }
+        }
+        match rx.recv_timeout(WAIT) {
+            Ok(b) => (b, None),
+            Err(_) => (
+                self.progress.lock().unwrap().last.clone(),
+                Some(WAIT.as_secs_f64()),
+            ),
+        }
     }
 
     /// Starts `balance` or `syncfs` in a thread of its own; refuses while
@@ -382,6 +431,7 @@ mod tests {
             [
                 "auto",
                 "balance",
+                "balance_waiting_secs",
                 "bg_reclaim_threshold_pct",
                 "device",
                 "exclusive_operation",

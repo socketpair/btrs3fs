@@ -776,7 +776,8 @@ function renderBtrfs(b) {
     (a.last_run_secs_ago == null ? " · not run yet" : ` · last ${span(a.last_run_secs_ago)} ago, ${num(a.last_groups)} empty groups`);
   $("b-op").innerHTML = panelTitle("btrfs operation") + kv([["automatic removal of empty groups", autoLine],
     ["exclusive operation", esc(b.exclusive_operation || "none")],
-    ["balance", b.balance.running ? `${num(b.balance.completed)} of ${num(b.balance.expected)} block groups` : "not running"],
+    ["balance", (b.balance.running ? `${num(b.balance.completed)} of ${num(b.balance.expected)} block groups` : "not running") +
+      (b.balance_waiting_secs ? ` · btrfs has not answered for ${span(b.balance_waiting_secs)} (a commit inside the balance)` : "")],
     ["global reserve", `${bytes(b.global_rsv_reserved_bytes)} of ${bytes(b.global_rsv_size_bytes)}`],
     ["reclaim starts at", b.bg_reclaim_threshold_pct === null ? "–" : `${num(b.bg_reclaim_threshold_pct)}% allocated`]]);
 }
