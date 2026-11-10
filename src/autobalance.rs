@@ -7,7 +7,7 @@
 
 use crate::btrfs::Btrfs;
 use crate::zones::Engine;
-use log::{debug, info, warn};
+use log::{info, warn};
 use serde::Serialize;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -125,13 +125,20 @@ impl AutoBalance {
                 continue; // the freed space waits for the next look
             }
             *self.last_check.lock().unwrap() = Some(Instant::now());
-            base = Some(now);
-            look_at_mount = false;
             let Some(mountpoint) = fs.mountpoint() else {
                 continue;
             };
             let groups = match crate::btrfs_zone::empty_groups(&mountpoint) {
-                Ok(Some(empty)) => worth(&empty, zone, |zi| engine.zone_in_use(zi)),
+                Ok(Some(empty)) => {
+                    let groups = worth(&empty, zone, |zi| engine.zone_in_use(zi));
+                    if groups == 0 {
+                        info!(
+                            "automatic removal: space was freed; {} empty block groups, none holds a stored zone",
+                            empty.len()
+                        );
+                    }
+                    groups
+                }
                 // No block group tree: whether a group is empty is not known
                 // cheaply; balance finds out.
                 Ok(None) => 1,
@@ -140,14 +147,17 @@ impl AutoBalance {
                     continue;
                 }
             };
-            if groups == 0 {
-                debug!("space was freed, but no empty block group holds a stored zone");
-                continue;
+            if groups > 0 {
+                // A balance already running (by the button) is no reason to
+                // forget the freed space: the look repeats after the cooldown.
+                if let Err(e) = fs.start("autobalance") {
+                    info!("automatic removal of {groups} empty block groups waits: {e}");
+                    continue;
+                }
+                *self.last_run.lock().unwrap() = Some((Instant::now(), groups));
             }
-            match fs.start("autobalance") {
-                Ok(()) => *self.last_run.lock().unwrap() = Some((Instant::now(), groups)),
-                Err(e) => debug!("automatic balance not started: {e}"),
-            }
+            base = Some(now);
+            look_at_mount = false;
         }
     }
 }
