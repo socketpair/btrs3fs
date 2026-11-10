@@ -188,7 +188,7 @@ class Btrs3fs:
         wipe(self.dir)
         syncfs(self.a.btrs3fs_mnt)
         self.post("balance")
-        self.wait("balance", lambda: self.get("btrfs.json")["running"] is None, 600)
+        self.wait("balance", lambda: not self.get("btrfs.json")["running"], 600)
         last = self.get("btrfs.json")["last"]
         if not last or not last["ok"]:
             raise RuntimeError(f"btrs3fs balance failed: {last}")
