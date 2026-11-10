@@ -9,7 +9,7 @@
   :root {
     --bg: #f2f4f6; --surface: #ffffff; --ink: #1b2430; --muted: #64707d; --rule: #dde2e7;
     --flow: #2563c9; --ok: #1e8e5a; --warn: #b7791f; --bad: #c53030;
-    --z-empty: #e6e9ed; --z-open: #3b82c4; --z-closed: #d9a13b; --z-full: #5b6b7c; --z-full-faint: #b9c1ca;
+    --z-empty: #e6e9ed; --z-open: #3b82c4; --z-closed: #d9a13b; --z-full: #5b6b7c;
     --warn-bg: #fbf3e4; --bad-bg: #fbeaea;
     color-scheme: light;
   }
@@ -17,7 +17,7 @@
     :root {
       --bg: #15191e; --surface: #1d232a; --ink: #e6eaef; --muted: #94a0ad; --rule: #2c343d;
       --flow: #6fa3f2; --ok: #3fb984; --warn: #e0a43c; --bad: #f06262;
-      --z-empty: #262d35; --z-open: #4f97d8; --z-closed: #d8a64a; --z-full: #7d8d9e; --z-full-faint: #444f5b;
+      --z-empty: #262d35; --z-open: #4f97d8; --z-closed: #d8a64a; --z-full: #7d8d9e;
       --warn-bg: #2e2717; --bad-bg: #33191b;
       color-scheme: dark;
     }
@@ -125,7 +125,6 @@
   .zbar i { position: absolute; top: 0; bottom: 0; }
   .zbar i + i { border-left: 1px solid var(--surface); }
   .zbar .ram { background: var(--bad); opacity: .6; }
-  .zbar .faint { background: var(--z-full-faint); }
   .zcols { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 8px 28px; margin-top: 14px; }
   .zcols h3 { font-size: 14px; font-weight: 600; margin: 0 0 6px; }
   .zcols h4 { font-size: 13px; font-weight: 600; margin: 14px 0 0; }
@@ -452,8 +451,6 @@ function legend(z) {
   return item("", "background:var(--z-open)", `${num(z.open)} open`) +
     item("", "background:var(--z-closed)", `${num(z.closed)} closed`) +
     item("", "background:var(--z-full)", `${num(z.full)} full`) +
-    (z.finished_early ? item("", "background:linear-gradient(var(--z-full-faint) 50%, var(--z-full) 50%)",
-      `${num(z.finished_early)} of them finished early (the rest unusable)`) : "") +
     item("", "background:var(--z-empty)", `${num(z.empty)} empty`) +
     item("ram", "", "data in RAM") +
     item("frag", "", `fragmented: ${num(z.fragmented)}, at most ${num(z.max_objects)} S3 objects in one`);
@@ -489,8 +486,7 @@ function drawZones() {
   c.height = Math.floor(rows * (cell + gap) * dpr);
   const g = c.getContext("2d");
   g.scale(dpr, dpr);
-  const col = { e: cssVar("--z-empty"), o: cssVar("--z-open"), c: cssVar("--z-closed"), f: cssVar("--z-full"),
-                faint: cssVar("--z-full-faint") };
+  const col = { e: cssVar("--z-empty"), o: cssVar("--z-open"), c: cssVar("--z-closed"), f: cssVar("--z-full") };
   const ram = cssVar("--bad"), dot = cssVar("--surface");
   const zoneBlocks = zmap.zone_size_bytes / zmap.block_size_bytes;
   for (let i = 0; i < n; i++) {
@@ -500,13 +496,8 @@ function drawZones() {
     g.globalAlpha = zkind && kindOf(i) !== zkind && k !== "e" ? 0.35 : 1;
     g.fillStyle = col.e;
     g.fillRect(x, y, cell, cell);
-    // Zones fill from the bottom by how much they hold. A zone FINISHed early is
-    // full too, but its unwritten rest is faint: it can never be written.
-    const h = k === "e" ? 0 : Math.max(k === "f" ? 0 : 1, Math.round(zmap.used_blocks[i] / zoneBlocks * cell));
-    if (k === "f" && h < cell) {
-      g.fillStyle = col.faint;
-      g.fillRect(x, y, cell, cell - h);
-    }
+    // Open and closed zones fill from the bottom by how much they hold; a full one is full.
+    const h = k === "e" ? 0 : k === "f" ? cell : Math.max(1, Math.round(zmap.used_blocks[i] / zoneBlocks * cell));
     g.fillStyle = col[k];
     g.fillRect(x, y + cell - h, cell, h);
     if (zmap.buffered_blocks[i] > 0) {
@@ -562,20 +553,17 @@ async function refreshZone(i) {
     $("zblock").innerHTML = zoneBlock(b);
   } catch (e) { say(`Cannot read zone-${i}-block.json: ${e.message}`); }
 }
-/* The clicked cell stretched along the zone: S3 objects, RAM, the unwritten rest. */
+/* The clicked cell stretched along the zone: S3 objects and RAM. */
 function zoneBar(b) {
   const pct = v => (v / b.size_bytes * 100).toFixed(3) + "%";
   const color = { empty: "--z-empty", closed: "--z-closed", full: "--z-full" }[b.cond] || "--z-open";
   const parts = b.objects.filter(o => o.to_bytes > o.from_bytes).map(o =>
     `<i style="left:${pct(o.from_bytes)};width:${pct(o.to_bytes - o.from_bytes)};background:var(${color})" title="${esc(o.key)}"></i>`);
   if (b.buffered_bytes) parts.push(`<i class="ram" style="left:${pct(b.stored_bytes)};width:${pct(b.buffered_bytes)}" title="in RAM"></i>`);
-  if (b.cond === "full" && b.written_bytes < b.size_bytes)
-    parts.push(`<i class="faint" style="left:${pct(b.written_bytes)};width:${pct(b.size_bytes - b.written_bytes)}" title="finished early: never written"></i>`);
   const objects = b.objects.filter(o => o.to_bytes > o.from_bytes).length;
   const said = [];
   if (b.stored_bytes) said.push(`${bytes(b.stored_bytes)} in ${num(objects)} S3 object${objects === 1 ? "" : "s"}`);
   if (b.buffered_bytes) said.push(`${bytes(b.buffered_bytes)} in RAM`);
-  if (b.cond === "full" && b.written_bytes < b.size_bytes) said.push(`${bytes(b.size_bytes - b.written_bytes)} never to be written (finished early)`);
   if (!said.length) said.push("nothing written");
   return `<div class="zbar" role="img" aria-label="${esc(said.join(", "))}">${parts.join("")}</div><p class="note">${said.join(", ")}.</p>`;
 }
@@ -588,7 +576,7 @@ const COND_MEANS = {
   empty: "nothing written",
   open: "being written now",
   closed: "holds data but is not open now; a write at the pointer opens it again (zones restored at start are closed)",
-  full: "no more writes until a reset: written to the end or finished early",
+  full: "no more writes until a reset: written to the end or closed by FINISH",
 };
 function zoneBlock(b) {
   const markers = b.objects.filter(o => o.to_bytes === o.from_bytes);
@@ -657,8 +645,7 @@ $("zmap").addEventListener("mousemove", ev => {
   const rect = $("zmap").getBoundingClientRect();
   const cx = ev.clientX - rect.left, cy = ev.clientY - rect.top;
   const b = zmap.block_size_bytes;
-  const early = zmap.cond[i] === "f" && zmap.used_blocks[i] * zmap.block_size_bytes < zmap.zone_size_bytes;
-  tip.innerHTML = `zone ${num(i)} at ${bytes(i * zmap.zone_size_bytes)} · ${early ? "full: finished early" : ZONE[zmap.cond[i]][0]}` +
+  tip.innerHTML = `zone ${num(i)} at ${bytes(i * zmap.zone_size_bytes)} · ${ZONE[zmap.cond[i]][0]}` +
     (zmap.cond[i] === "e" ? "" : ` · ${KIND[kindOf(i)]}`) + `<br>` +
     `${bytes(zmap.used_blocks[i] * b)} of ${bytes(zmap.zone_size_bytes)} written · ${num(zmap.objects[i])} S3 object${zmap.objects[i] === 1 ? "" : "s"}` +
     (zmap.buffered_blocks[i] ? ` · ${bytes(zmap.buffered_blocks[i] * b)} in RAM` : "");

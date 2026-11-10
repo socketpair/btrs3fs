@@ -458,11 +458,8 @@ pub struct ZoneCounts {
     pub open: u64,
     pub closed: u64,
     pub full: u64,
-    /// Zones with data, but less than the zone: open, closed, or FULL after
-    /// an early FINISH.
+    /// Zones with data, but less than the zone.
     pub partial: u64,
-    /// FULL after a FINISH before the end: the rest of the zone is unusable.
-    pub finished_early: u64,
     /// Zones served by more than one object (SEGMENTS, not concatenated yet).
     pub fragmented: u64,
     /// Zones with data by what they hold; unknown: no request since start.
