@@ -205,7 +205,6 @@
   </div>
   <nav role="tablist" aria-orientation="vertical">
     <button role="tab" aria-selected="true" data-tab="overview">Overview</button>
-    <button role="tab" aria-selected="false" data-tab="zones">Zones</button>
     <button role="tab" aria-selected="false" data-tab="link">S3 link</button>
     <button role="tab" aria-selected="false" data-tab="details">Details</button>
   </nav>
@@ -222,10 +221,6 @@
   <h2>Last 5 minutes</h2>
   <div class="charts" id="charts"></div>
   <h2>Zones</h2>
-  <div class="panel" id="zones-brief"></div>
-</section>
-
-<section id="tab-zones" hidden>
   <div class="panel">
     <div class="strip" id="zstrip"></div>
     <div class="legend" id="zlegend"></div>
@@ -256,6 +251,7 @@
   <div class="panel" id="b-op" style="margin-top:12px"></div>
   <div class="panel" id="zinfo" hidden></div>
 </section>
+
 
 
 <section id="tab-link" hidden>
@@ -365,13 +361,13 @@ function showTab(t) {
   // The tab is in the address, so reloading or sharing the link keeps it.
   if (location.hash !== "#" + t) history.replaceState(null, "", t === "overview" ? location.pathname : "#" + t);
   for (const b of document.querySelectorAll("nav button")) b.setAttribute("aria-selected", String(b.dataset.tab === t));
-  for (const s of ["overview", "zones", "link", "details"]) $("tab-" + s).hidden = s !== t;
-  if (t === "zones") { tickZones(); tickBtrfs(); }
+  for (const s of ["overview", "link", "details"]) $("tab-" + s).hidden = s !== t;
+  if (t === "overview") { tickZones(); tickBtrfs(); }
   if (t === "link") tickLink();
   if (last) draw(last);
 }
 for (const b of document.querySelectorAll("nav button")) b.onclick = () => showTab(b.dataset.tab);
-if (["zones", "link", "details"].includes(location.hash.slice(1))) showTab(location.hash.slice(1));
+if (["link", "details"].includes(location.hash.slice(1))) showTab(location.hash.slice(1));
 
 /* ---------- overview ---------- */
 /* An arrow between stages; `left` points from right to left (reads come back from S3). */
@@ -426,12 +422,6 @@ function renderOverview(s) {
     chart("Read from S3", series.rd, bitrate) +
     chart("RAM buffers", series.dirty, bytes, hard) +
     chart("Uploads in flight", series.par, num, s.uploads_limit);
-
-  const z = s.zones, used = z.open + z.closed + z.full;
-  $("zones-brief").innerHTML = `<div class="strip">${stripSpans(z)}</div><div class="legend">${legend(z, false)}</div>` +
-    `<p class="note" style="margin-bottom:0">${num(used)} of ${num(used + z.empty)} zones hold data · ${num(z.partial)} partly filled · ` +
-    `${num(z.fragmented)} fragmented · <a href="#" data-goto="zones">open the zone map</a></p>` + concatLine(s);
-  $("zones-brief").querySelector("[data-goto]").onclick = ev => { ev.preventDefault(); showTab("zones"); };
 }
 
 function chart(title, data, fmt, limit) {
@@ -457,16 +447,16 @@ function stripSpans(z) {
   return [["o", z.open], ["c", z.closed], ["f", z.full]].map(([k, v]) =>
     `<span style="width:${v / total * 100}%;background:var(${ZONE[k][1]})" title="${num(v)} ${ZONE[k][0]}"></span>`).join("");
 }
-function legend(z, map) {
+function legend(z) {
   const item = (cls, style, text) => `<span><i class="${cls}" style="${style}"></i>${text}</span>`;
   return item("", "background:var(--z-open)", `${num(z.open)} open`) +
     item("", "background:var(--z-closed)", `${num(z.closed)} closed`) +
     item("", "background:var(--z-full)", `${num(z.full)} full`) +
-    (map && z.finished_early ? item("", "background:linear-gradient(var(--z-full-faint) 50%, var(--z-full) 50%)",
+    (z.finished_early ? item("", "background:linear-gradient(var(--z-full-faint) 50%, var(--z-full) 50%)",
       `${num(z.finished_early)} of them finished early (the rest unusable)`) : "") +
     item("", "background:var(--z-empty)", `${num(z.empty)} empty`) +
-    (map ? item("ram", "", "data in RAM") +
-      item("frag", "", `fragmented: ${num(z.fragmented)}, at most ${num(z.max_objects)} S3 objects in one`) : "");
+    item("ram", "", "data in RAM") +
+    item("frag", "", `fragmented: ${num(z.fragmented)}, at most ${num(z.max_objects)} S3 objects in one`);
 }
 
 let zmap = null, zgeom = null, zkind = "", zsel = null;
@@ -484,10 +474,10 @@ async function tickZones() {
     zmap = await r.json();
     drawZones();
   } catch (e) { say(`Cannot read the zone map: ${e.message}`); }
-  if (zsel !== null && tab === "zones") refreshZone(zsel);
+  if (zsel !== null && tab === "overview") refreshZone(zsel);
 }
 function drawZones() {
-  if (!zmap || tab !== "zones") return;
+  if (!zmap || tab !== "overview") return;
   const c = $("zmap"), n = zmap.cond.length;
   const width = c.parentElement.clientWidth || 800;
   const cell = n > 20000 ? 4 : n > 5000 ? 7 : 10, gap = 1;
@@ -701,9 +691,9 @@ function concatLine(s) {
 
 function renderZones(s) {
   $("zstrip").innerHTML = stripSpans(s.zones);
-  $("zlegend").innerHTML = legend(s.zones, true) + concatLine(s);
+  $("zlegend").innerHTML = legend(s.zones) + concatLine(s);
   const z = s.zones;
-  $("zkinds").textContent = `${num(z.meta_zones)} metadata zones · ${num(z.data_zones + z.unknown_zones)} data zones`;
+  $("zkinds").textContent = `${num(z.meta_zones)} metadata zones · ${num(z.data_zones + z.unknown_zones)} data zones · ${num(z.partial)} partly filled`;
   $("btn-compact").hidden = s.append !== "SEGMENTS";
 }
 
@@ -768,7 +758,7 @@ function renderDetails(s) {
       ["dropped (zone changed meanwhile)", num(s.compact_aborted)], ["failed", num(s.compact_errors), s.compact_errors > 0]])) : "");
 }
 
-/* ---------- btrfs operations (zones tab) ---------- */
+/* ---------- btrfs operations (under the zone map) ---------- */
 async function tickBtrfs() {
   try {
     const r = await fetch("btrfs.json", { cache: "no-store" });
@@ -1008,8 +998,7 @@ function draw(s) {
   diskRO = !!s.disk_read_only;
   $("meta").textContent = `on ${s.device} · ${appendMode(s)}${diskRO ? " · read-only" : ""} · up ${span(s.uptime_secs)}`;
   document.title = `${s.alerts && s.alerts.length ? "⚠ " : ""}btrs3fs ${s.disk}`;
-  if (tab === "overview") renderOverview(s);
-  if (tab === "zones") renderZones(s);
+  if (tab === "overview") { renderOverview(s); renderZones(s); }
   if (tab === "details") renderDetails(s);
 }
 
@@ -1024,9 +1013,9 @@ async function tick() {
     prev = s; prevTime = now; last = s;
     draw(s);
     $("live").className = "on"; $("live").textContent = "live";
-    if (tab === "zones") tickBtrfs();
+    if (tab === "overview") tickBtrfs();
     tickLink();  // the Overview shows auto or manual connections too
-    if (tab === "zones" && ++ticks % 3 === 0) tickZones();  // the map changes slowly; every 3 s is enough
+    if (tab === "overview" && ++ticks % 3 === 0) tickZones();  // the map changes slowly; every 3 s is enough
   } catch (e) {
     $("live").className = "off"; $("live").textContent = "no connection to the device server";
   }

@@ -85,7 +85,7 @@ pub struct ActionResult {
 }
 
 /// `/btrfs.json`: the operation running in the filesystem and the actions
-/// of the statistics page (zones tab).
+/// of the statistics page (under the zone map).
 #[derive(Serialize, Default)]
 pub struct Info {
     /// The filesystem on the device is mounted (found in sysfs and mountinfo).
@@ -366,7 +366,7 @@ mod tests {
         assert_eq!(b.mountpoint(), None);
     }
 
-    /// Only what the zones tab shows: the operation running and the actions.
+    /// Only what the page shows under the zone map: the operation running and the actions.
     #[test]
     fn info_has_operations_only() {
         let json = serde_json::to_value(Btrfs::new("ublkb-none").info()).unwrap();
