@@ -19,6 +19,7 @@ mod stats;
 mod store;
 mod tuning;
 mod units;
+mod unmount;
 mod zones;
 
 use anyhow::{Context, bail, ensure};
@@ -371,6 +372,7 @@ fn serve_disk(
         stats: stats_opt,
         link,
         read_only,
+        stop_on_unmount,
     } = serve;
     if let Some(q) = queues {
         cfg.nr_queues = q;
@@ -434,6 +436,7 @@ fn serve_disk(
         fs_readahead: tune.as_ref().map(|_| fs_target.clone()),
         serial,
         read_only,
+        stop_on_unmount,
     };
 
     // The statistics page starts once the device number is known.
@@ -602,6 +605,8 @@ struct ServeOptions {
     link: Option<Manual>,
     /// Serve the disk read-only (SPEC.md §9.2).
     read_only: bool,
+    /// Stop when the filesystem is unmounted (`mount`, not `run`).
+    stop_on_unmount: bool,
 }
 
 impl ServeOptions {
@@ -619,6 +624,7 @@ impl ServeOptions {
             stats: Some(stats),
             link: Some(manual),
             read_only,
+            stop_on_unmount: false,
         }
     }
 }
@@ -811,7 +817,11 @@ fn mount_daemon(
             }
             true
         });
-        let serve = ServeOptions::device(a.dev_id, a.queues, a.stats, manual, a.read_only);
+        // A device of `mount` has no use once its filesystem is unmounted.
+        let serve = ServeOptions {
+            stop_on_unmount: true,
+            ..ServeOptions::device(a.dev_id, a.queues, a.stats, manual, a.read_only)
+        };
         serve_until_stopped(&rt, cfg, layout, store, serve, on_ready)
     })();
     match res {
@@ -1136,6 +1146,7 @@ fn format_disk(cfg: &DiskConfig, layout: &Layout, s3: &S3Store) -> anyhow::Resul
             // mkfs reads next to nothing.
             link: None,
             read_only: false,
+            stop_on_unmount: false,
         },
         on_ready,
     )?;

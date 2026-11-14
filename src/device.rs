@@ -68,6 +68,8 @@ pub struct DeviceOptions {
     pub serial: Option<String>,
     /// Read-only device (SPEC.md §9.2): the kernel refuses writes to it.
     pub read_only: bool,
+    /// Stop when the filesystem, once mounted, is unmounted (`btrs3fs mount`).
+    pub stop_on_unmount: bool,
 }
 
 struct Ctx {
@@ -180,6 +182,7 @@ pub fn serve(
     let zone_size = cfg.zone_size;
     let fs_readahead = opts.fs_readahead.clone();
     let serial = opts.serial.clone();
+    let stop_on_unmount = opts.stop_on_unmount;
     let device_fn = move |ctrl: &UblkCtrl| {
         let bdev = ctrl.get_bdev_path();
         info!(
@@ -197,10 +200,23 @@ pub fn serve(
                 .name("btrs3fs-fs-tune".into())
                 .spawn(move || keep_fs_tuned(&name, fs_readahead, !read_only));
         }
+        let unmounted = Arc::new(AtomicBool::new(false));
+        if stop_on_unmount && let Some(name) = bdev.strip_prefix("/dev/") {
+            let (name, flag) = (name.to_string(), unmounted.clone());
+            let spawned = std::thread::Builder::new()
+                .name("btrs3fs-unmount".into())
+                .spawn(move || crate::unmount::stop_on_unmount(&name, flag));
+            if let Err(e) = spawned {
+                warn!("cannot watch for the unmount of {bdev}: {e}");
+            }
+        }
         if on_ready(&bdev) {
             loop {
                 if let Some(sig) = signals.pending().next() {
                     info!("signal {sig} received, stopping device");
+                    break;
+                }
+                if unmounted.load(Ordering::SeqCst) {
                     break;
                 }
                 if live_queues.load(Ordering::SeqCst) == 0 {
