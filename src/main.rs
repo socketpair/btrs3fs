@@ -372,7 +372,7 @@ fn serve_disk(
         stats: stats_opt,
         link,
         read_only,
-        stop_on_unmount,
+        unmounted,
     } = serve;
     if let Some(q) = queues {
         cfg.nr_queues = q;
@@ -436,7 +436,7 @@ fn serve_disk(
         fs_readahead: tune.as_ref().map(|_| fs_target.clone()),
         serial,
         read_only,
-        stop_on_unmount,
+        unmounted,
     };
 
     // The statistics page starts once the device number is known.
@@ -605,8 +605,8 @@ struct ServeOptions {
     link: Option<Manual>,
     /// Serve the disk read-only (SPEC.md §9.2).
     read_only: bool,
-    /// Stop when the filesystem is unmounted (`mount`, not `run`).
-    stop_on_unmount: bool,
+    /// Stop when the filesystem is unmounted (`mount`, not `run`): set then.
+    unmounted: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl ServeOptions {
@@ -624,7 +624,7 @@ impl ServeOptions {
             stats: Some(stats),
             link: Some(manual),
             read_only,
-            stop_on_unmount: false,
+            unmounted: None,
         }
     }
 }
@@ -639,8 +639,12 @@ fn serve_until_stopped(
     serve: ServeOptions,
     on_ready: device::OnReady,
 ) -> anyhow::Result<()> {
+    let unmounted = serve.unmounted.clone();
     let (engine, ctrl) = serve_disk(rt, cfg, layout, store, serve, on_ready)?;
-    report_discarded(&engine);
+    report_discarded(
+        &engine,
+        unmounted.is_some_and(|u| u.load(std::sync::atomic::Ordering::SeqCst)),
+    );
     device::delete(&ctrl);
     info!("device removed");
     Ok(())
@@ -655,17 +659,38 @@ fn ublk_dev_id(bdev: &str) -> Option<u32> {
 }
 
 /// Data not covered by a FLUSH is not stored on shutdown (SPEC.md §5).
-fn report_discarded(engine: &Engine) {
-    let pending = engine.unflushed();
+fn report_discarded(engine: &Engine, after_unmount: bool) {
+    if let Some((level, text)) = discard_report(&engine.unflushed(), after_unmount) {
+        log::log!(level, "{text}");
+    }
+}
+
+/// The log line for the buffers `pending` (zone, bytes) left at a stop:
+/// after an unmount there should be none (btrfs flushed everything), so any
+/// is an error; at a stop by signal (`detach`, `run`) a warning.
+fn discard_report(pending: &[(usize, u64)], after_unmount: bool) -> Option<(log::Level, String)> {
     if pending.is_empty() {
-        return;
+        return None;
     }
     let bytes: u64 = pending.iter().map(|&(_, b)| b).sum();
-    info!(
-        "not storing {} in {} zones: they were never flushed from userspace (no fsync/FLUSH)",
+    let what = format!(
+        "not storing {} in {} zones",
         units::size(bytes),
         pending.len()
     );
+    Some(if after_unmount {
+        (
+            log::Level::Error,
+            format!(
+                "{what} left unflushed after its filesystem was unmounted (btrfs flushes everything at unmount)"
+            ),
+        )
+    } else {
+        (
+            log::Level::Warn,
+            format!("{what}: they were never flushed from userspace (no fsync/FLUSH)"),
+        )
+    })
 }
 
 fn cmd_run(a: RunArgs) -> anyhow::Result<i32> {
@@ -819,7 +844,7 @@ fn mount_daemon(
         });
         // A device of `mount` has no use once its filesystem is unmounted.
         let serve = ServeOptions {
-            stop_on_unmount: true,
+            unmounted: Some(Arc::default()),
             ..ServeOptions::device(a.dev_id, a.queues, a.stats, manual, a.read_only)
         };
         serve_until_stopped(&rt, cfg, layout, store, serve, on_ready)
@@ -1146,7 +1171,7 @@ fn format_disk(cfg: &DiskConfig, layout: &Layout, s3: &S3Store) -> anyhow::Resul
             // mkfs reads next to nothing.
             link: None,
             read_only: false,
-            stop_on_unmount: false,
+            unmounted: None,
         },
         on_ready,
     )?;
@@ -1275,6 +1300,21 @@ mod tests {
         assert_eq!(leftovers, ["d/measure-1f/w-3", "d/measure-1f/small"]);
         let listed = [obj("d/measure-1f/w-3"), obj("d/0000000000000000")];
         assert_eq!(existing_objects(&layout, &listed).0, ["d/0000000000000000"]);
+    }
+
+    /// What is left unflushed at a stop: an error after an unmount (btrfs
+    /// flushed everything then), a warning otherwise, nothing when empty.
+    #[test]
+    fn discarded_data_report() {
+        assert_eq!(discard_report(&[], true), None);
+        let (level, text) = discard_report(&[(1, 4096), (3, 8192)], true).unwrap();
+        assert_eq!(level, log::Level::Error);
+        assert!(
+            text.contains("2 zones") && text.contains("after its filesystem was unmounted"),
+            "{text}"
+        );
+        let (level, _) = discard_report(&[(1, 4096)], false).unwrap();
+        assert_eq!(level, log::Level::Warn);
     }
 
     #[test]
